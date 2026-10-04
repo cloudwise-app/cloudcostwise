@@ -1,0 +1,15 @@
+{
+  "name": "cloudcostwise",
+  "description": "cloudcostwise: find AWS waste from Claude Code, locally and read-only.",
+  "owner": {
+    "name": "CloudWise",
+    "email": "hello@cloudcostwise.io"
+  },
+  "plugins": [
+    {
+      "name": "cloudcostwise",
+      "source": "./",
+      "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally; nothing leaves your machine."
+    }
+  ]
+}

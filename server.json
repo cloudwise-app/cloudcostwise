@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cloudwise-app/cloudcostwise",
+  "title": "cloudcostwise",
+  "description": "Find AWS waste with your own read-only credentials. Runs locally; nothing leaves your machine.",
+  "repository": {
+    "url": "https://github.com/cloudwise-app/cloudcostwise",
+    "source": "github"
+  },
+  "websiteUrl": "https://cloudcostwise.io/cli",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "cloudcostwise",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        { "type": "positional", "value": "mcp" }
+      ],
+      "environmentVariables": [
+        {
+          "name": "AWS_PROFILE",
+          "description": "AWS profile to scan with (read-only access is enough). Defaults to the standard credential chain.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "cloudcostwise",
+  "version": "0.1.0",
+  "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally; nothing leaves your machine.",
+  "author": { "name": "CloudWise", "url": "https://cloudcostwise.io" },
+  "homepage": "https://cloudcostwise.io/cli",
+  "repository": "https://github.com/cloudwise-app/cloudcostwise",
+  "license": "FSL-1.1-ALv2",
+  "userConfig": {
+    "aws_profile": {
+      "type": "string",
+      "title": "AWS profile",
+      "description": "The AWS profile to scan with (read-only access is enough).",
+      "required": false,
+      "default": "default"
+    }
+  },
+  "mcpServers": {
+    "cloudcostwise": {
+      "command": "uvx",
+      "args": ["cloudcostwise", "mcp"],
+      "env": { "AWS_PROFILE": "${user_config.aws_profile}" }
+    }
+  }
+}

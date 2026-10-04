@@ -1,5 +1,7 @@
 # cloudcostwise
 
+<!-- mcp-name: io.github.cloudwise-app/cloudcostwise -->
+
 Find AWS waste from your terminal or your AI assistant. `cloudcostwise` runs CloudWise's open waste
 checks on your own machine, with your own read-only AWS credentials.
 
@@ -17,7 +19,7 @@ checks on your own machine, with your own read-only AWS credentials.
 ## Install and run
 
 ```bash
-pipx install cloudcostwise
+pipx install cloudcostwise          # or: uvx cloudcostwise scan
 cloudcostwise scan                      # us-east-1 plus your profile's region
 cloudcostwise scan --profile prod --regions all
 cloudcostwise scan --format json > waste.json
@@ -38,7 +40,14 @@ Options:
 `cloudcostwise mcp` runs the same scan as an MCP server (stdio). Then ask your
 assistant: *"Where am I wasting money on AWS?"*
 
-Claude Code:
+Claude Code, as a plugin (asks for your AWS profile):
+
+```text
+/plugin marketplace add cloudwise-app/cloudcostwise
+/plugin install cloudcostwise@cloudcostwise
+```
+
+Claude Code, as a plain MCP server:
 
 ```bash
 claude mcp add cloudcostwise -- uvx cloudcostwise mcp
