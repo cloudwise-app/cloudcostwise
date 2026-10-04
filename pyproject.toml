@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudcostwise"
+version = "0.1.0.dev0"
+description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials; nothing leaves your machine."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "FSL-1.1-ALv2" }
+authors = [{ name = "CloudWise" }]
+dependencies = ["boto3>=1.40", "mcp>=2.3,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+cloudcostwise = "cloudcostwise.cli:main"
+
+[project.urls]
+Homepage = "https://cloudcostwise.io/cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cloudwise_scan_core = ["py.typed"]
