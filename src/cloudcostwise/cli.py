@@ -24,6 +24,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--no-cost-explorer", action="store_true",
                    help="make no Cost Explorer call ($0.01 per request): skips the RI/Savings Plans checks; "
                         "extended-support surcharges fall back to estimates")
+    s.add_argument("--parallel", type=int, default=4, metavar="N",
+                   help="regions scanned at once, each in its own process (default 4; 1 = one at a time)")
     s.add_argument("--verbose", "-v", action="store_true", help="show data warnings and engine logs")
     sub.add_parser("mcp", help="run as an MCP server (stdio) for Claude Code, Codex and other assistants")
     return p
@@ -59,12 +61,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("note: the RI/Savings Plans checks call Cost Explorer, which AWS bills at $0.01 per "
               "request (about $0.13 a scan). Add --no-cost-explorer to skip them.", file=sys.stderr)
 
-    def progress(region: str) -> None:
-        if args.format == "table":
-            print(f"scanning {region} ...", file=sys.stderr)
+    done = 0
+    print(f"scanning {len(regions)} region(s), {min(max(args.parallel, 1), len(regions))} at a time ...",
+          file=sys.stderr)
+
+    def progress(res) -> None:
+        nonlocal done
+        done += 1
+        print(f"  [{done}/{len(regions)}] {res.region:<15} {len(res.findings):>3} finding(s)  {res.seconds:>5.1f}s",
+              file=sys.stderr)
 
     try:
-        report = run_scan(creds, regions, include_cost_explorer=not args.no_cost_explorer, on_region=progress)
+        report = run_scan(creds, regions, include_cost_explorer=not args.no_cost_explorer, on_region=progress,
+                          parallel=args.parallel)
     except ReadOnlyViolation as e:
         print(f"cloudcostwise: stopped, {e}. Please report this: it is a bug.", file=sys.stderr)
         return 3

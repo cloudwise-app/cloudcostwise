@@ -57,7 +57,7 @@ def test_counted_groups_come_before_advisory_and_sort_by_savings():
 def test_footer_and_cost_explorer_note():
     report = _report(calls={"ce": 13, "ec2": 4})
     assert render.footer(report).startswith("20 of 46 service checks run locally. The other 26,")
-    assert "connect?src=cli" in render.footer(report)
+    assert "connect?utm_source=cloudcostwise&utm_medium=cli" in render.footer(report)
     assert "13 Cost Explorer request(s)" in render.cost_explorer_note(report)
     assert "about $0.13" in render.cost_explorer_note(report)
     assert render.cost_explorer_note(_report(calls={"ec2": 4})) == ""
@@ -169,3 +169,39 @@ def test_no_cost_explorer_says_what_was_skipped_and_footer_still_counts_20_open_
     assert "extended-support surcharges are estimates" in table
     assert "20 of 46 service checks run locally. The other 26," in table
     assert json.loads(render.as_json(report))["cost_explorer_skipped"] is True
+
+
+def _region_result(region, n_findings, calls=None, violations=None, seconds=1.0):
+    from cloudcostwise.scan import RegionResult
+    return RegionResult(region=region, findings=[_item(TRUSTED, f"{region}-{i}", 1.0, region) for i in range(n_findings)],
+                        warnings=[f"{region}: w"], errors=[], calls=calls or {"ec2": 2}, blocked={},
+                        violations=violations or [], seconds=seconds)
+
+
+def test_regions_aggregate_in_requested_order_with_summed_calls():
+    from cloudcostwise import scan as scan_mod
+
+    fake = {"us-east-1": _region_result("us-east-1", 2, {"ec2": 3, "ce": 13}), "eu-west-1": _region_result("eu-west-1", 1)}
+    seen = []
+    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce: fake[r]):
+        report = scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], on_region=lambda res: seen.append(res.region),
+                                   parallel=1)
+    assert [i.resource_id for i in report.findings] == ["us-east-1-0", "us-east-1-1", "eu-west-1-0"]
+    assert report.api_calls == {"ec2": 5, "ce": 13}
+    assert seen == ["us-east-1", "eu-west-1"]
+    assert report.warnings == ["us-east-1: w", "eu-west-1: w"]
+
+
+def test_a_refused_write_in_any_region_fails_the_whole_scan():
+    from cloudcostwise import scan as scan_mod
+
+    fake = {"us-east-1": _region_result("us-east-1", 1), "eu-west-1": _region_result("eu-west-1", 0, violations=["ec2:DeleteVolume"])}
+    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce: fake[r]):
+        with pytest.raises(ReadOnlyViolation, match="ec2:DeleteVolume"):
+            scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], parallel=1)
+
+
+def test_scan_region_result_pickles_for_worker_processes():
+    import pickle
+    res = _region_result("us-east-1", 1)
+    assert pickle.loads(pickle.dumps(res)).region == "us-east-1"

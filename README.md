@@ -33,12 +33,16 @@ Options:
 | `--regions LIST` | Comma-separated regions, or `all` for every enabled region. Account-level checks (Cost Explorer, Route 53) run once, in us-east-1 |
 | `--format table\|markdown\|json` | Output format |
 | `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $0.01 per request and a scan makes about 13. Skips the RI/Savings Plans checks; extended-support surcharges fall back to estimates |
+| `--parallel N` | Regions scanned at once, each in its own process (default 4; `--regions all` takes ~2–3 min instead of ~10) |
 | `--verbose` | Show data warnings (checks that could not read a metric report it as missing, never as zero) |
 
 ## Use it from Claude Code, Codex or any MCP client
 
 `cloudcostwise mcp` runs the same scan as an MCP server (stdio). Then ask your
 assistant: *"Where am I wasting money on AWS?"*
+
+The plugin and registry entries start the server with `uvx`, so install
+[uv](https://docs.astral.sh/uv/) first (`brew install uv` or `pipx install uv`).
 
 Claude Code, as a plugin (asks for your AWS profile):
 
@@ -86,7 +90,7 @@ added to the total.
 
 The other 26 service checks (Glue, ECS, Step Functions, Backup, CloudFront,
 commitments and more), history and trends, alerts, and safe automated fixes:
-<https://cloudcostwise.io/connect?src=cli>.
+<https://cloudcostwise.io/connect?utm_source=cloudcostwise&utm_medium=cli>.
 
 ## License
 

@@ -17,7 +17,7 @@ from cloudwise_scan_core.advisory_types import ADVISORY, validation_for
 from cloudcostwise.runtime import COST_EXPLORER_PRICE_PER_REQUEST, COST_EXPLORER_SERVICE
 from cloudcostwise.scan import ScanReport
 
-HOSTED_URL = "https://cloudcostwise.io/connect?src=cli"
+HOSTED_URL = "https://cloudcostwise.io/connect?utm_source=cloudcostwise&utm_medium=cli"
 TOTAL_ENTRYPOINTS = 46
 OPEN_ENTRYPOINTS = 20
 CE_SKIPPED_NOTE = ("RI/Savings Plans checks skipped (--no-cost-explorer); "

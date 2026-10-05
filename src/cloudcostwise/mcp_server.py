@@ -8,10 +8,12 @@ text and never executes it.
 
 from __future__ import annotations
 
+import asyncio
+
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from cloudcostwise import __version__, render
@@ -64,18 +66,29 @@ def build_server() -> MCPServer:
         annotations=READ_ONLY,
         description=(
             "Scan the user's AWS account for waste with their local credentials (read-only; any non-read "
-            "AWS call is refused). Takes 30-60 s per region. COST: the RI/Savings Plans checks call Cost "
+            "AWS call is refused). Takes 30-60 s per region; up to 4 regions run at once. COST: the RI/Savings Plans checks call Cost "
             "Explorer, billed by AWS at $0.01 per request (about $0.13 a scan); tell the user before "
             "running, and pass include_cost_explorer=false to skip them. regions: comma-separated, or "
             "'all'; default us-east-1 plus the profile's region."
         ),
     )
-    async def scan(profile: Optional[str] = None, regions: Optional[str] = None,
+    async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,
                    include_cost_explorer: bool = True) -> str:
         try:
             creds = resolve_credentials(profile)
             region_list = resolve_regions(regions, creds)
-            report = await run_scan_async(creds, region_list, include_cost_explorer=include_cost_explorer)
+            finished = 0
+
+            def progress(res) -> None:
+                # Clients that sent a progress token show this; others ignore it.
+                nonlocal finished
+                finished += 1
+                asyncio.ensure_future(ctx.report_progress(
+                    finished, len(region_list),
+                    f"{res.region}: {len(res.findings)} finding(s) in {res.seconds:.0f}s"))
+
+            report = await run_scan_async(creds, region_list, include_cost_explorer=include_cost_explorer,
+                                          on_region=progress)
         except CredentialsError as e:
             return f"Could not scan: {e}"
         except ReadOnlyViolation as e:

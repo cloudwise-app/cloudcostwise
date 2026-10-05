@@ -1589,8 +1589,17 @@ class EMRClusterData:
     cluster_arn: str = ''
     region: Optional[str] = None
     release_label: str = ''                 # e.g. 'emr-6.15.0'
-    auto_termination_policy: Optional[Dict] = None  # {'IdleTimeout': 3600} or None
-    keep_alive: bool = True                 # KeepJobFlowAliveWhenNoSteps
+    # CLO-574: DescribeCluster's Cluster shape has neither AutoTerminationPolicy
+    # nor KeepJobFlowAliveWhenNoSteps (botocore 1.40.21 confirmed) -- the real
+    # policy comes only from GetAutoTerminationPolicy. `auto_termination_policy`
+    # is meaningful ONLY when `auto_termination_unknown` is False: None then
+    # means a successful GetAutoTerminationPolicy call confirmed no policy. The
+    # default is "unknown" (safe): a provider that forgets to set this after a
+    # successful read never has the detector read None as a confirmed no-policy
+    # answer.
+    auto_termination_policy: Optional[Dict] = None  # {'IdleTimeout': 3600} or None (confirmed)
+    auto_termination_unknown: bool = True   # True = not read / read failed; withhold the finding
+    keep_alive: bool = True                 # derived from NOT Cluster.AutoTerminate
     ready_datetime: Optional[datetime] = None
     created_datetime: Optional[datetime] = None
     instance_groups: List[Dict] = field(default_factory=list)

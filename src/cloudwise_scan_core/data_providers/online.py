@@ -8390,6 +8390,57 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             master_type = ig.get('InstanceType', '')
                             break
 
+                    # CLO-574: the Cluster shape has no AutoTerminationPolicy or
+                    # KeepJobFlowAliveWhenNoSteps member -- it has AutoTerminate
+                    # (true = the cluster terminates itself after its steps
+                    # finish, so it never needs an idle auto-termination policy)
+                    # and TerminationProtected. keep_alive is the complement.
+                    auto_terminate = details.get('AutoTerminate')
+                    keep_alive = (not auto_terminate) if auto_terminate is not None else True
+
+                    # Mirror the detector's own age gate (analytics.py
+                    # ~hours_running > 24) here: a cluster younger than 24h is
+                    # never a candidate for this finding, so don't spend the
+                    # extra API call or raise a MISSING note for it either.
+                    ref_time = timeline.get('ReadyDateTime') or timeline.get('CreationDateTime')
+                    if ref_time is not None and ref_time.tzinfo is None:
+                        ref_time = ref_time.replace(tzinfo=timezone.utc)
+                    old_enough = bool(
+                        ref_time and (datetime.now(timezone.utc) - ref_time) > timedelta(hours=24)
+                    )
+
+                    auto_termination_policy = None
+                    auto_termination_unknown = True
+                    if keep_alive and old_enough:
+                        # Only clusters that don't self-terminate AND are old
+                        # enough to be a candidate are worth the extra call;
+                        # skip it (and any MISSING note) for the rest.
+                        try:
+                            policy_resp = emr.get_auto_termination_policy(ClusterId=cluster_id)
+                        except Exception as policy_err:  # noqa: BLE001 -- any
+                            # failed read (ClientError or a transport failure)
+                            # withholds the finding; it must never be read as
+                            # "confirmed no policy".
+                            self._warn_swallowed(
+                                "EMR Auto-Termination Policy",
+                                "elasticmapreduce:GetAutoTerminationPolicy",
+                                policy_err,
+                            )
+                            self._note_idle_verdict_missing(
+                                'emr auto-termination', cluster_id,
+                                f"read failed ({self._error_label(policy_err)})",
+                                verdict='auto-termination',
+                                evidence='GetAutoTerminationPolicy',
+                            )
+                        else:
+                            # A successful call with no AutoTerminationPolicy key
+                            # is the "no policy set" response implied by the
+                            # botocore model (no modeled errors for this
+                            # operation; AutoTerminationPolicy is an optional
+                            # output member) -- distinct from the except above.
+                            auto_termination_policy = policy_resp.get('AutoTerminationPolicy')
+                            auto_termination_unknown = False
+
                     clusters.append(EMRClusterData(
                         cluster_id=cluster_id,
                         cluster_name=c.get('Name', cluster_id),
@@ -8397,8 +8448,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         cluster_arn=details.get('ClusterArn', ''),
                         region=self._region,
                         release_label=details.get('ReleaseLabel', ''),
-                        auto_termination_policy=details.get('AutoTerminationPolicy'),
-                        keep_alive=details.get('KeepJobFlowAliveWhenNoSteps', True),
+                        auto_termination_policy=auto_termination_policy,
+                        auto_termination_unknown=auto_termination_unknown,
+                        keep_alive=keep_alive,
                         ready_datetime=timeline.get('ReadyDateTime'),
                         created_datetime=timeline.get('CreationDateTime'),
                         instance_groups=[{

@@ -4112,35 +4112,118 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     # =========================================================================
 
     async def get_appsync_apis(self) -> List[Dict[str, Any]]:
-        """Load AppSync APIs from exported JSON."""
-        return self._load_json('appsync_apis.json').get('graphqlApis', [])
+        """Load AppSync APIs from the export's ``appsync_apis.json``
+        (CLO-552: this used to call ``self._load_json``, which isn't defined
+        anywhere, so this raised AttributeError and the AppSync detectors
+        never ran Air-Gapped)."""
+        return self._get_data('appsync_apis')
 
     async def get_appsync_api_cache(self, api_id: str) -> Optional[Dict[str, Any]]:
-        """Load cache config from exported JSON."""
-        data = self._load_json(f'appsync_cache_{api_id}.json')
-        return data.get('apiCache') if data else None
+        """Load cache config from the export's
+        ``appsync_cache_<api_id>.json`` (CLO-552). None when the API has no
+        cache, the file was never exported (no cache configured), or
+        --anonymize removed it (CLO-554: the same ``_is_removed`` check
+        ``_get_data`` uses — inlined here, not a literal ``_get_data`` call,
+        because this file is a single cache-config dict, not a list
+        ``_get_data``'s extraction map knows how to unwrap)."""
+        key = f'appsync_cache_{api_id}'
+        if self._is_removed(key):
+            self._note_idle_verdict_missing(
+                'appsync_idle_cache', api_id,
+                f"{key}.json removed by --anonymize (CLO-554)",
+                verdict='idle-cache', evidence='AppSync cache config',
+            )
+            return None
+        data = self._export_data.get(key)
+        return data.get('apiCache') if isinstance(data, dict) else None
+
+    # AWS/AppSync publishes no CacheHitCount/CacheMissCount CloudWatch
+    # metric at all. The real cache metrics are Enhanced monitoring's
+    # CacheHit/CacheMiss, keyed by API_Id + Resolver — neither the export
+    # nor this provider reads them. The export's appsync_cache_hits_/
+    # appsync_cache_misses_ files are therefore always empty, which used to
+    # read as a measured zero: appsync_idle_cache fired HIGH confidence on
+    # every cached API, Air-Gapped, busy or not (CLO-577 fixes the same bug
+    # online; this is the offline half, blocking review on #1616).
+    _APPSYNC_UNPUBLISHED_METRICS = frozenset({'CacheHitCount', 'CacheMissCount'})
 
     async def get_appsync_metrics(
         self, api_id: str, metric_name: str,
         days: int = 14, statistic: str = 'Sum'
-    ) -> float:
-        """Load AppSync CloudWatch metric from exported JSON."""
+    ) -> Optional[float]:
+        """Sum of an exported AppSync CloudWatch metric (CLO-552).
+
+        cloudwise-export.sh writes these under ``cloudwatch_metrics/`` as raw
+        ``get-metric-statistics`` responses; the upload parser keeps them raw
+        under their file stem (like Transfer FilesIn, CLO-546), since no
+        consolidation pattern claims the ``appsync_*`` prefixes. None when
+        the file was never exported or the export read failed — CLO-485:
+        MISSING, not zero. An exported series with no datapoints sums to
+        0.0, a measured zero.
+
+        CacheHitCount/CacheMissCount are always MISSING (see
+        ``_APPSYNC_UNPUBLISHED_METRICS``): AWS never publishes them, so
+        there is nothing here for an export window or an anonymize-removed
+        file to change.
+
+        CLO-552 review follow-up: the export's actual CloudWatch collection
+        window (``CLOUDWATCH_PERIOD``, often 7 days) can be shorter than the
+        ``days`` the caller is judging — unused_appsync asks for 30,
+        appsync_idle_subscriptions for 14 (both read ``metric_name ==
+        'Latency'`` for their own request-count check, so ``days`` — not
+        ``metric_name`` — is what tells the two apart here). "0 requests in
+        30 days" would be a false claim on a 7-day export, so this is
+        MISSING rather than a claim scoped to a window the export never
+        covered."""
+        if metric_name in self._APPSYNC_UNPUBLISHED_METRICS:
+            self._note_idle_verdict_missing(
+                'appsync_idle_cache', api_id,
+                'cache hit/miss metric not published by AWS (CLO-577)',
+                verdict='idle-cache', evidence='AppSync cache hit/miss metrics',
+            )
+            return None
+
+        # days >= 30 is unused_appsync's window; appsync_idle_subscriptions
+        # always asks for 14. Both constants live in detectors/integration.py,
+        # which this module cannot import (detectors depend on providers,
+        # not the other way round), so this keys off the value itself.
+        service_key, verdict = (
+            ('unused_appsync', 'unused') if days >= 30
+            else ('appsync_idle_subscriptions', 'idle-subscriptions')
+        )
+        export_days = self._export_cloudwatch_days()
+        if export_days < days:
+            self._note_idle_verdict_missing(
+                service_key, api_id,
+                f"export covers {export_days} days, short of the {days}-day window",
+                verdict=verdict, evidence='AppSync CloudWatch metrics',
+            )
+            return None
+
         metric_file_map = {
             'Latency': f'appsync_requests_{api_id}',
-            'CacheHitCount': f'appsync_cache_hits_{api_id}',
-            'CacheMissCount': f'appsync_cache_misses_{api_id}',
             'ConnectSuccess': f'appsync_connections_{api_id}',
             'ActiveConnections': f'appsync_active_connections_{api_id}',
         }
         filename = metric_file_map.get(
             metric_name, f'appsync_{metric_name.lower()}_{api_id}'
         )
-        data = self._load_json(
-            f'cloudwatch_metrics/{filename}.json'
-        )
+        # CLO-552 review follow-up: the same anonymize-removed check
+        # _get_data performs, inlined (see get_appsync_api_cache above for
+        # why this can't be a literal _get_data call).
+        if self._is_removed(filename):
+            self._note_idle_verdict_missing(
+                service_key, api_id,
+                f"{filename}.json removed by --anonymize (CLO-554)",
+                verdict=verdict, evidence='AppSync CloudWatch metrics',
+            )
+            return None
+        data = self._export_data.get(filename)
+        if not isinstance(data, dict) or not isinstance(data.get('Datapoints'), list):
+            return None
         return sum(
             dp.get(statistic, 0)
-            for dp in data.get('Datapoints', [])
+            for dp in data['Datapoints']
         )
 
     # =========================================================================
@@ -4668,6 +4751,33 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 except (ValueError, TypeError):
                     created_dt = None
 
+            # CLO-574: the export's cluster detail is a raw DescribeCluster
+            # response, which has AutoTerminate (not KeepJobFlowAliveWhenNoSteps)
+            # and never carries an auto-termination policy -- the export script
+            # does not run GetAutoTerminationPolicy (CLO-574 follow-up ticket).
+            # keep_alive is still derivable from AutoTerminate; the policy itself
+            # is always unknown offline, so the detector must withhold the
+            # finding rather than read "no policy".
+            auto_terminate = cluster_detail.get('AutoTerminate')
+            keep_alive = (not auto_terminate) if auto_terminate is not None else True
+            # Mirror the detector's own age gate (and online.py's): a cluster
+            # younger than 24h is never a candidate for this finding, so a
+            # young cluster raises no MISSING note either.
+            ref_dt = ready_dt or created_dt
+            # An export timestamp without an offset parses naive, and a non-
+            # datetime (e.g. a CLI v1 epoch) can't be aged: treat naive as UTC,
+            # like the detector does, and anything else as not old enough.
+            if isinstance(ref_dt, datetime) and ref_dt.tzinfo is None:
+                ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+            old_enough = isinstance(ref_dt, datetime) and (
+                datetime.now(timezone.utc) - ref_dt
+            ) > timedelta(hours=24)
+            if keep_alive and old_enough:
+                self._note_idle_verdict_missing(
+                    'emr auto-termination', cluster_id, 'not in export',
+                    verdict='auto-termination', evidence='GetAutoTerminationPolicy',
+                )
+
             clusters.append(EMRClusterData(
                 cluster_id=cluster_id,
                 cluster_name=c.get('Name', cluster_id),
@@ -4675,8 +4785,9 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 cluster_arn=cluster_detail.get('ClusterArn', ''),
                 region=self._region,
                 release_label=cluster_detail.get('ReleaseLabel', ''),
-                auto_termination_policy=cluster_detail.get('AutoTerminationPolicy'),
-                keep_alive=cluster_detail.get('KeepJobFlowAliveWhenNoSteps', True),
+                auto_termination_policy=None,
+                auto_termination_unknown=True,
+                keep_alive=keep_alive,
                 ready_datetime=ready_dt,
                 created_datetime=created_dt,
                 instance_groups=[{
