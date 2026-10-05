@@ -205,3 +205,31 @@ def test_scan_region_result_pickles_for_worker_processes():
     import pickle
     res = _region_result("us-east-1", 1)
     assert pickle.loads(pickle.dumps(res)).region == "us-east-1"
+
+
+def test_placeholder_default_profile_falls_back_to_the_standard_chain(tmp_path, monkeypatch):
+    from cloudcostwise import runtime
+
+    cfg = tmp_path / "config"
+    cfg.write_text("[profile other]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "none"))
+    for value in ("default", "", "  "):
+        monkeypatch.setenv("AWS_PROFILE", value)
+        runtime._drop_placeholder_profile()
+        assert "AWS_PROFILE" not in __import__("os").environ, repr(value)
+
+
+def test_existing_default_or_named_profile_is_kept(tmp_path, monkeypatch):
+    import os
+    from cloudcostwise import runtime
+
+    cfg = tmp_path / "config"
+    cfg.write_text("[default]\nregion = us-east-1\n[profile other]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("AWS_PROFILE", "default")
+    runtime._drop_placeholder_profile()
+    assert os.environ["AWS_PROFILE"] == "default"
+    monkeypatch.setenv("AWS_PROFILE", "typo-profile")   # a real typo must still fail loudly later
+    runtime._drop_placeholder_profile()
+    assert os.environ["AWS_PROFILE"] == "typo-profile"

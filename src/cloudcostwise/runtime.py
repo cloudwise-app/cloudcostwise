@@ -68,8 +68,27 @@ class _LocalEnvironment:
     environment_name = "local"
 
 
+def _drop_placeholder_profile() -> None:
+    """Treat an empty or missing "default" AWS_PROFILE as "use the standard chain".
+
+    The Claude Code plugin passes AWS_PROFILE from its settings, which default
+    to "default". A user whose credentials come from environment variables or
+    SSO without a [default] profile would otherwise get "config profile
+    (default) could not be found" instead of a scan. Any other missing profile
+    is a real typo and still fails loudly.
+    """
+    value = os.environ.get("AWS_PROFILE")
+    if value is None or value.strip() not in ("", "default"):
+        return
+    os.environ.pop("AWS_PROFILE", None)  # boto3 reads it while listing profiles
+    if value.strip() == "default" and "default" in boto3.Session().available_profiles:
+        os.environ["AWS_PROFILE"] = value  # a real [default] exists: keep the user's setting
+
+
 def resolve_credentials(profile: Optional[str]) -> Credentials:
     """Standard boto3 chain (env vars, profile, SSO, instance role), frozen."""
+    if not profile:
+        _drop_placeholder_profile()
     try:
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
         creds = session.get_credentials()
