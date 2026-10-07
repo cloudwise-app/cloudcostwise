@@ -17,6 +17,7 @@
         "cloudwatch:GetMetricData",
         "cloudwatch:GetMetricStatistics",
         "cloudwatch:ListDashboards",
+        "cloudwatch:ListMetrics",
         "compute-optimizer:GetEBSVolumeRecommendations",
         "compute-optimizer:GetEC2InstanceRecommendations",
         "compute-optimizer:GetEnrollmentStatus",

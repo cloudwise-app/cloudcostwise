@@ -27,6 +27,84 @@ DYNAMODB_METRIC_WINDOW_DAYS = 14
 ELASTICACHE_IDLE_WINDOW_DAYS = 7
 
 
+# CLO-572: node memory ("Memory (GiB)" column) for every node type that
+# appears as a key OR a value of ``downsize_map`` in _detect_elasticache_waste
+# below -- Redis OSS and Valkey list the same figure for every type here.
+# Source: AWS ElastiCache User Guide, "Supported node types"
+# https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/CacheNodes.SupportedTypes.html
+# (read 2026-10-04). A type with no entry is MISSING, never guessed -- the
+# oversized memory gate withholds rather than assuming it fits.
+ELASTICACHE_NODE_MEMORY_GIB = {
+    'cache.r7g.2xlarge': 52.82, 'cache.r7g.xlarge': 26.32, 'cache.r7g.large': 13.07,
+    'cache.r6g.2xlarge': 52.82, 'cache.r6g.xlarge': 26.32, 'cache.r6g.large': 13.07,
+    'cache.r5.2xlarge': 52.82, 'cache.r5.xlarge': 26.32, 'cache.r5.large': 13.07,
+    'cache.m7g.2xlarge': 26.04, 'cache.m7g.xlarge': 12.93, 'cache.m7g.large': 6.38,
+    'cache.m6g.2xlarge': 26.04, 'cache.m6g.xlarge': 12.93, 'cache.m6g.large': 6.38,
+    'cache.m5.xlarge': 12.93, 'cache.m5.large': 6.38,
+    'cache.t4g.medium': 3.09, 'cache.t4g.small': 1.37, 'cache.t4g.micro': 0.50,
+    'cache.t3.medium': 3.09, 'cache.t3.small': 1.37, 'cache.t3.micro': 0.50,
+}
+
+# CLO-572: oversized_elasticache's memory gate. A one-tier downsize does not
+# always halve memory -- cache.r5.large -> cache.t3.medium is a 4.2x step,
+# cache.t3.small -> cache.t3.micro about 2.7x -- so gating on "% of the
+# CURRENT node" (the ticket's own illustrative example) would wave through
+# a workload that will not fit that SPECIFIC target. Instead the measured
+# average is projected onto the target's own capacity:
+#   projected_pct = avg_pct * (current_node_gib / target_node_gib)
+# and the verdict is withheld above this cap, leaving at least a quarter of
+# the target's memory as headroom -- the hourly/daily AVERAGE this gate
+# reads cannot see a traffic spike that pushes past it and evicts or OOMs.
+ELASTICACHE_MEMORY_HEADROOM_MAX_PCT = 75.0
+
+
+def _elasticache_oversized_memory_ok(metrics, node_type, target_type, period_seconds, data_provider, cluster_id, engine=None):
+    """CLO-572: whether the measured memory comfortably fits ``target_type``
+    after oversized_elasticache's one-tier downsize. Returns ``(ok, avg_pct)``.
+
+    ``ok`` is False -- and the oversized verdict must be withheld, never
+    read as fine -- whenever the data cannot support a verdict either way:
+    missing or under-covered DatabaseMemoryUsagePercentage (noted through
+    ``_note_idle_verdict_missing`` under its own 'elasticache-memory' key,
+    so it cannot mislabel the CPU note sharing this same aggregator), or a
+    node type absent from ``ELASTICACHE_NODE_MEMORY_GIB``. The same 75%
+    coverage rule CLO-559 set for CPU applies here.
+
+    ``engine`` names the no-datapoints case precisely for Memcached, which
+    AWS never publishes DatabaseMemoryUsagePercentage for (Redis OSS/Valkey
+    only) -- every Memcached cluster withholds here, by design, not by
+    accident; see CLO-572's Memcached follow-up ticket for a
+    BytesUsedForCache-based path."""
+    mem_datapoints = metrics.memory_datapoints
+    mem_window_days = metrics.memory_window_days or metrics.period_days
+    note = getattr(data_provider, '_note_idle_verdict_missing', None)
+
+    def _missing(reason):
+        if callable(note):
+            note(
+                'elasticache-memory', cluster_id, reason,
+                verdict='oversized', evidence='memory metrics',
+            )
+        return False, None
+
+    if mem_datapoints is None or not has_min_coverage(mem_datapoints, mem_window_days, period_seconds):
+        if not mem_datapoints and (engine or '').strip().lower() == 'memcached':
+            return _missing("Memcached publishes no DatabaseMemoryUsagePercentage")
+        return _missing(
+            "no DatabaseMemoryUsagePercentage datapoints" if not mem_datapoints
+            else "DatabaseMemoryUsagePercentage under 75% coverage"
+        )
+
+    current_gib = ELASTICACHE_NODE_MEMORY_GIB.get(node_type)
+    target_gib = ELASTICACHE_NODE_MEMORY_GIB.get(target_type)
+    if not current_gib or not target_gib:
+        return _missing(f"no memory size on file for {node_type} or {target_type}")
+
+    avg_pct = metrics.database_memory_usage_pct
+    projected_pct = avg_pct * (current_gib / target_gib)
+    return projected_pct <= ELASTICACHE_MEMORY_HEADROOM_MAX_PCT, avg_pct
+
+
 # CLO-535: DescribeDBInstances also lists DocumentDB and Neptune instances
 # and Aurora (aurora-*) cluster members. Their idle verdicts belong to
 # idle_documentdb, idle_neptune and the Aurora detectors, which judge the
@@ -69,6 +147,18 @@ def _elasticache_price_engine(engine) -> str:
     """The Price List rows an ElastiCache engine bills at: Valkey has its own
     rows; Redis OSS and Memcached share the Redis rows."""
     return 'valkey' if (engine or '').strip().lower() == 'valkey' else 'redis'
+
+
+def _redis_supports_data_tiering(engine_version) -> bool:
+    """True when a Redis OSS engine version is 6.2 or later, the first that
+    supports r6gd data tiering. '6.x', an empty string or anything else
+    without a readable major.minor is unknown, so False (withheld)."""
+    parts = (engine_version or '').strip().split('.')
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return False
+    return (major, minor) >= (6, 2)
 
 
 class ElastiCachePrices:
@@ -742,7 +832,25 @@ class OpenDatabaseDetectorsMixin:
                                 recommended_cost = recommended_price * 730 * cluster.num_nodes
                                 savings = monthly_cost - recommended_cost
 
+                                # CLO-572: low CPU alone recommends a one-tier
+                                # downsize that roughly halves (or, for some
+                                # targets, cuts much further into) memory. A
+                                # memory-bound, low-CPU cache -- a common
+                                # Redis profile -- would get a harmful
+                                # recommendation. Evaluated only once the
+                                # finding would otherwise fire (a priced,
+                                # savings-clearing target), so a busy or
+                                # unpriced cluster never gets a spurious
+                                # "memory missing" note.
+                                mem_ok, mem_avg = False, None
                                 if savings >= settings.min_waste_threshold_usd:
+                                    mem_ok, mem_avg = _elasticache_oversized_memory_ok(
+                                        metrics, cluster.node_type, recommended_type,
+                                        cpu_period_seconds, data_provider, cluster.cluster_id,
+                                        engine=cluster.engine,
+                                    )
+
+                                if savings >= settings.min_waste_threshold_usd and mem_ok:
                                     waste_items.append(WasteItem(
                                         id=str(uuid.uuid4()),
                                         resource_id=cluster.cluster_id,
@@ -751,7 +859,8 @@ class OpenDatabaseDetectorsMixin:
                                         title="Oversized ElastiCache Cluster",
                                         description=(
                                             f"Cluster '{cluster.cluster_id}' ({cluster.node_type}, {cluster.num_nodes} node(s)) "
-                                            f"has {cpu_avg:.1f}% average CPU. Consider downsizing to {recommended_type}."
+                                            f"has {cpu_avg:.1f}% average CPU and {mem_avg:.1f}% average memory. "
+                                            f"Consider downsizing to {recommended_type}."
                                         ),
                                         monthly_savings=savings,
                                         confidence=ConfidenceLevel.MEDIUM,
@@ -760,22 +869,28 @@ class OpenDatabaseDetectorsMixin:
                                             'detection': (
                                                 f'Average CPU utilization is {cpu_avg:.1f}% over 7 days with '
                                                 f'{metrics.current_connections_avg:.0f} avg connections. '
+                                                f'Average memory utilization is {mem_avg:.1f}% of the current node. '
                                                 f'Current type: {cluster.node_type}.'
                                             ),
-                                            'threshold': 'CPU utilization < 10% over 7 days',
+                                            'threshold': (
+                                                'CPU utilization < 10% over 7 days, and measured memory projects to '
+                                                f'at most {ELASTICACHE_MEMORY_HEADROOM_MAX_PCT:.0f}% of the target '
+                                                'node after the downsize (at least 75% coverage; CLO-572)'
+                                            ),
                                             'pricing': (
                                                 f'Current: {cluster.node_type} × {cluster.num_nodes} = ${monthly_cost:.2f}/month. '
                                                 f'Recommended: {recommended_type} × {cluster.num_nodes} = ${recommended_cost:.2f}/month. '
                                                 f'Savings: ${savings:.2f}/month.'
                                             ),
                                             'why_waste': (
-                                                f'This {cluster.engine} cluster is using only {cpu_avg:.1f}% of its CPU capacity. '
+                                                f'This {cluster.engine} cluster is using only {cpu_avg:.1f}% of its CPU capacity, '
+                                                f'and its measured memory use comfortably fits {recommended_type}. '
                                                 f'A smaller node type can handle the current workload at lower cost.'
                                             ),
                                             'risk': (
                                                 'Downsizing requires a maintenance window (brief failover for Redis cluster mode). '
-                                                'Monitor memory usage — memory is typically the bottleneck for ElastiCache, not CPU. '
-                                                'Check EngineCPUUtilization and DatabaseMemoryUsagePercentage before proceeding.'
+                                                'Re-check DatabaseMemoryUsagePercentage after the change; the gate above is an '
+                                                'average over the window and cannot see a traffic spike.'
                                             ),
                                         },
                                         metadata={
@@ -783,6 +898,7 @@ class OpenDatabaseDetectorsMixin:
                                             'current_type': cluster.node_type,
                                             'recommended_type': recommended_type,
                                             'cpu_avg': round(cpu_avg, 1),
+                                            'memory_pct_avg': round(mem_avg, 1),
                                             'connections_avg': round(metrics.current_connections_avg, 0),
                                             'engine': cluster.engine,
                                             'detection_mode': data_provider.provider_type,
@@ -979,34 +1095,62 @@ class OpenDatabaseDetectorsMixin:
         settings: "WasteDetectionSettings",
         data_provider: "WasteDataProvider",
     ) -> List[WasteItem]:
-        """Detect non-production ElastiCache clusters with unnecessary replicas."""
+        """Detect non-production ElastiCache clusters with unnecessary replicas.
+
+        CLO-585: ``get_elasticache_clusters`` returns one row per MEMBER cache
+        cluster (the primary and every replica, each its own CacheClusterId),
+        so a per-member loop priced and emitted the group's own replica
+        saving once per member — a 1-primary/2-replica group counted its
+        saving three times. Grouped by replication group (falling back to
+        the cluster id for a standalone cluster) so the saving is computed,
+        and emitted, exactly once per group. Tags are read per member (a
+        customer may tag only the primary), so any member's matching
+        Environment-style tag counts for the whole group."""
         waste_items = []
         NON_PROD_VALUES = {'dev', 'development', 'staging', 'stg', 'test', 'testing', 'sandbox', 'qa', 'uat'}
 
+        groups: Dict[str, list] = {}
+        group_order: List[str] = []
         for cluster in clusters:
-            if cluster.status != 'available':
+            key = cluster.replication_group_id or cluster.cluster_id
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(cluster)
+
+        for key in group_order:
+            members = groups[key]
+            # Any member: the topology fields are the group's, and every
+            # member shares them (members[0] is not necessarily the primary).
+            representative = members[0]
+            if representative.status != 'available':
                 continue
-            if cluster.engine not in ('redis', 'valkey'):
+            if representative.engine not in ('redis', 'valkey'):
                 continue
-            if cluster.replicas_per_shard <= 0:
+            if representative.replicas_per_shard <= 0:
                 continue
 
-            # Check environment tag
+            # Check environment tag on any member of the group.
             env_value = None
             env_tag_key = None
-            for key in ('Environment', 'environment', 'env', 'Env', 'ENV'):
-                if key in cluster.tags:
-                    env_value = cluster.tags[key].lower().strip()
-                    env_tag_key = key
+            env_member = representative
+            for member in members:
+                for tag_key in ('Environment', 'environment', 'env', 'Env', 'ENV'):
+                    if tag_key in member.tags:
+                        candidate = member.tags[tag_key].lower().strip()
+                        if candidate in NON_PROD_VALUES:
+                            env_value, env_tag_key, env_member = candidate, tag_key, member
+                            break
+                if env_value:
                     break
 
-            if not env_value or env_value not in NON_PROD_VALUES:
+            if not env_value:
                 continue
 
-            hourly_price = pricing.price(cluster.node_type, cluster.engine)
+            hourly_price = pricing.price(representative.node_type, representative.engine)
             if hourly_price is None:  # MISSING (noted by _detect_elasticache_waste)
                 continue
-            total_replicas = cluster.replicas_per_shard * cluster.num_shards
+            total_replicas = representative.replicas_per_shard * representative.num_shards
             savings = hourly_price * total_replicas * 730
 
             if savings < settings.min_waste_threshold_usd:
@@ -1014,12 +1158,12 @@ class OpenDatabaseDetectorsMixin:
 
             waste_items.append(WasteItem(
                 id=str(uuid.uuid4()),
-                resource_id=cluster.replication_group_id or cluster.cluster_id,
+                resource_id=key,
                 resource_type=ResourceType.ELASTICACHE_CLUSTER,
                 waste_type=WasteType.ELASTICACHE_REPLICATION_WASTE,
                 title="ElastiCache Replication Waste (Non-Production)",
                 description=(
-                    f"Replication group '{cluster.replication_group_id or cluster.cluster_id}' "
+                    f"Replication group '{key}' "
                     f"in {env_value} environment has {total_replicas} replica(s) costing "
                     f"${savings:.2f}/month. Non-production environments typically don't need "
                     f"replicas for high availability."
@@ -1029,13 +1173,13 @@ class OpenDatabaseDetectorsMixin:
                 action="Remove replicas from this non-production cluster to reduce costs.",
                 explanation={
                     'detection': (
-                        f'Replication group has {cluster.replicas_per_shard} replica(s) per shard '
-                        f'({cluster.num_shards} shard(s)) in {env_value} environment. '
-                        f'Environment detected via tag: {env_tag_key}={cluster.tags.get(env_tag_key, env_value)}'
+                        f'Replication group has {representative.replicas_per_shard} replica(s) per shard '
+                        f'({representative.num_shards} shard(s)) in {env_value} environment. '
+                        f'Environment detected via tag: {env_tag_key}={env_member.tags.get(env_tag_key, env_value)}'
                     ),
                     'threshold': 'Non-production environments (dev/staging/test/sandbox) with replicas',
                     'pricing': (
-                        f'{cluster.node_type} × {total_replicas} replica(s) = ${savings:.2f}/month in replica costs alone. '
+                        f'{representative.node_type} × {total_replicas} replica(s) = ${savings:.2f}/month in replica costs alone. '
                         f'Each replica is a full node at the same hourly rate as the primary.'
                     ),
                     'why_waste': (
@@ -1049,15 +1193,15 @@ class OpenDatabaseDetectorsMixin:
                     ),
                 },
                 metadata={
-                    'cluster_id': cluster.cluster_id,
-                    'replication_group_id': cluster.replication_group_id,
-                    'node_type': cluster.node_type,
+                    'cluster_id': representative.cluster_id,
+                    'replication_group_id': representative.replication_group_id,
+                    'node_type': representative.node_type,
                     'num_replicas': total_replicas,
-                    'num_shards': cluster.num_shards,
-                    'replicas_per_shard': cluster.replicas_per_shard,
+                    'num_shards': representative.num_shards,
+                    'replicas_per_shard': representative.replicas_per_shard,
                     'environment': env_value,
                     'monthly_savings': round(savings, 2),
-                    'engine': cluster.engine,
+                    'engine': representative.engine,
                     'detection_mode': data_provider.provider_type,
                 },
             ))
@@ -1325,7 +1469,20 @@ class OpenDatabaseDetectorsMixin:
         settings: "WasteDetectionSettings",
         data_provider: "WasteDataProvider",
     ) -> List[WasteItem]:
-        """Detect R5/R6g/R7g clusters eligible for R6gd data tiering (up to 52% savings)."""
+        """Detect R5/R6g/R7g replication groups eligible for R6gd data tiering
+        (up to 52% savings).
+
+        CLO-584: ``get_elasticache_clusters`` returns one row per MEMBER
+        cache cluster (NumCacheNodes=1 for every Redis/Valkey member), so
+        pricing one row's single node against one r6gd node always priced a
+        loss — r6gd always costs more per node, so the "saving" was negative
+        and floored out. Evaluated per replication group instead (falling
+        back to the cluster id for a standalone cluster, which for
+        Redis/Valkey is always a single node anyway): the memory a GROUP's
+        shards hold — not the replica copies of it — decides how many r6gd
+        shards are needed, and the result keeps the group's own replica
+        factor (data tiering does not remove HA; a replica is a full copy of
+        its shard, at the new node type, not a shard of new data)."""
         waste_items = []
 
         # Mapping from memory-only types to R6gd equivalents
@@ -1342,14 +1499,25 @@ class OpenDatabaseDetectorsMixin:
             'cache.r7g.2xlarge': 'cache.r6gd.2xlarge',
         }
 
-        # R6gd total capacity (memory + SSD) in GiB
+        # R6gd total capacity (memory + SSD) in GiB, AWS's documented figures.
+        # Source: the ElastiCache "Data tiering" page (docs.aws.amazon.com/
+        # AmazonElastiCache/latest/dg/data-tiering.html) and "Supported node
+        # types" (CacheNodes.SupportedTypes.html), confirmed 2026-10-05 via
+        # search excerpts of those pages (the docs host was egress-blocked):
+        #   xlarge   26.32 + 99.33   = 125.65
+        #   2xlarge  52.82 + 199.07  = 251.89
+        #   4xlarge  105.81 + 398.14 = 503.95
+        #   16xlarge 419.09 + 1592.56 = 2011.65 (AWS's launch range,
+        #            26.32-419.09 GiB memory + 99.33-1592.56 GiB SSD)
+        # The old table (145/290/.../2320) overstated each size by ~15%.
+        # 8xlarge and 12xlarge are WITHHELD: no AWS-attributed figure could be
+        # confirmed, so a group mapping to them is skipped (MISSING), not
+        # sized on a guess.
         R6GD_TOTAL_CAPACITY = {
-            'cache.r6gd.xlarge': 145,
-            'cache.r6gd.2xlarge': 290,
-            'cache.r6gd.4xlarge': 580,
-            'cache.r6gd.8xlarge': 1160,
-            'cache.r6gd.12xlarge': 1744,
-            'cache.r6gd.16xlarge': 2320,
+            'cache.r6gd.xlarge': 26.32 + 99.33,
+            'cache.r6gd.2xlarge': 52.82 + 199.07,
+            'cache.r6gd.4xlarge': 105.81 + 398.14,
+            'cache.r6gd.16xlarge': 419.09 + 1592.56,
         }
 
         NODE_MEMORY_GIB = {
@@ -1362,10 +1530,28 @@ class OpenDatabaseDetectorsMixin:
 
         import math
 
+        groups: Dict[str, list] = {}
+        group_order: List[str] = []
         for cluster in clusters:
+            key = cluster.replication_group_id or cluster.cluster_id
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(cluster)
+
+        for key in group_order:
+            members = groups[key]
+            # Any member: the topology fields are the group's, and every
+            # member shares them (members[0] is not necessarily the primary).
+            cluster = members[0]
             if cluster.status != 'available':
                 continue
             if cluster.engine not in ('redis', 'valkey'):
+                continue
+            # Data tiering needs Valkey or Redis OSS 6.2+. An older (or
+            # unreadable) Redis version can't adopt r6gd without an engine
+            # upgrade, so it is not recommended here.
+            if cluster.engine == 'redis' and not _redis_supports_data_tiering(cluster.engine_version):
                 continue
             if cluster.data_tiering_enabled:
                 continue
@@ -1373,11 +1559,21 @@ class OpenDatabaseDetectorsMixin:
                 continue
 
             r6gd_type = R6GD_MAP[cluster.node_type]
-            r6gd_capacity = R6GD_TOTAL_CAPACITY.get(r6gd_type, 145)
+            r6gd_capacity = R6GD_TOTAL_CAPACITY.get(r6gd_type)
+            if r6gd_capacity is None:  # MISSING: withheld size, see the table
+                continue
             node_memory = NODE_MEMORY_GIB.get(cluster.node_type, 26.32)
 
-            total_memory = node_memory * cluster.num_nodes
-            r6gd_nodes_needed = max(1, math.ceil(total_memory / r6gd_capacity))
+            num_shards = max(cluster.num_shards, 1)
+            replicas_per_shard = max(cluster.replicas_per_shard, 0)
+            total_nodes = num_shards * (replicas_per_shard + 1)
+
+            # Data tiering sizes SHARDS, not replica copies: the unique data
+            # a group holds is one copy per shard, and every replica stays a
+            # full copy of its own shard at the new node type.
+            shard_data_gib = node_memory * num_shards
+            r6gd_shards_needed = max(1, math.ceil(shard_data_gib / r6gd_capacity))
+            r6gd_nodes_needed = r6gd_shards_needed * (replicas_per_shard + 1)
 
             current_price = pricing.price(cluster.node_type, cluster.engine)
             r6gd_price = pricing.price(r6gd_type, cluster.engine)
@@ -1387,7 +1583,7 @@ class OpenDatabaseDetectorsMixin:
                 # Price List table.
                 continue
 
-            current_monthly = current_price * cluster.num_nodes * 730
+            current_monthly = current_price * total_nodes * 730
             r6gd_monthly = r6gd_price * r6gd_nodes_needed * 730
 
             savings = current_monthly - r6gd_monthly
@@ -1398,13 +1594,15 @@ class OpenDatabaseDetectorsMixin:
 
             waste_items.append(WasteItem(
                 id=str(uuid.uuid4()),
-                resource_id=cluster.replication_group_id or cluster.cluster_id,
+                resource_id=key,
                 resource_type=ResourceType.ELASTICACHE_CLUSTER,
                 waste_type=WasteType.ELASTICACHE_DATA_TIERING_OPPORTUNITY,
                 title="ElastiCache Data Tiering Opportunity",
                 description=(
-                    f"Cluster '{cluster.cluster_id}' uses {cluster.num_nodes}× {cluster.node_type} (memory-only). "
-                    f"Migrating to R6gd data tiering could consolidate to {r6gd_nodes_needed}× {r6gd_type}, "
+                    f"Replication group '{key}' runs {num_shards} shard(s) × "
+                    f"{replicas_per_shard + 1} node(s) of {cluster.node_type} (memory-only). "
+                    f"Migrating to R6gd data tiering could consolidate to {r6gd_shards_needed} "
+                    f"shard(s) × {replicas_per_shard + 1} node(s) of {r6gd_type}, "
                     f"saving ~${savings:.2f}/month ({savings_pct:.0f}% reduction)."
                 ),
                 monthly_savings=savings,
@@ -1412,19 +1610,22 @@ class OpenDatabaseDetectorsMixin:
                 action="Evaluate migrating to R6gd nodes with data tiering for cost savings.",
                 explanation={
                     'detection': (
-                        f'Cluster runs {cluster.num_nodes}× {cluster.node_type} ({total_memory:.1f} GiB total memory). '
-                        f'R6gd data tiering could provide equivalent capacity with fewer nodes.'
+                        f'Group runs {num_shards} shard(s) of {cluster.node_type} '
+                        f'({shard_data_gib:.1f} GiB of unique memory across shards, '
+                        f'{total_nodes} node(s) total with replicas). '
+                        f'R6gd data tiering could provide equivalent capacity with fewer shards.'
                     ),
                     'threshold': 'Memory-optimized R5/R6g/R7g nodes at xlarge or larger, not already using R6gd',
                     'pricing': (
-                        f'Current: {cluster.num_nodes}× {cluster.node_type} = ${current_monthly:.2f}/month. '
+                        f'Current: {total_nodes}× {cluster.node_type} = ${current_monthly:.2f}/month. '
                         f'With data tiering: {r6gd_nodes_needed}× {r6gd_type} = ${r6gd_monthly:.2f}/month. '
                         f'Savings: ${savings:.2f}/month ({savings_pct:.0f}% reduction).'
                     ),
                     'why_waste': (
                         'R6gd nodes combine memory and NVMe SSD, automatically tiering least-frequently-accessed '
-                        'data to SSD. This provides ~5× total storage capacity, allowing fewer nodes for the '
-                        'same dataset. AWS benchmarks show up to 52% cost reduction for large datasets.'
+                        'data to SSD. This provides ~5× total storage capacity per shard, allowing fewer shards for the '
+                        'same dataset while keeping the same replica count. AWS benchmarks show up to 52% cost '
+                        'reduction for large datasets.'
                     ),
                     'risk': (
                         'SSD-resident data has slightly higher latency on first access (sub-millisecond vs microsecond). '
@@ -1437,9 +1638,12 @@ class OpenDatabaseDetectorsMixin:
                     'cluster_id': cluster.cluster_id,
                     'replication_group_id': cluster.replication_group_id,
                     'current_type': cluster.node_type,
-                    'num_nodes': cluster.num_nodes,
+                    'num_nodes': total_nodes,
+                    'num_shards': num_shards,
+                    'replicas_per_shard': replicas_per_shard,
                     'recommended_type': r6gd_type,
                     'recommended_nodes': r6gd_nodes_needed,
+                    'recommended_shards': r6gd_shards_needed,
                     'current_monthly': round(current_monthly, 2),
                     'r6gd_monthly': round(r6gd_monthly, 2),
                     'monthly_savings': round(savings, 2),

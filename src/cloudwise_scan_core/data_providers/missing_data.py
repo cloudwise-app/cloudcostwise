@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 # Example resource ids kept in a note; the count covers the rest.
 _MAX_EXAMPLES = 3
 
+# CLO-589 follow-up: the one note kinesis_enhanced_fan_out_waste's withheld
+# verdicts share (both providers, the base default and the detector), kept
+# apart from the stream-level 'kinesis' note so their wording never mixes.
+KINESIS_EFO_NOTE_SERVICE = 'kinesis enhanced fan-out'
+KINESIS_EFO_NOTE_VERDICT = 'never-subscribed consumer'
+KINESIS_EFO_NOTE_EVIDENCE = 'SubscribeToShard series (ListMetrics)'
+
 
 class MissingDataNotesMixin:
     """Provider mixin. Needs ``self.data_warnings`` (a list), ``self._region``

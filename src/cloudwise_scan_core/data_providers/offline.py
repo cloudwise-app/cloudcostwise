@@ -22,9 +22,14 @@ from cloudwise_scan_core.cpu_sizing import (
     summarize_ecs_utilization,
     summarize_hourly_cpu,
 )
-from cloudwise_scan_core.metric_window import drop_pre_creation_datapoints
+from cloudwise_scan_core.metric_window import _as_utc, drop_pre_creation_datapoints, trim_to_recent_window
 from cloudwise_scan_core.data_providers.base import WasteDataProvider
-from cloudwise_scan_core.data_providers.missing_data import MissingDataNotesMixin
+from cloudwise_scan_core.data_providers.missing_data import (
+    KINESIS_EFO_NOTE_EVIDENCE,
+    KINESIS_EFO_NOTE_SERVICE,
+    KINESIS_EFO_NOTE_VERDICT,
+    MissingDataNotesMixin,
+)
 from cloudwise_scan_core.data_providers.models import (
     CounterRead,
     EC2InstanceData,
@@ -444,6 +449,11 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     _KEY_ALIASES: Dict[str, str] = {
         'load_balancers': 'elb_v2',
     }
+
+    # CLO-560, matching online.py's _MSK_FRESH_HOURS (CLO-549): how stale a
+    # broker's latest MSK datapoint may be next to the cluster's own
+    # freshest one before it is MISSING rather than averaged in.
+    _MSK_FRESH_HOURS = 3
 
     def _get_data(self, key: str) -> List[Any]:
         """
@@ -1317,6 +1327,9 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     is_idle=float(bytes_out) == 0,
                 )
             else:
+                # CLO-589: not exported (or an empty series, which the upload
+                # consolidation drops) is MISSING; is_idle stays False, noted.
+                self._note_idle_verdict_missing('nat gateway', nat_id, "not in export")
                 metrics[nat_id] = NATGatewayMetricsData(
                     nat_gateway_id=nat_id,
                     period_days=days,
@@ -2268,6 +2281,13 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             multi_az = False
             auto_failover = 'disabled'
 
+            # CLO-584: DataTiering is a ReplicationGroup field, never a
+            # CacheCluster one -- DescribeCacheClusters' CacheCluster shape
+            # has no DataTiering member, so the export's per-cluster row
+            # never carries it either. Read it off the replication group
+            # export row, the same lookup already used for shard/replica/
+            # Multi-AZ topology.
+            data_tiering_enabled = False
             if rg_id and rg_id in rg_map:
                 rg = rg_map[rg_id]
                 node_groups = rg.get('NodeGroups', rg.get('node_groups', []))
@@ -2277,6 +2297,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     replicas_per_shard = max(len(members) - 1, 0)
                 multi_az = rg.get('MultiAZ', rg.get('multi_az', 'disabled')) == 'enabled'
                 auto_failover = rg.get('AutomaticFailover', rg.get('automatic_failover', 'disabled'))
+                data_tiering_enabled = rg.get('DataTiering', rg.get('data_tiering', 'disabled')) == 'enabled'
 
             clusters.append(ElastiCacheClusterData(
                 cluster_id=cluster_id,
@@ -2293,7 +2314,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 replicas_per_shard=replicas_per_shard,
                 multi_az_enabled=multi_az,
                 automatic_failover=auto_failover,
-                data_tiering_enabled=cluster.get('DataTiering', cluster.get('data_tiering', 'disabled')) == 'enabled',
+                data_tiering_enabled=data_tiering_enabled,
             ))
         
         return clusters
@@ -2371,6 +2392,37 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             mem_data = _extract_points(self._export_data.get(f'elasticache_memory_{cluster_id}'), created)
             bytes_data = _extract_points(self._export_data.get(f'elasticache_bytes_{cluster_id}'), created)
 
+            # CLO-485/CLO-559: the window coverage gates are measured against
+            # what the export actually collected, clamped to the detector's
+            # own window -- an export shorter than the window could never
+            # pass otherwise, and the CLO-572 trim below needs the same
+            # number so CPU/memory aren't held to a window wider than what
+            # coverage was computed against.
+            metric_window_days = min(idle_window_days or days, self._export_cloudwatch_days())
+            # CLO-572 hardening: if the export ever collects more days than
+            # this detector's window asks for, only the most recent
+            # ``metric_window_days`` of CPU/memory hours should feed the
+            # average and the coverage count -- not the whole export.
+            # Anchored on the manifest's own export_timestamp when present
+            # (falling back to the series' own latest Timestamp); never
+            # wall-clock "now" -- an upload is read long after the export ran.
+            _manifest = self._export_data.get('manifest')
+            export_anchor = _manifest.get('export_timestamp') if isinstance(_manifest, dict) else None
+            cpu_data = trim_to_recent_window(cpu_data, metric_window_days, 3600, anchor=export_anchor)
+            mem_data = trim_to_recent_window(mem_data, metric_window_days, 3600, anchor=export_anchor)
+            # CLO-579: CurrConnections and BytesUsedForCache got the same
+            # CLO-572 trim CPU/memory already had -- an export collecting
+            # more hours than this window asks for must not let the older
+            # hours widen the average/coverage. Only the RAW per-hour
+            # ``conn_data`` (read when ``raw_conn_present``, below) carries
+            # Timestamps to trim on; the ``consolidated_conn`` row fallback
+            # (what a real upload normally has -- CLO-498's
+            # ``_consolidate_metrics`` folds the raw file into one
+            # pre-aggregated row with no per-datapoint Timestamps) cannot be
+            # trimmed and is used as exported.
+            conn_data = trim_to_recent_window(conn_data, metric_window_days, 3600, anchor=export_anchor)
+            bytes_data = trim_to_recent_window(bytes_data, metric_window_days, 3600, anchor=export_anchor)
+
             conn_avg = _stat_avg(conn_data, 'Sum') if conn_data else 0.0
             conn_max_val = _stat_max(conn_data, 'Maximum') if conn_data else 0.0
             conn_std_val = _stat_std(conn_data, 'Sum') if conn_data else 0.0
@@ -2383,7 +2435,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # of the hours the export collected (#1452's coverage rule). Any
             # other series (CPU, memory) says nothing about clients, and the
             # detector used to read a missing series as 0 connections.
-            conn_window_days = min(idle_window_days or days, self._export_cloudwatch_days())
+            conn_window_days = metric_window_days
             conn_points = len(conn_data)
             conn_zero = conn_avg == 0 and conn_max_val == 0
             row = consolidated_conn.get(cluster_id)
@@ -2406,9 +2458,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             metrics[cluster_id] = ElastiCacheMetricsData(
                 cluster_id=cluster_id,
                 cache_hits_avg=0.0,
-                current_connections_avg=round(conn_avg, 2),
+                # CLO-584: deliberately unrounded, same reason as the online
+                # provider -- rounding a brief-connections average to 2dp
+                # can collapse a true small positive to exactly 0.0, which
+                # makes oversized_elasticache's own
+                # ``current_connections_avg > 0`` gate unreachable. The std
+                # stays unrounded with it (the serverless cv = std/avg).
+                current_connections_avg=conn_avg,
                 current_connections_max=round(conn_max_val, 2),
-                current_connections_std=round(conn_std_val, 2),
+                current_connections_std=conn_std_val,
                 cpu_utilization_avg=round(cpu_avg, 2),
                 cpu_utilization_max=round(cpu_max_val, 2),
                 database_memory_usage_pct=round(mem_pct, 2),
@@ -2421,7 +2479,10 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # sized to what the export actually collected, the same
                 # clamp conn_window_days applies above — else an export
                 # shorter than the requested window could never pass.
-                cpu_window_days=min(days, self._export_cloudwatch_days()),
+                cpu_window_days=metric_window_days,
+                # CLO-572: same clamp, for the memory gate's coverage check.
+                memory_datapoints=len(mem_data),
+                memory_window_days=metric_window_days,
             )
 
         return metrics
@@ -3071,20 +3132,33 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         consumer_name: str,
         days: int = 14,
         consumer_create_time: Optional[datetime] = None,
-    ) -> KinesisMetricsData:
-        """Get consumer metrics from the export (pre-aggregated, so
-        ``consumer_create_time`` cannot filter anything; CLO-457)."""
-        for m in self._get_data('kinesis_consumer_metrics'):
-            if (m.get('stream_name') == stream_name and
-                    m.get('consumer_name') == consumer_name):
-                get_records = m.get('get_records_total', 0)
-                return KinesisMetricsData(
-                    stream_name=stream_name,
-                    get_records_total=int(get_records),
-                    period_days=days,
-                    is_idle=int(get_records) == 0,
-                )
-        return KinesisMetricsData(stream_name=stream_name, period_days=days)
+    ) -> Optional[KinesisMetricsData]:
+        """Enhanced fan-out consumer reads are MISSING offline (CLO-589).
+
+        The export never collects a per-consumer series (cloudwise-export.sh
+        lists consumers but reads no consumer metric), so the old fallback
+        returned a default model whose 0 reads made every exported consumer
+        idle. A ``get_records_total`` hand-fed under ``consumer_metrics``
+        would be GetRecords, which an enhanced fan-out consumer never calls,
+        so it is no evidence either. Always None, noted."""
+        self._note_idle_verdict_missing(
+            'kinesis', f"{stream_name}/{consumer_name}",
+            "SubscribeToShardEvent.Records not in export",
+        )
+        return None
+
+    async def get_kinesis_consumer_subscribed(
+        self, stream_name: str, consumer_name: str,
+    ) -> Optional[bool]:
+        """CLO-589 follow-up: MISSING offline. cloudwise-export.sh runs no
+        ListMetrics, so the export cannot tell a never-subscribed consumer
+        from a subscribed one; always None, noted. That makes
+        kinesis_enhanced_fan_out_waste online-only (ONLINE_ONLY_WASTE_TYPES)."""
+        self._note_idle_verdict_missing(
+            KINESIS_EFO_NOTE_SERVICE, f"{stream_name}/{consumer_name}", "not in export",
+            verdict=KINESIS_EFO_NOTE_VERDICT, evidence=KINESIS_EFO_NOTE_EVIDENCE,
+        )
+        return None
 
     async def get_firehose_delivery_streams(self) -> List[KinesisFirehoseData]:
         """Get Firehose delivery streams from the export."""
@@ -3158,10 +3232,13 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # list-clusters-v2 nests fields under 'Provisioned'
             provisioned = c.get('Provisioned', {})
 
-            # broker count: v2 nests under Provisioned, v1 is flat
+            # broker count: v2 nests under Provisioned, v1 is flat.
+            # CLO-560 (CLO-549's convention): None when absent, never a
+            # 3-broker guess — the per-broker metric read then withholds
+            # both verdicts as MISSING.
             broker_count = (
                 provisioned.get('NumberOfBrokerNodes')
-                or c.get('NumberOfBrokerNodes', 3)
+                or c.get('NumberOfBrokerNodes')
             )
             # instance type: v2 nests under Provisioned.BrokerNodeGroupInfo
             broker_info = (
@@ -3191,48 +3268,210 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         created: Optional[datetime] = None,
         broker_count: Optional[int] = None,
     ) -> Optional[MSKMetrics]:
-        """Get MSK metrics from the export.
+        """Per-broker MSK metrics from the export (CLO-560), mirroring
+        ``OnlineDataProvider.get_msk_metrics`` (CLO-549, PR #1598).
 
-        CLO-457: ``created`` is accepted but cannot be applied: the export
-        holds window averages, not timestamped datapoints. The idle
-        detector's minimum-age rule is the defence here.
-        CLO-549: ``broker_count`` is accepted and unused here (the export
-        holds one series per cluster, not per broker).
+        AWS/Kafka publishes MessagesInPerSec, BytesInPerSec, BytesOutPerSec,
+        CpuUser and CpuSystem per broker ("Cluster Name" + "Broker ID");
+        cloudwise-export.sh now queries brokers "1".."N" (N = list-clusters-v2's
+        Provisioned.NumberOfBrokerNodes, read in :meth:`get_msk_clusters`) and
+        keeps each broker's series raw under
+        ``msk_<metric>_<cluster name>_broker_<id>``, like Transfer FilesIn
+        (CLO-546).
 
-        Reads consolidated msk_messages_metrics, msk_bytes_in_metrics,
-        msk_bytes_out_metrics, and msk_cpu_metrics produced by the
-        upload service from the per-cluster CloudWatch metric files
-        collected by cloudwise-export.sh.
+        CLO-457: ``created`` drops pre-creation datapoints (a reused
+        "Cluster Name" inherits a deleted predecessor's hourly buckets),
+        exactly as the online path does, now that each broker's series is
+        kept raw with its own Timestamps. A broker's latest surviving
+        datapoint must also be within ``_MSK_FRESH_HOURS`` of a freshness
+        anchor, or it is MISSING instead of averaging a removed broker's
+        stale datapoints in as idle: the export's ``export_timestamp`` when
+        it reaches this provider (matching online's live "now" exactly),
+        else the cluster's own latest exported MSK datapoint as a
+        self-referential proxy (today's common case — see the anchor's own
+        comment, below, for why).
+
+        A broker count never exported (CLO-549: no 3-broker guess) withholds
+        both verdicts. A broker with no exported series, or an empty or
+        stale one, is MISSING for that metric, not a measured zero (these
+        are gauges that only publish while there is traffic/load): any
+        broker missing messages_in or bytes_in withholds the whole cluster's
+        traffic verdict ("partial broker coverage"). CPU needs every
+        broker's CpuUser and CpuSystem, matched by Timestamp; a gap there
+        withholds oversized only — idle still fires on traffic alone. A
+        probe at broker id N+1 (one extra exported MessagesInPerSec file)
+        that published anything means "1".."N" was not the whole cluster; a
+        probe the parser never saw at all (0-byte failed read, or never
+        written) is itself withheld, not read as silence.
         """
-        # Look up each metric type for this cluster
-        messages_in = 0.0
-        bytes_in = 0.0
-        bytes_out = 0.0
-        cpu_user = 0.0
-        found_any = False
-
-        for metric_key, field_name in [
-            ('msk_messages_metrics', 'messages_in'),
-            ('msk_bytes_in_metrics', 'bytes_in'),
-            ('msk_bytes_out_metrics', 'bytes_out'),
-            ('msk_cpu_metrics', 'cpu_user'),
-        ]:
-            for entry in self._get_data(metric_key):
-                if entry.get('cluster_name') == cluster_name:
-                    found_any = True
-                    avg_val = entry.get('avg', entry.get('cpu_avg', 0.0))
-                    if field_name == 'messages_in':
-                        messages_in = avg_val
-                    elif field_name == 'bytes_in':
-                        bytes_in = avg_val
-                    elif field_name == 'bytes_out':
-                        bytes_out = avg_val
-                    elif field_name == 'cpu_user':
-                        cpu_user = avg_val
-                    break
-
-        if not found_any:
+        if isinstance(broker_count, bool) or not isinstance(broker_count, int) or broker_count < 1:
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, 'broker count unknown', evidence='per-broker traffic metrics',
+            )
             return None
+
+        broker_ids = [str(i) for i in range(1, broker_count + 1)]
+        metric_prefixes = (
+            'msk_messages_', 'msk_bytes_in_', 'msk_bytes_out_', 'msk_cpu_', 'msk_cpu_system_',
+        )
+
+        def _raw_series(metric_prefix: str, broker_id: str) -> Optional[List[Dict[str, Any]]]:
+            """A broker's own raw ``Datapoints`` after CLO-457's pre-creation
+            drop, or None when MISSING (not exported, a 0-byte failed read
+            the parser skipped, or an exported-but-empty series)."""
+            data = self._export_data.get(f'{metric_prefix}{cluster_name}_broker_{broker_id}')
+            if not isinstance(data, dict) or not isinstance(data.get('Datapoints'), list):
+                return None
+            dps = drop_pre_creation_datapoints(data['Datapoints'], created, 3600)
+            return dps or None
+
+        def _latest(dps: List[Dict[str, Any]]) -> Optional[datetime]:
+            timestamps = [t for t in (_as_utc(d.get('Timestamp')) for d in dps) if t is not None]
+            return max(timestamps) if timestamps else None
+
+        # Freshness anchor: the export's own export_timestamp when it's
+        # readable, matching online's live "now" exactly. In practice the
+        # upload path does not thread the manifest through to the per-
+        # region/single-region resources dict this provider reads (a
+        # known, separate gap that also affects DocumentDB's and
+        # Beanstalk's own window-capping; tracked on CLO-560), so this
+        # falls back to the cluster's own latest surviving MSK datapoint —
+        # a self-referential proxy for "now" that still catches a broker
+        # gone stale next to its still-live siblings, just not a broker
+        # that went stale before the rest of the cluster did too.
+        manifest = self._export_data.get('manifest')
+        export_timestamp = (
+            _as_utc(manifest.get('export_timestamp')) if isinstance(manifest, dict) else None
+        )
+        if export_timestamp is not None:
+            fresh_after = export_timestamp - timedelta(hours=self._MSK_FRESH_HOURS)
+        else:
+            cluster_latest = max(
+                (
+                    lt for broker_id in broker_ids for prefix in metric_prefixes
+                    for lt in [_latest(_raw_series(prefix, broker_id) or [])] if lt is not None
+                ),
+                default=None,
+            )
+            fresh_after = (
+                cluster_latest - timedelta(hours=self._MSK_FRESH_HOURS) if cluster_latest else None
+            )
+
+        def _series(metric_prefix: str, broker_id: str) -> Optional[List[Dict[str, Any]]]:
+            """``_raw_series``, additionally MISSING when stale next to the
+            cluster's own freshest MSK datapoint (a broker removed
+            mid-window)."""
+            dps = _raw_series(metric_prefix, broker_id)
+            if dps is None:
+                return None
+            if fresh_after is not None:
+                latest = _latest(dps)
+                if latest is None or latest < fresh_after:
+                    return None
+            return dps
+
+        def _mean(dps: List[Dict[str, Any]]) -> float:
+            return sum(d.get('Average', 0) for d in dps) / len(dps)
+
+        def _per_broker(metric_prefix: str) -> Tuple[Optional[Dict[str, float]], str]:
+            """Each broker's mean, or (None, why) when any broker is MISSING."""
+            means: Dict[str, float] = {}
+            for broker_id in broker_ids:
+                dps = _series(metric_prefix, broker_id)
+                if dps is not None:
+                    means[broker_id] = _mean(dps)
+            if len(means) == len(broker_ids):
+                return means, ''
+            if not means:
+                return None, 'no datapoints'
+            return None, f"partial broker coverage ({len(means)} of {len(broker_ids)} brokers)"
+
+        msg_means, msg_why = _per_broker('msk_messages_')
+        bin_means, bin_why = _per_broker('msk_bytes_in_')
+        if msg_means is None or bin_means is None:
+            # CLO-457/CLO-549/CLO-560: unmeasured traffic, on any broker, is
+            # MISSING. Both verdicts need it (idle reads it as zero, oversized
+            # as network headroom).
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, msg_why or bin_why, evidence='per-broker traffic metrics',
+            )
+            return None
+
+        # A broker past the reported count that published anything means
+        # "1".."N" was not the cluster's whole set (PR #1598's online probe).
+        # A failed probe read is itself withheld, not treated as silence:
+        # a 0-byte read the parser skipped (or the file never written) is
+        # absent from _export_data entirely, same as online's "a failed
+        # query or an unknown broker count" MISSING — unlike a probe that
+        # was genuinely read and is simply empty (the broker really isn't
+        # there), which _raw_series also reports as None but which is a
+        # real, trustworthy answer.
+        probe_key = f'msk_messages_{cluster_name}_broker_{broker_count + 1}'
+        if probe_key not in self._export_data:
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, 'probe read failed',
+                evidence='per-broker traffic metrics',
+            )
+            return None
+        probe = _raw_series('msk_messages_', str(broker_count + 1))
+        if probe:
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, 'broker ids beyond the reported count',
+                evidence='per-broker traffic metrics',
+            )
+            return None
+
+        messages_in = sum(msg_means.values())
+        bytes_in = sum(bin_means.values())
+
+        bout_means, bout_why = _per_broker('msk_bytes_out_')
+        if bout_means is None:
+            # Both verdicts need BytesOut: a consumer-only cluster (no
+            # inbound, consumers still reading) is NOT idle, and oversized
+            # would read it as network headroom. Unmeasured is MISSING.
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, bout_why,
+                verdict='idle' if messages_in == 0 and bytes_in == 0 else 'oversized',
+                evidence='per-broker BytesOutPerSec',
+            )
+            return None
+        bytes_out = sum(bout_means.values())
+        # Idle needs no inbound AND no outbound traffic on any broker.
+        is_idle = messages_in == 0 and bytes_in == 0 and bytes_out == 0
+
+        # CPU: per broker, the hours with both CpuUser and CpuSystem,
+        # matched by Timestamp exactly as online does (the export's two CPU
+        # files for a broker are not guaranteed to share every hour); the
+        # cluster's figure is the busiest broker's mean (AWS's sizing
+        # guidance reads total CPU as user + system). A broker with no
+        # shared hour between its two series is unmeasured.
+        cpu_by_broker: Dict[str, float] = {}
+        cpu_hours: List[int] = []
+        for broker_id in broker_ids:
+            user = _series('msk_cpu_', broker_id)
+            system = _series('msk_cpu_system_', broker_id)
+            if user is None or system is None:
+                continue
+            system_by_ts = {d.get('Timestamp'): d.get('Average', 0) for d in system}
+            totals = [
+                d.get('Average', 0) + system_by_ts[d.get('Timestamp')]
+                for d in user if d.get('Timestamp') in system_by_ts
+            ]
+            if not totals:
+                continue
+            cpu_by_broker[broker_id] = sum(totals) / len(totals)
+            cpu_hours.append(len(totals))
+        cpu_measured = len(cpu_by_broker) == len(broker_ids)
+        cpu_user = max(cpu_by_broker.values()) if cpu_measured else 0.0
+        # CLO-457: 0 means CPU was not measured (cpu_user is a placeholder,
+        # not 0% CPU).
+        cpu_datapoints = min(cpu_hours) if cpu_measured else 0
+        if not cpu_measured and not is_idle:
+            self._note_idle_verdict_missing(
+                'msk', cluster_name, 'no datapoints' if not cpu_by_broker else
+                f"partial broker coverage ({len(cpu_by_broker)} of {len(broker_ids)} brokers)",
+                verdict='oversized', evidence='per-broker CPU metrics',
+            )
 
         return MSKMetrics(
             messages_in_per_sec=round(messages_in, 2),
@@ -3240,7 +3479,8 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             bytes_out_per_sec=round(bytes_out, 2),
             cpu_user=round(cpu_user, 2),
             period_days=days,
-            is_idle=messages_in == 0 and bytes_in == 0,
+            is_idle=is_idle,
+            cpu_datapoints=cpu_datapoints,
         )
 
     # =========================================================================
@@ -3368,10 +3608,28 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         series covers few hours and is withheld); datapoints without a
         parseable Timestamp cannot show coverage and are withheld, not
         guessed. Empty or under-covered is MISSING (noted), never 0% use
-        (CLO-541: empty used to read as idle)."""
-        key = f'cloudwatch_ecs_{metric_name.lower()}_{cluster_name}_{service_name}'
+        (CLO-541: empty used to read as idle).
+
+        CLO-556: export 1.24.0+ writes the per-service series
+        (ecs_service_<cpu|memory>_<cluster>.<service>.json), which the upload
+        parser keeps under this key. A series not in the export (an older
+        export, or a failed read's 0-byte file) is MISSING and noted too; it
+        used to return None silently.
+
+        The key keeps the export's "." between the cluster and the service
+        (review of PR #1661): ECS names may hold "_" but never ".", so with
+        "_" cluster ``prod_api`` + service ``worker`` and cluster ``prod`` +
+        service ``api_worker`` read one series. No export ever wrote the old
+        "_" key (no per-service series existed before 1.24.0), so it is not
+        read."""
+        key = f'cloudwatch_ecs_{metric_name.lower()}_{cluster_name}.{service_name}'
         data = self._export_data.get(key)
         if not (isinstance(data, dict) and 'Datapoints' in data):
+            self._note_idle_verdict_missing(
+                'ecs', f"{cluster_name}/{service_name}",
+                f"{metric_name} not in export",
+                verdict='oversized', evidence='hourly utilization metrics',
+            )
             return None
         datapoints = data['Datapoints'] or []
         hours = set()
@@ -3502,8 +3760,32 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     # =========================================================================
 
     def get_transfer_servers(self) -> List[Dict[str, Any]]:
-        """Get Transfer servers from exported data."""
-        return self._get_data('transfer_servers')
+        """Transfer servers from exported data, each list-servers entry
+        merged with its describe-server detail (CLO-548).
+
+        list-servers' ListedServer has no ``Protocols``, so every exported
+        server read as the detector's ``['SFTP']`` default: a multi-protocol
+        server was priced as one protocol and never reached the per-protocol
+        check, and an AS2 server lost its "an EMPTY AS2 read is not a measured
+        zero" guard. The export has always written
+        ``transfer_server_<id>.json`` (``{"Server": {...}}``), as online
+        enriches with DescribeServer; it is now merged over the listed entry.
+        Absent or 0-byte (a failed read, skipped by the upload parser): the
+        listed entry is returned without ``Protocols``: protocols unknown, so
+        the detector does not read an EMPTY series as a measured zero there
+        (noted, as for AS2)."""
+        servers = []
+        for listed in self._get_data('transfer_servers'):
+            if not isinstance(listed, dict):
+                continue
+            server_id = listed.get('ServerId', '')
+            detail = self._export_data.get(f'transfer_server_{server_id}')
+            detail = detail.get('Server') if isinstance(detail, dict) else None
+            if isinstance(detail, dict):
+                servers.append({**listed, **detail})
+            else:
+                servers.append(dict(listed))
+        return servers
 
     def get_transfer_server_users(self, server_id: str) -> Optional[List[Dict[str, Any]]]:
         """Users of a Transfer server from exported data, or None when the
@@ -3553,18 +3835,61 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         server-level FilesIn series only, which the upload parser keeps raw
         under its file stem ``transfer_files_<id>`` (it used to drop it: the
         prefix was claimed with no consolidation pattern). That file answers
-        FilesIn alone; FilesOut and per-protocol series are not exported, so
-        they are MISSING. A failed export read leaves a 0-byte file, which
-        the parser skips: MISSING, not zero."""
+        FilesIn alone; FilesOut is ``transfer_filesout_<id>`` (export 1.24.0+,
+        CLO-548; absent in older exports, so MISSING there). Per-protocol
+        series are not exported (AWS documents no Protocol dimension on
+        AWS/Transfer), so they are MISSING. A failed export read leaves a
+        0-byte file, which the parser skips: MISSING, not zero.
+
+        The two export-written series cover the window the export read
+        (:meth:`_export_transfer_window_days`), not ``days``. An empty
+        series carries no timestamps, so when ``days`` is longer than that
+        window a zero read is MISSING: an empty 30-day series is not a
+        measured zero over 45 days (review of PR #1661, finding 2). Non-zero
+        traffic in the shorter window still proves activity, so it is read."""
         suffix = f"_{protocol.lower()}" if protocol else ""
         series = self._transfer_series(
             f'cloudwatch_transfer_{metric_name.lower()}_{server_id}{suffix}')
-        if series is None and metric_name == 'FilesIn' and not protocol:
-            series = self._transfer_series(f'transfer_files_{server_id}')
+        # CLO-548: export 1.24.0+ writes FilesOut as transfer_filesout_<id>
+        # (kept raw by the upload parser). Only that series answers FilesOut:
+        # BytesOut is a different counter and never stands in for it.
+        export_key = {
+            'FilesIn': f'transfer_files_{server_id}',
+            'FilesOut': f'transfer_filesout_{server_id}',
+        }.get(metric_name)
+        if series is None and export_key and not protocol:
+            series = self._transfer_series(export_key)
+            window = self._export_transfer_window_days(server_id)
+            if series is not None and days > window:
+                read = CounterRead.from_datapoints(series)
+                # Traffic inside the shorter window is traffic inside the
+                # longer one; only a zero cannot be stretched over it.
+                if not (read.value or 0) > 0:
+                    return CounterRead.missing(
+                        f"{metric_name} exported over {window} days, "
+                        f"shorter than the {days}-day window")
         if series is None:
             label = f"{metric_name} {protocol}" if protocol else metric_name
             return CounterRead.missing(f"{label} not in export")
         return CounterRead.from_datapoints(series)
+
+    # cloudwise-export.sh 1.24.0+ reads Transfer FilesIn and FilesOut over a
+    # fixed 30-day window ("30 days ago" in export_cloudwatch_metrics), not
+    # CLOUDWATCH_PERIOD. The export records no window, so this constant is
+    # the contract; a test pins it to the script's literals.
+    EXPORT_TRANSFER_WINDOW_DAYS = 30
+
+    def _export_transfer_window_days(self, server_id: str) -> int:
+        """Days the exported FilesIn / FilesOut series of ``server_id`` cover.
+
+        Only export 1.24.0+ writes ``transfer_filesout_<id>``, and it reads
+        both series over :attr:`EXPORT_TRANSFER_WINDOW_DAYS`. Without that
+        file the FilesIn series may come from an older export, which read it
+        over CLOUDWATCH_PERIOD (:meth:`_export_cloudwatch_days`), so the
+        shorter window is assumed."""
+        if self._transfer_series(f'transfer_filesout_{server_id}') is not None:
+            return self.EXPORT_TRANSFER_WINDOW_DAYS
+        return self._export_cloudwatch_days()
 
     def _transfer_series(self, key: str) -> Optional[List[Dict[str, Any]]]:
         """The ``Datapoints`` list of an exported CloudWatch response under
@@ -3705,6 +4030,44 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 not_resources=body.get('NotResources', body.get('not_resources', [])),
             ))
         return selections
+
+    async def backup_vault_exists(self, vault_arn: str) -> Optional[bool]:
+        """CLO-589: judged against the exported list-backup-vaults, which
+        covers only the export's own Region and account. A vault elsewhere,
+        or an export with no valid vault list, is None (noted).
+
+        CLO-589 follow-up (PR #1654 review MEDIUM 3): the export runs only
+        the unfiltered ``list-backup-vaults``, which may leave out a
+        logically air-gapped or restore-access vault, so a vault missing
+        from it is not proven deleted: None, noted, never False. The
+        detector withholds on False and None alike; this only makes the
+        withhold visible. Listing each ``--by-vault-type`` in the export
+        would let offline say False again."""
+        raw_vaults = self._export_data.get('backup_vaults')
+        vaults = raw_vaults.get('BackupVaultList') if isinstance(raw_vaults, dict) else raw_vaults
+        parts = vault_arn.split(':')
+        reason = None
+        if len(parts) < 7 or parts[2] != 'backup' or parts[5] != 'backup-vault':
+            reason = 'vault ARN unparseable'
+        elif not isinstance(vaults, list) or (not vaults and self._legacy_failed_reads):
+            reason = 'vault list not read'
+        else:
+            arns = {v.get('BackupVaultArn') for v in vaults if isinstance(v, dict)}
+            if vault_arn in arns:
+                return True
+            # Absent could be "deleted" only when the list could have held
+            # it (same Region, an account the exported vaults belong to), and
+            # even then the unfiltered list may omit other vault types.
+            own_accounts = {a.split(':')[4] for a in arns if a and len(a.split(':')) >= 7}
+            if parts[3] == self._region and parts[4] in own_accounts:
+                reason = 'vault absent from the unfiltered vault list (other vault types not exported)'
+            else:
+                reason = 'destination vault not in export'
+        self._note_idle_verdict_missing(
+            'backup', vault_arn, reason,
+            verdict='copy-policy-overreach', evidence='destination vault reads',
+        )
+        return None
 
     async def get_backup_copy_jobs(self, days: int = 90) -> List[BackupCopyJobSummary]:
         """Get copy job summaries from exported data."""
@@ -4412,16 +4775,20 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         # CLO-457: drop datapoints from before the cluster existed (a reused
         # DBClusterIdentifier inherits its predecessor's). The export reads
         # requests daily (Period=86400) and CPU hourly (Period=3600).
-        gremlin_requests = int(sum(
+        # CLO-584: kept as floats, same reason as the online provider -- a
+        # lightly used cluster's GremlinRequestsPerSec Sum over the window
+        # can be well under 1, and wrapping it in int() truncated it to 0,
+        # indistinguishable from true zero traffic.
+        gremlin_requests = sum(
             dp.get('Sum', 0) for dp in drop_pre_creation_datapoints(
                 gremlin_data.get('Datapoints', []), cluster_create_time, 86400,
             )
-        ))
-        sparql_requests = int(sum(
+        )
+        sparql_requests = sum(
             dp.get('Sum', 0) for dp in drop_pre_creation_datapoints(
                 sparql_data.get('Datapoints', []), cluster_create_time, 86400,
             )
-        ))
+        )
         # The export collects hourly CPU (Period=3600, Average + Maximum), so
         # the shared CPU rule (cpu_sizing, CLO-480) applies offline too.
         cpu = summarize_hourly_cpu(drop_pre_creation_datapoints(
@@ -4753,11 +5120,9 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
             # CLO-574: the export's cluster detail is a raw DescribeCluster
             # response, which has AutoTerminate (not KeepJobFlowAliveWhenNoSteps)
-            # and never carries an auto-termination policy -- the export script
-            # does not run GetAutoTerminationPolicy (CLO-574 follow-up ticket).
-            # keep_alive is still derivable from AutoTerminate; the policy itself
-            # is always unknown offline, so the detector must withhold the
-            # finding rather than read "no policy".
+            # and never carries an auto-termination policy. keep_alive is
+            # derivable from AutoTerminate; the policy comes from
+            # emr_auto_termination_policy_<id>.json (CLO-576, export 1.24.0+).
             auto_terminate = cluster_detail.get('AutoTerminate')
             keep_alive = (not auto_terminate) if auto_terminate is not None else True
             # Mirror the detector's own age gate (and online.py's): a cluster
@@ -4772,11 +5137,25 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             old_enough = isinstance(ref_dt, datetime) and (
                 datetime.now(timezone.utc) - ref_dt
             ) > timedelta(hours=24)
+            auto_termination_policy = None
+            auto_termination_unknown = True
             if keep_alive and old_enough:
-                self._note_idle_verdict_missing(
-                    'emr auto-termination', cluster_id, 'not in export',
-                    verdict='auto-termination', evidence='GetAutoTerminationPolicy',
-                )
+                # CLO-576, as online: only a candidate cluster's policy is
+                # read. The export writes GetAutoTerminationPolicy's answer
+                # as is, and {} when the CLI printed nothing (no policy set):
+                # a present document without AutoTerminationPolicy is a
+                # confirmed "no policy". An absent file (an export older than
+                # 1.24.0) or a 0-byte one (a failed read, skipped by the
+                # upload parser) is MISSING, never "no policy".
+                policy_doc = self._export_data.get(f'emr_auto_termination_policy_{cluster_id}')
+                if isinstance(policy_doc, dict):
+                    auto_termination_policy = policy_doc.get('AutoTerminationPolicy')
+                    auto_termination_unknown = False
+                else:
+                    self._note_idle_verdict_missing(
+                        'emr auto-termination', cluster_id, 'not in export',
+                        verdict='auto-termination', evidence='GetAutoTerminationPolicy',
+                    )
 
             clusters.append(EMRClusterData(
                 cluster_id=cluster_id,
@@ -4785,8 +5164,8 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 cluster_arn=cluster_detail.get('ClusterArn', ''),
                 region=self._region,
                 release_label=cluster_detail.get('ReleaseLabel', ''),
-                auto_termination_policy=None,
-                auto_termination_unknown=True,
+                auto_termination_policy=auto_termination_policy,
+                auto_termination_unknown=auto_termination_unknown,
                 keep_alive=keep_alive,
                 ready_datetime=ready_dt,
                 created_datetime=created_dt,

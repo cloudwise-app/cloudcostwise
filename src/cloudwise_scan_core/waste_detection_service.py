@@ -152,6 +152,12 @@ SERVICE_TO_DETECTORS: Dict[str, List[str]] = {
     # EMR
     'AmazonEMR': ['emr'],
     'Amazon EMR': ['emr'],
+    # CLO-589: the billing name Cost Explorer has historically used for EMR
+    # and the Price List service code. Unverified from the session that added
+    # them (no AWS access); exact-match keys, so adding them cannot deselect
+    # anything. The wave-8a scan's cur_skipped / CLO-465 WARNING settles it.
+    'Amazon Elastic MapReduce': ['emr'],
+    'ElasticMapReduce': ['emr'],
     # Glue
     'AWSGlue': ['glue'],
     'AWS Glue': ['glue'],

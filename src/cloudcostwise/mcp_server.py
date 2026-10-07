@@ -62,16 +62,16 @@ def build_server() -> MCPServer:
     session = _Session()
     server = MCPServer(name="cloudcostwise", version=__version__, instructions=INSTRUCTIONS)
 
-    @server.tool(
-        annotations=READ_ONLY,
-        description=(
-            "Scan the user's AWS account for waste with their local credentials (read-only; any non-read "
-            "AWS call is refused). Takes 30-60 s per region; up to 4 regions run at once. COST: the RI/Savings Plans checks call Cost "
-            "Explorer, billed by AWS at $0.01 per request (about $0.13 a scan); tell the user before "
-            "running, and pass include_cost_explorer=false to skip them. regions: comma-separated, or "
-            "'all'; default us-east-1 plus the profile's region."
-        ),
-    )
+    # Same one-line decorator shape as the other three tools: directories that
+    # list tools by reading the source (mcprush) missed this one when its
+    # decorator opened on its own line.
+    @server.tool(annotations=READ_ONLY,
+                 description="Scan the user's AWS account for waste with their local credentials (read-only; "
+                             "any non-read AWS call is refused). Takes 30-60 s per region; up to 4 regions run "
+                             "at once. COST: the RI/Savings Plans checks call Cost Explorer, billed by AWS at "
+                             "$0.01 per request (about $0.13 a scan); tell the user before running, and pass "
+                             "include_cost_explorer=false to skip them. regions: comma-separated, or 'all'; "
+                             "default us-east-1 plus the profile's region.")
     async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,
                    include_cost_explorer: bool = True) -> str:
         try:

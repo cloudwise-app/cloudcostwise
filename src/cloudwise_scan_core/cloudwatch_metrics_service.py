@@ -164,22 +164,27 @@ class MSKMetrics:
     messages_in_per_sec: float
     bytes_in_per_sec: float
     bytes_out_per_sec: float
-    # Online (CLO-549): the busiest broker's mean CpuUser + CpuSystem, and
-    # traffic summed across brokers. Offline: the export's cluster figure.
+    # Both online (CLO-549) and offline (CLO-560): the busiest broker's mean
+    # CpuUser + CpuSystem, and traffic summed across brokers.
     cpu_user: float
     period_days: int
     is_idle: bool = False
-    # CLO-457: hourly CpuUser datapoints behind ``cpu_user``. 0 means CPU was
-    # not measured (``cpu_user`` is then a placeholder 0.0, not 0% CPU);
-    # None means the source does not count them (the offline export).
+    # CLO-457/CLO-560: hourly CpuUser+CpuSystem datapoints behind
+    # ``cpu_user`` (the fewest of any broker). 0 means CPU was not measured
+    # on at least one broker (``cpu_user`` is then a placeholder 0.0, not 0%
+    # CPU). None is unused today — both providers count it.
     cpu_datapoints: Optional[int] = None
 
 
 @dataclass
 class NeptuneMetrics:
     """Neptune cluster metrics."""
-    gremlin_requests: int
-    sparql_requests: int
+    # CLO-584: float for parity with NeptuneMetricsData (data_providers/models.py) --
+    # this class and get_neptune_metrics() below are not on the live
+    # detector path (no caller in the repo), but kept consistent rather than
+    # left truncating.
+    gremlin_requests: float
+    sparql_requests: float
     loader_requests: int
     avg_cpu: float
     max_cpu: float
@@ -1779,8 +1784,9 @@ class CloudWatchMetricsService:
                 )
             )
             
-            gremlin_requests = int(sum(dp.get('Sum', 0) for dp in gremlin_response.get('Datapoints', [])))
-            sparql_requests = int(sum(dp.get('Sum', 0) for dp in sparql_response.get('Datapoints', [])))
+            # CLO-584: kept as floats (see NeptuneMetrics above).
+            gremlin_requests = sum(dp.get('Sum', 0) for dp in gremlin_response.get('Datapoints', []))
+            sparql_requests = sum(dp.get('Sum', 0) for dp in sparql_response.get('Datapoints', []))
             
             cpu_datapoints = cpu_response.get('Datapoints', [])
             avg_cpu = sum(dp.get('Average', 0) for dp in cpu_datapoints) / len(cpu_datapoints) if cpu_datapoints else 0

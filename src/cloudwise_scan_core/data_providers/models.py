@@ -583,6 +583,15 @@ class ElastiCacheMetricsData:
     # applies to the CurrConnections coverage check — otherwise a shorter
     # export could never pass a coverage gate sized to the full window.
     cpu_window_days: Optional[int] = None
+    # CLO-572: DatabaseMemoryUsagePercentage datapoints behind
+    # database_memory_usage_pct, the same convention as cpu_datapoints: None
+    # means not reported, 0 means a read with no data (MISSING, never read
+    # as 0% used). oversized_elasticache's memory gate needs 75% coverage
+    # of memory_window_days (cpu_window_days's sibling: None means use
+    # period_days, the offline provider clamps it to the export's own
+    # shorter window).
+    memory_datapoints: Optional[int] = None
+    memory_window_days: Optional[int] = None
 
 
 @dataclass
@@ -1422,8 +1431,11 @@ class NeptuneSnapshotData:
 class NeptuneMetricsData:
     """Normalized Neptune cluster CloudWatch metrics."""
     cluster_id: str
-    gremlin_requests: int = 0
-    sparql_requests: int = 0
+    # CLO-584: floats, not int -- a lightly used cluster's per-second-rate
+    # Sum over the window can be well under 1, and an int() truncation made
+    # that indistinguishable from true zero traffic.
+    gremlin_requests: float = 0.0
+    sparql_requests: float = 0.0
     avg_cpu: float = 0.0
     max_cpu: float = 0.0  # window maximum of hourly Maximums; reported, not gated by oversized_neptune
     # CLO-480: the shared CPU rule's inputs (cloudwise_scan_core.cpu_sizing)

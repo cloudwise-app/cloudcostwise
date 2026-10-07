@@ -85,6 +85,23 @@ def gp2_baseline(size_gb: int) -> tuple:
 INCOMPLETE_MULTIPART_MIN_AGE_DAYS = 7
 
 
+# CLO-589: AWS Backup's EBS snapshots carry its tag and fixed description.
+# EC2 DeleteSnapshot refuses them (they are deleted as Backup recovery
+# points, under the vault's retention), so `aws ec2 delete-snapshot` is advice
+# that cannot be followed. Neither marker is in the botocore model; both are
+# AWS Backup's documented behaviour, unverified from the session that wrote
+# this (no AWS docs access).
+BACKUP_SNAPSHOT_TAG_PREFIX = 'aws:backup:'
+BACKUP_SNAPSHOT_DESCRIPTION = 'This snapshot is created by the AWS Backup service.'
+
+
+def is_backup_managed_snapshot(snapshot) -> bool:
+    """Whether an EBS snapshot was created by (and is managed by) AWS Backup."""
+    if any(key.startswith(BACKUP_SNAPSHOT_TAG_PREFIX) for key in (snapshot.tags or {})):
+        return True
+    return (snapshot.description or '').startswith(BACKUP_SNAPSHOT_DESCRIPTION)
+
+
 def provisioned_iops_monthly_cost(volume_type: str, iops: int) -> float:
     """Monthly list price of ``iops`` provisioned IOPS on ``volume_type``."""
     iops = max(int(iops or 0), 0)
@@ -347,6 +364,7 @@ class OpenStorageDetectorsMixin:
             # Track snapshot IDs flagged by higher-priority detectors to avoid duplicates
             orphaned_snapshot_ids = set()
             ami_orphaned_snapshot_ids = set()
+            backup_managed_snapshot_ids = set()
             
             # Check 5: AMI Orphaned Snapshots (highest priority among snapshot checks)
             for snapshot in all_snapshots:
@@ -399,6 +417,12 @@ class OpenStorageDetectorsMixin:
                 # Skip if already flagged as AMI orphan (higher priority)
                 if snapshot.snapshot_id in ami_orphaned_snapshot_ids:
                     continue
+                # CLO-589: AWS Backup owns this snapshot's lifecycle and EC2
+                # refuses to delete it. Kept out of old_ebs_snapshot below
+                # too, which would give the same refused command.
+                if is_backup_managed_snapshot(snapshot):
+                    backup_managed_snapshot_ids.add(snapshot.snapshot_id)
+                    continue
                 
                 if snapshot.volume_id and snapshot.volume_id not in existing_volume_ids:
                     age_days = snapshot.age_days if snapshot.age_days else (
@@ -444,7 +468,11 @@ class OpenStorageDetectorsMixin:
             
             for snapshot in snapshots:
                 # Skip if already flagged by orphan detectors
-                if snapshot.snapshot_id in orphaned_snapshot_ids or snapshot.snapshot_id in ami_orphaned_snapshot_ids:
+                if (
+                    snapshot.snapshot_id in orphaned_snapshot_ids
+                    or snapshot.snapshot_id in ami_orphaned_snapshot_ids
+                    or snapshot.snapshot_id in backup_managed_snapshot_ids
+                ):
                     continue
                 
                 age_days = snapshot.age_days if snapshot.age_days else (

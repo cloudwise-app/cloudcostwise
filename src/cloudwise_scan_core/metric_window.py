@@ -71,3 +71,56 @@ def drop_pre_creation_datapoints(
             continue
         kept.append(dp)
     return kept
+
+
+def trim_to_recent_window(
+    datapoints: Iterable[Mapping[str, Any]],
+    window_days: int,
+    period_seconds: int,
+    anchor: Any = None,
+) -> List[Mapping[str, Any]]:
+    """CLO-572: keep only the points within ``window_days`` of ``anchor``
+    (the export's own ``manifest.export_timestamp`` when the caller has
+    one), or the series' OWN latest Timestamp when it does not -- never
+    wall-clock ``now``: an export is read long after it was collected, so a
+    ``now``-anchored trim would turn every upload into MISSING. The export
+    timestamp is preferable when available: it is when collection actually
+    ended, so it still anchors correctly even for a series whose own latest
+    point is itself a few hours stale (a slow metric, a throttled read).
+
+    The offline export can collect more CloudWatch history than a
+    detector's window asks for (a longer ``cloudwatch_period_days``, or the
+    window becoming configurable later). Without this, those older hours
+    would silently widen the average/coverage with data outside the window
+    the finding claims. No usable anchor -- no ``anchor`` given AND no
+    readable Timestamp in the series (or no points at all) -- keeps
+    everything, the same fail-open convention as
+    :func:`drop_pre_creation_datapoints` (whose cutoff this delegates to).
+
+    With no explicit anchor, the cutoff is ``latest + period - window_days``:
+    ``window_days`` worth of whole ``period_seconds`` buckets ending one
+    period after the latest Timestamp (the end of the last bucket), not
+    plain ``latest - window_days``. That bare subtraction would also keep a
+    169th hourly point for a 7-day/168-hour window -- its bucket
+    ``[ts, ts + period)`` straddles the ``latest - window_days`` instant, and :func:`drop_pre_creation_datapoints` only drops a bucket
+    that ENDS at or before the cutoff. Shifting the cutoff forward by one
+    period puts that straddling bucket's end exactly ON the cutoff, so it
+    is dropped like any other bucket that ended too early. An explicit
+    ``anchor`` is an instant (when collection ended), not a bucket start,
+    so it uses plain ``anchor - window_days`` (PR #1620 review)."""
+    dps = list(datapoints)
+    if window_days <= 0:
+        return dps
+    anchor_at = _as_utc(anchor)
+    if anchor_at is not None:
+        # An explicit anchor (the export's end time) is an instant, not the
+        # start of a bucket, so the window is simply [anchor - window, anchor).
+        window_start = anchor_at - timedelta(days=window_days)
+    else:
+        timestamps = [t for t in (_as_utc(dp.get('Timestamp')) for dp in dps) if t is not None]
+        if not timestamps:
+            return dps
+        # The series' latest Timestamp is the START of its last bucket, so
+        # the window ends one period later (see the docstring).
+        window_start = max(timestamps) + timedelta(seconds=period_seconds) - timedelta(days=window_days)
+    return drop_pre_creation_datapoints(dps, window_start, period_seconds)

@@ -777,6 +777,26 @@ class WasteDataProvider(ABC):
         pass
 
     @abstractmethod
+    async def get_kinesis_consumer_subscribed(
+        self, stream_name: str, consumer_name: str,
+    ) -> Optional[bool]:
+        """Whether an enhanced fan-out consumer has subscribed in the past
+        two weeks (CLO-589 follow-up, PR #1654 review HIGH 1).
+
+        AWS publishes SubscribeToShard.Success (StreamName, ConsumerName) at
+        least once every 5 minutes while a subscription lives, and the
+        SubscribeToShardEvent.* series only while one is active; a consumer
+        that never subscribes publishes no series at all. CloudWatch
+        ListMetrics reports the metrics that had data in the past two weeks.
+        So: True when a successful ListMetrics answer holds any series for
+        the (StreamName, ConsumerName) pair; False only when a complete,
+        successful answer holds none; None (MISSING, noted) when it could not
+        be read. Never an empty GetMetricStatistics series read as idle.
+
+        Both providers implement it (repo rule: every get_* is abstract)."""
+        pass
+
+    @abstractmethod
     async def get_firehose_delivery_streams(self) -> List['KinesisFirehoseData']:
         """Get all Kinesis Data Firehose delivery streams."""
         pass
@@ -1010,6 +1030,17 @@ class WasteDataProvider(ABC):
     async def get_backup_copy_jobs(self, days: int = 90) -> List[BackupCopyJobSummary]:
         """Get copy job summaries for the specified lookback period."""
         pass
+
+    async def backup_vault_exists(self, vault_arn: str) -> Optional[bool]:
+        """Whether the backup vault ``vault_arn`` exists now (CLO-589).
+
+        True / False only on a read that could see the vault; None when it
+        could not be judged (a cross-account vault, a failed read, a
+        provider that cannot look): MISSING, never "exists". ListCopyJobs
+        keeps a deleted vault's COMPLETED jobs for its whole window, so
+        backup_copy_policy_overreach needs this before naming a vault. The
+        default cannot look."""
+        return None
 
     # =========================================================================
     # DocumentDB

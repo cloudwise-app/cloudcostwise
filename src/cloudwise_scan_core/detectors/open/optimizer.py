@@ -52,6 +52,52 @@ _OPT_IN_ERROR_CODES = frozenset({'OptInRequiredException', 'OptInRequired'})
 COVERAGE_SOURCE = 'compute_optimizer'
 
 
+def _normalize_enum_value(value: Optional[str]) -> str:
+    """CLO-583: compare Compute Optimizer enum-ish strings (``finding``,
+    ``instanceFinding``, utilization metric ``name``) case- and
+    underscore-insensitively.
+
+    ``GetEC2InstanceRecommendations``' ``finding`` is documented with BOTH a
+    "Valid Values" list (``Overprovisioned`` / ``Underprovisioned`` /
+    ``Optimized`` / ``NotOptimized``) AND, in the same field's description,
+    a note that "the valid values in your API responses appear as
+    ``OVER_PROVISIONED``, ``UNDER_PROVISIONED``, or ``OPTIMIZED``". AWS's own
+    service team confirmed this is real, not stale copy
+    (github.com/aws/aws-sdk#550, closed 2024-05-01, from
+    github.com/boto/boto3#3746, where a user reported seeing exactly the
+    SCREAMING_SNAKE_CASE spelling in production): their resolution was to
+    add that note, not to change the API. So this field can legitimately
+    come back as either spelling depending on the account/region, and
+    hardcoding a comparison against only one of them is a latent bug
+    regardless of which one is picked (this module's original EC2 check
+    used the documented WIRE spelling and most likely worked for real
+    traffic; CLO-583's RDS fix below is the one that was genuinely dead, by
+    reading response keys that do not exist under any spelling). Normalizing
+    both sides before comparing accepts either without having to guess, and
+    costs nothing when the two sides already match (e.g. EBS/Lambda
+    ``NotOptimized``, RDS ``instanceFinding``, where no such mismatch has
+    been reported — applied there purely as defense-in-depth)."""
+    return (value or '').replace('_', '').replace('-', '').upper()
+
+
+def _best_recommendation_option(options: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """CLO-587: pick the recommendation option Compute Optimizer itself
+    ranks best, not whichever one the API happened to list first.
+
+    ``recommendationOptions`` (EC2) and ``instanceRecommendationOptions``
+    (RDS) both carry a ``rank``. EC2's is documented as "The top
+    recommendation option is ranked as 1."; RDS documents no direction, so
+    lowest = best is assumed there by analogy with EC2. Neither API promises
+    list order, so ``options[0]`` was whatever AWS returned first. This
+    picks the lowest ``rank`` among options that carry one, falling back to
+    ``[0]`` only when none has a usable (integer) rank."""
+    ranked = [(opt.get('rank'), opt) for opt in options]
+    with_rank = [(r, opt) for r, opt in ranked if isinstance(r, int)]
+    if with_rank:
+        return min(with_rank, key=lambda item: item[0])[1]
+    return options[0]
+
+
 def _lambda_function_name(function_arn: str) -> str:
     """The function name from a Lambda ARN, qualified or not (CLO-507).
 
@@ -155,7 +201,7 @@ class ComputeOptimizerDetectorsMixin:
         Get rightsizing recommendations from AWS Compute Optimizer.
         
         This detector queries AWS Compute Optimizer for resources that are
-        OVER_PROVISIONED and returns specific recommendations with exact savings.
+        Overprovisioned and returns specific recommendations with exact savings.
         
         Note: Only available in online mode as it requires real-time AWS API access.
         
@@ -247,9 +293,14 @@ class ComputeOptimizerDetectorsMixin:
                 
                 for rec in response.get('instanceRecommendations', []):
                     finding = rec.get('finding')
-                    
-                    # Only report OVER_PROVISIONED instances
-                    if finding != 'OVER_PROVISIONED':
+
+                    # CLO-583: this field is documented two ways -- a "Valid
+                    # Values" list (Overprovisioned) and a same-field note
+                    # that responses "appear as" OVER_PROVISIONED -- and AWS
+                    # confirmed both are real wire spellings. Match either
+                    # (_normalize_enum_value docstring) instead of hardcoding
+                    # one and silently missing accounts/regions on the other.
+                    if _normalize_enum_value(finding) != _normalize_enum_value('Overprovisioned'):
                         continue
                     
                     instance_arn = rec.get('instanceArn', '')
@@ -261,8 +312,8 @@ class ComputeOptimizerDetectorsMixin:
                     options = rec.get('recommendationOptions', [])
                     if not options:
                         continue
-                    
-                    best_option = options[0]
+
+                    best_option = _best_recommendation_option(options)
                     recommended_type = best_option.get('instanceType', 'unknown')
                     
                     savings_opportunity = best_option.get('savingsOpportunity', {})
@@ -277,11 +328,14 @@ class ComputeOptimizerDetectorsMixin:
                     cpu_util = None
                     memory_util = None
                     for metric in utilization:
-                        if metric.get('name') == 'CPU':
+                        # CLO-583: EC2's UtilizationMetric.name enum is
+                        # Cpu/Memory (not CPU/MEMORY); normalized to be safe.
+                        metric_name = _normalize_enum_value(metric.get('name'))
+                        if metric_name == _normalize_enum_value('Cpu'):
                             cpu_util = metric.get('value')
-                        elif metric.get('name') == 'MEMORY':
+                        elif metric_name == _normalize_enum_value('Memory'):
                             memory_util = metric.get('value')
-                    
+
                     confidence = ConfidenceLevel.HIGH
                     
                     util_parts = []
@@ -306,7 +360,7 @@ class ComputeOptimizerDetectorsMixin:
                         action=f"Resize instance from {current_type} to {recommended_type}.",
                         explanation={
                             'detection': f"AWS Compute Optimizer analyzed 14 days of utilization and recommends downsizing from {current_type} to {recommended_type}.",
-                            'threshold': 'Compute Optimizer flags instances as OVER_PROVISIONED when CPU/memory consistently underutilize the current size.',
+                            'threshold': 'Compute Optimizer flags instances as Overprovisioned when CPU/memory consistently underutilize the current size.',
                             'pricing': f'Downsizing saves ~${monthly_savings:.0f}/month ({savings_percentage:.0f}% reduction). Utilization: {util_str}.',
                             'why_waste': 'An oversized instance pays for CPU and memory capacity it does not use.',
                             'risk': 'Resize requires a brief stop/start. Test the new size in staging first and monitor after resizing.',
@@ -356,9 +410,11 @@ class ComputeOptimizerDetectorsMixin:
                 
                 for rec in response.get('volumeRecommendations', []):
                     finding = rec.get('finding')
-                    
-                    # Only process volumes that are NotOptimized (have optimization opportunities)
-                    if finding != 'NotOptimized':
+
+                    # Only process volumes that are NotOptimized (have optimization
+                    # opportunities). CLO-583: normalized defensively, same as the
+                    # EC2/RDS finding checks (_normalize_enum_value docstring).
+                    if _normalize_enum_value(finding) != _normalize_enum_value('NotOptimized'):
                         continue
                     
                     volume_arn = rec.get('volumeArn', '')
@@ -460,9 +516,11 @@ class ComputeOptimizerDetectorsMixin:
                 
                 for rec in response.get('lambdaFunctionRecommendations', []):
                     finding = rec.get('finding')
-                    
-                    # Only process functions that are NotOptimized (have optimization opportunities)
-                    if finding != 'NotOptimized':
+
+                    # Only process functions that are NotOptimized (have optimization
+                    # opportunities). CLO-583: normalized defensively, same as the
+                    # EC2/RDS finding checks (_normalize_enum_value docstring).
+                    if _normalize_enum_value(finding) != _normalize_enum_value('NotOptimized'):
                         continue
                     
                     function_arn = rec.get('functionArn', '')
@@ -575,21 +633,28 @@ class ComputeOptimizerDetectorsMixin:
                 if not isinstance(response, dict):
                     break
 
-                for rec in response.get('rdsDatabaseRecommendations', []):
-                    finding = rec.get('finding')
+                # CLO-583: the real key is rdsDBRecommendations, not
+                # rdsDatabaseRecommendations.
+                for rec in response.get('rdsDBRecommendations', []):
+                    # CLO-583: the real field is instanceFinding (there is a
+                    # separate storageFinding); 'finding' does not exist.
+                    finding = rec.get('instanceFinding')
 
-                    if finding != 'Overprovisioned':
+                    # CLO-583: normalized defensively, same as the EC2 finding
+                    # check (_normalize_enum_value docstring).
+                    if _normalize_enum_value(finding) != _normalize_enum_value('Overprovisioned'):
                         continue
 
                     resource_arn = rec.get('resourceArn', '')
                     db_identifier = resource_arn.split(':')[-1] if ':' in resource_arn else resource_arn
                     current_config = rec.get('currentDBInstanceClass', 'unknown')
 
-                    options = rec.get('recommendationOptions', [])
+                    # CLO-583: the real key is instanceRecommendationOptions.
+                    options = rec.get('instanceRecommendationOptions', [])
                     if not options:
                         continue
 
-                    best_option = options[0]
+                    best_option = _best_recommendation_option(options)
                     recommended_class = best_option.get('dbInstanceClass', 'unknown')
 
                     savings_opportunity = best_option.get('savingsOpportunity', {})
@@ -604,9 +669,13 @@ class ComputeOptimizerDetectorsMixin:
                     cpu_util = None
                     memory_util = None
                     for metric in utilization:
-                        if metric.get('name') == 'CPU':
+                        # CLO-583: RDS's RDSDBUtilizationMetric.name enum is
+                        # CPU/Memory (CPU stays upper case here, unlike EC2's
+                        # Cpu/Memory); normalized to be safe.
+                        metric_name = _normalize_enum_value(metric.get('name'))
+                        if metric_name == _normalize_enum_value('CPU'):
                             cpu_util = metric.get('value')
-                        elif metric.get('name') == 'MEMORY':
+                        elif metric_name == _normalize_enum_value('Memory'):
                             memory_util = metric.get('value')
 
                     util_parts = []

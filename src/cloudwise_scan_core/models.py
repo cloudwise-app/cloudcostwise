@@ -1472,6 +1472,12 @@ RDS_PRICING = {
     # On-Demand hourly pricing (US East) - monthly = hourly * 730
     "db.t3.micro": 0.017, "db.t3.small": 0.034, "db.t3.medium": 0.068,
     "db.t3.large": 0.136, "db.t3.xlarge": 0.272, "db.t3.2xlarge": 0.544,
+    # CLO-589: Graviton burstable. Without these rows db.t4g.micro (the
+    # cheapest current class, ~$11.68/month) fell back to the $0.10/hr
+    # default ($73/month), a sixfold overstatement. MySQL/PostgreSQL
+    # Single-AZ list rates, not re-read from the Pricing API in that session.
+    "db.t4g.micro": 0.016, "db.t4g.small": 0.032, "db.t4g.medium": 0.065,
+    "db.t4g.large": 0.129, "db.t4g.xlarge": 0.258, "db.t4g.2xlarge": 0.517,
     "db.m5.large": 0.171, "db.m5.xlarge": 0.342, "db.m5.2xlarge": 0.684,
     "db.m6i.large": 0.171, "db.m6i.xlarge": 0.342, "db.m6i.2xlarge": 0.684,
     "db.r5.large": 0.24, "db.r5.xlarge": 0.48, "db.r5.2xlarge": 0.96,

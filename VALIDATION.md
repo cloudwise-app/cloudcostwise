@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 43 at L1, 37 at L2, 7 at L3.
+Summary for the checks in this repository: 38 at L1, 42 at L2, 7 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -30,7 +30,7 @@ resources as described above; the levels below are the evidence.
 | `elasticache_data_tiering_opportunity` | L1 |  |
 | `elasticache_engine_migration` | L2 |  |
 | `elasticache_extended_support_cost` | L2 |  |
-| `elasticache_replication_waste` | L1 |  |
+| `elasticache_replication_waste` | L2 |  |
 | `elasticache_serverless_optimization` | L1 |  |
 | `empty_log_group` | L2 |  |
 | `excessive_retention_log_group` | L2 |  |
@@ -52,8 +52,8 @@ resources as described above; the levels below are the evidence.
 | `lambda_excessive_timeout` | L2 |  |
 | `lambda_old_runtime` | L2 |  |
 | `lambda_provisioned_concurrency_idle` | L2 |  |
-| `lightsail_idle_database` | L1 |  |
-| `lightsail_idle_load_balancer` | L1 |  |
+| `lightsail_idle_database` | L2 |  |
+| `lightsail_idle_load_balancer` | L2 |  |
 | `lightsail_old_snapshot` | L1 |  |
 | `lightsail_unattached_disk` | L2 |  |
 | `lightsail_unattached_static_ip` | L2 |  |
@@ -66,14 +66,14 @@ resources as described above; the levels below are the evidence.
 | `old_ecr_images` | L3 |  |
 | `old_log_group` | L1 |  |
 | `old_rds_snapshot` | L1 |  |
-| `opensearch_no_encryption_at_rest` | L1 |  |
+| `opensearch_no_encryption_at_rest` | L2 |  |
 | `orphaned_dns_record` | L3 |  |
 | `orphaned_ebs_snapshot` | L2 |  |
 | `over_provisioned_dynamodb` | L2 |  |
 | `over_provisioned_iops` | L1 |  |
 | `over_provisioned_lambda` | L2 |  |
 | `oversized_elasticache` | L1 |  |
-| `oversized_sagemaker_endpoint` | L1 |  |
+| `oversized_sagemaker_endpoint` | L2 |  |
 | `oversized_workspace` | L1 |  |
 | `previous_gen_sagemaker_instance` | L2 |  |
 | `rds_extended_support_cost` | L1 |  |
@@ -86,7 +86,7 @@ resources as described above; the levels below are the evidence.
 | `ri_opportunity_rds` | L1 | yes |
 | `ri_opportunity_redshift` | L1 | yes |
 | `s3_empty_bucket` | L2 |  |
-| `s3_high_request_and_transfer_cost` | L1 |  |
+| `s3_high_request_and_transfer_cost` | L1 | yes |
 | `s3_no_default_encryption` | L1 | yes |
 | `s3_rapid_growth` | L1 |  |
 | `s3_wrong_storage_class` | L2 |  |

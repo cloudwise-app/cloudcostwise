@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # (ledger aging_d: 14).
 VPC_ENDPOINT_WINDOW_DAYS = 14
 
+# CLO-589: idle_nat_gateway's BytesOutToDestination window and minimum age
+# (ledger aging_d: 7).
+NAT_IDLE_WINDOW_DAYS = 7
+
 
 # ELB DNS name shapes, any region: classic ELB and ALB resolve under
 # <name>.<region>.elb.amazonaws.com; NLB resolves under
@@ -197,12 +201,16 @@ class OpenNetworkDetectorsMixin:
             for nat in nat_gateways:
                 if nat.state != 'available':
                     continue
+                # CLO-589 / CLO-233: "no traffic in 7 days" needs a gateway
+                # that existed for all 7 (unknown age counts as old).
+                if not is_as_old_as_window(nat.create_time, NAT_IDLE_WINDOW_DAYS):
+                    continue
                 
                 # Check for idle NAT gateway (requires CloudWatch metrics)
                 if settings.cloudwatch_enabled and data_provider.supports_cloudwatch:
                     metrics_map = await data_provider.get_nat_gateway_metrics(
                         nat_gateway_ids=[nat.nat_gateway_id],
-                        days=7,
+                        days=NAT_IDLE_WINDOW_DAYS,
                     )
                     
                     metrics = metrics_map.get(nat.nat_gateway_id)

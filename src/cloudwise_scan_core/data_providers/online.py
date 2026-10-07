@@ -19,7 +19,12 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, BotoCoreError
 
 from cloudwise_scan_core.data_providers.base import WasteDataProvider
-from cloudwise_scan_core.data_providers.missing_data import MissingDataNotesMixin
+from cloudwise_scan_core.data_providers.missing_data import (
+    KINESIS_EFO_NOTE_EVIDENCE,
+    KINESIS_EFO_NOTE_SERVICE,
+    KINESIS_EFO_NOTE_VERDICT,
+    MissingDataNotesMixin,
+)
 from cloudwise_scan_core.cloudwatch_metrics_service import MSKMetrics, MQMetrics
 from cloudwise_scan_core.metric_window import (
     _as_utc,
@@ -339,6 +344,13 @@ _LAMBDA_VERSION_WALK_FUNCTIONS_PER_PAGE_BUDGET = 8
 # reported MISSING in data_warnings and not flagged.
 _LOG_ACTIVITY_LOOKUP_WORKERS = 4
 _LOG_ACTIVITY_LOOKUP_MAX_RPS = 10.0
+
+# CLO-577: AWS/AppSync does not publish CacheHitCount/CacheMissCount under
+# the GraphQLAPIId dimension (or under any dimension) — confirmed against
+# docs.aws.amazon.com/appsync/latest/devguide/monitoring.html. The only
+# documented cache metrics are the Enhanced CacheHit/CacheMiss, keyed by
+# API_Id + Resolver. See get_appsync_metrics for the full story.
+_APPSYNC_CACHE_METRICS_NOT_PUBLISHED = frozenset({'CacheHitCount', 'CacheMissCount'})
 
 
 class _RateLimiter:
@@ -2452,7 +2464,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         nat_gateway_ids: List[str],
         days: int = 7,
     ) -> Dict[str, NATGatewayMetricsData]:
-        """Get CloudWatch metrics for NAT Gateways."""
+        """Get CloudWatch metrics for NAT Gateways.
+
+        CLO-589: an empty BytesOutToDestination series (no datapoints at all,
+        not a published 0) is MISSING: noted and left out of the map, so the
+        detector withholds idle_nat_gateway. It used to sum to 0 and read as
+        idle. A failed read is noted the same way."""
         metrics = {}
         
         if not nat_gateway_ids:
@@ -2476,6 +2493,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     )
                     
                     datapoints = response.get('Datapoints', [])
+                    if not datapoints:
+                        self._note_idle_verdict_missing('nat gateway', nat_id, "no datapoints")
+                        continue
                     bytes_out = sum(dp.get('Sum', 0) for dp in datapoints)
                     
                     metrics[nat_id] = NATGatewayMetricsData(
@@ -2491,6 +2511,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         )
                         self._warn_access_denied("NAT Gateway Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
                     logger.warning(f"Error fetching NAT Gateway metrics for {nat_id}: {e}")
+                    self._note_idle_verdict_missing(
+                        'nat gateway', nat_id, f"read failed ({self._error_label(e)})",
+                    )
                     metrics[nat_id] = NATGatewayMetricsData(nat_gateway_id=nat_id, period_days=days)
         except Exception as e:
             if self._is_access_denied(e):
@@ -2499,6 +2522,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 )
                 self._warn_access_denied("NAT Gateway Metrics", "cloudwatch:GetMetricStatistics", e)
             logger.error(f"Error fetching NAT Gateway metrics: {e}")
+            for nat_id in nat_gateway_ids:
+                if nat_id not in metrics:
+                    self._note_idle_verdict_missing(
+                        'nat gateway', nat_id, f"read failed ({self._error_label(e)})",
+                    )
         
         return metrics
     
@@ -3529,15 +3557,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     break
                 kwargs = {**kwargs, 'NextToken': token}
         except (ClientError, BotoCoreError) as e:
-            # The customer monitoring template does not grant
-            # cloudwatch:ListMetrics yet, so AccessDenied is expected there:
-            # logged, not recorded as a permission error the customer cannot
-            # fix from the template. Either way the guard fails and the
-            # empty-series endpoints stay MISSING (noted per endpoint).
+            # Monitoring template 1.29.0 grants cloudwatch:ListMetrics; an
+            # older stack is denied it. The denial is recorded (once: the
+            # answer is cached per provider) so permission_missing carries it
+            # and the account gets the CLO-534 targeted notice. Either way the
+            # guard fails and the empty-series endpoints stay MISSING (noted
+            # per endpoint): the verdict is unchanged.
             if self._is_access_denied(e):
                 logger.info(
                     "vpc-endpoint: cloudwatch:ListMetrics denied in %s; empty BytesProcessed "
                     "series are judged only on same-request evidence", self._region,
+                )
+                self._record_permission_error(
+                    resource="VPC endpoint BytesProcessed series check",
+                    permission="cloudwatch:ListMetrics", error=e,
                 )
             else:
                 self._warn_swallowed(
@@ -3949,6 +3982,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 multi_az = False
                 auto_failover = 'disabled'
 
+                # CLO-584: DataTiering is a ReplicationGroup field, never a
+                # CacheCluster one (DescribeCacheClusters' CacheCluster shape
+                # has no DataTiering member at all), so reading it off
+                # ``cluster`` always defaulted to 'disabled' -- the data
+                # tiering detector's own "already tiered" guard never
+                # fired. Read it off the replication group, the same lookup
+                # already used for shard/replica/Multi-AZ topology.
+                data_tiering_enabled = False
                 if rg_id and rg_id in replication_groups:
                     rg = replication_groups[rg_id]
                     node_groups = rg.get('NodeGroups', [])
@@ -3957,6 +3998,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         replicas_per_shard = max(len(node_groups[0].get('NodeGroupMembers', [])) - 1, 0)
                     multi_az = rg.get('MultiAZ', 'disabled') == 'enabled'
                     auto_failover = rg.get('AutomaticFailover', 'disabled')
+                    data_tiering_enabled = rg.get('DataTiering', 'disabled') == 'enabled'
 
                 clusters.append(ElastiCacheClusterData(
                     cluster_id=cluster_id,
@@ -3973,7 +4015,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     replicas_per_shard=replicas_per_shard,
                     multi_az_enabled=multi_az,
                     automatic_failover=auto_failover,
-                    data_tiering_enabled=cluster.get('DataTiering', 'disabled') == 'enabled',
+                    data_tiering_enabled=data_tiering_enabled,
                 ))
         except ClientError as e:
             if self._is_access_denied(e):
@@ -4119,9 +4161,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     metrics[cluster_id] = ElastiCacheMetricsData(
                         cluster_id=cluster_id,
                         cache_hits_avg=round(cache_hits_avg, 2),
-                        current_connections_avg=round(conn_avg, 2),
+                        # CLO-584: deliberately unrounded -- a brief handful
+                        # of connections over 7 days can average well under
+                        # 0.01, and rounding to 2dp would collapse it to
+                        # exactly 0.0, which makes oversized_elasticache's
+                        # own ``current_connections_avg > 0`` gate
+                        # unreachable (``is_idle`` above already reads the
+                        # raw, unrounded ``conn_avg``, so it is unaffected).
+                        # The std stays unrounded with it: the serverless
+                        # detector divides one by the other (cv = std/avg),
+                        # and a 2dp std over a full-precision avg read a
+                        # true cv of 1.5 (avg 0.004, std 0.006) as 2.5.
+                        current_connections_avg=conn_avg,
                         current_connections_max=round(conn_max, 2),
-                        current_connections_std=round(conn_std, 2),
+                        current_connections_std=conn_std,
                         cpu_utilization_avg=round(cpu_avg, 2),
                         cpu_utilization_max=round(cpu_max, 2),
                         database_memory_usage_pct=round(mem_pct, 2),
@@ -4130,6 +4183,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         is_idle=conn_covered and conn_avg == 0,
                         connection_datapoints=len(conn_dps),
                         cpu_datapoints=len(cpu_dps),
+                        # CLO-572: the oversized memory gate's coverage count.
+                        memory_datapoints=len(mem_dps),
                     )
                 except ClientError as e:
                     # CLO-485: a failed read is MISSING, not zero. It used to
@@ -5540,7 +5595,18 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         default model whose 0 reads made the consumer look idle.
 
         CLO-457: with ``consumer_create_time`` the read starts at the
-        consumer's creation (StreamName and ConsumerName are both names)."""
+        consumer's creation (StreamName and ConsumerName are both names).
+
+        CLO-589: an enhanced fan-out consumer never calls GetRecords (botocore:
+        GetRecordsInput is ShardIterator/Limit/StreamARN, no consumer; records
+        are pushed over SubscribeToShard), so the old GetRecords.Records read
+        by ConsumerName was always empty and every consumer read as idle. The
+        read is now SubscribeToShardEvent.Records (StreamName, ConsumerName).
+        That name is not in botocore and could not be checked against the AWS
+        docs from the session that wrote this, so an EMPTY series is MISSING
+        (noted, None), never zero reads: if the name were wrong the detector
+        goes quiet instead of firing on every consumer. Only a published
+        series that sums to 0 is idle."""
         try:
             cw = self._get_client('cloudwatch')
             end_time = datetime.now(timezone.utc)
@@ -5548,7 +5614,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
             response = cw.get_metric_statistics(
                 Namespace='AWS/Kinesis',
-                MetricName='GetRecords.Records',
+                MetricName='SubscribeToShardEvent.Records',
                 Dimensions=[
                     {'Name': 'StreamName', 'Value': stream_name},
                     {'Name': 'ConsumerName', 'Value': consumer_name},
@@ -5558,9 +5624,15 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 Period=86400 * days,
                 Statistics=['Sum'],
             )
-            records = sum(dp.get('Sum', 0) for dp in drop_pre_creation_datapoints(
+            datapoints = drop_pre_creation_datapoints(
                 response.get('Datapoints', []), consumer_create_time, 86400 * days,
-            ))
+            )
+            if not datapoints:
+                self._note_idle_verdict_missing(
+                    'kinesis', f"{stream_name}/{consumer_name}", "no datapoints",
+                )
+                return None
+            records = sum(dp.get('Sum', 0) for dp in datapoints)
             return KinesisMetricsData(
                 stream_name=stream_name,
                 get_records_total=int(records),
@@ -5573,6 +5645,75 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 'kinesis', f"{stream_name}/{consumer_name}", f"read failed ({self._error_label(e)})",
             )
             return None
+
+    # CLO-589 follow-up: ListMetrics pages read per consumer (500 metrics per
+    # page; a consumer has a handful). Running out of pages is MISSING.
+    _KINESIS_CONSUMER_LIST_METRICS_MAX_PAGES = 10
+
+    async def get_kinesis_consumer_subscribed(
+        self, stream_name: str, consumer_name: str,
+    ) -> Optional[bool]:
+        """CLO-589 follow-up (PR #1654 review HIGH 1): see
+        WasteDataProvider.get_kinesis_consumer_subscribed.
+
+        One ListMetrics read in AWS/Kinesis filtered on BOTH StreamName and
+        ConsumerName, paged to the end, no MetricName and no RecentlyActive
+        filter (ListMetrics then covers the past two weeks). Any series
+        returned counts as subscribed; AWS publishes only SubscribeToShard*
+        under that pair, and SubscribeToShard.Success at least once every 5
+        minutes while a subscription lives, so counting any of them is the
+        conservative superset. False only on a complete, successful answer
+        with none. A failed, denied or truncated read is None, noted.
+        Monitoring template 1.29.0 grants cloudwatch:ListMetrics, so a
+        denial (an older stack) is noted per consumer AND recorded once per
+        provider as a permission error, which is what puts the account in
+        line for the CLO-534 targeted notice (same as the CLO-533 VPC
+        endpoint guard). The verdict stays None either way."""
+        resource_id = f"{stream_name}/{consumer_name}"
+        try:
+            cw = self._get_client('cloudwatch')
+            kwargs: Dict[str, Any] = {
+                'Namespace': 'AWS/Kinesis',
+                'Dimensions': [
+                    {'Name': 'StreamName', 'Value': stream_name},
+                    {'Name': 'ConsumerName', 'Value': consumer_name},
+                ],
+            }
+            for _ in range(self._KINESIS_CONSUMER_LIST_METRICS_MAX_PAGES):
+                page = cw.list_metrics(**kwargs)
+                # The filter ran server-side: any series returned is one
+                # under this (StreamName, ConsumerName), so it counts.
+                if page.get('Metrics'):
+                    return True
+                token = page.get('NextToken')
+                if not token:
+                    return False
+                kwargs = {**kwargs, 'NextToken': token}
+            reason = 'ListMetrics answer truncated'
+        except Exception as e:
+            if self._is_access_denied(e):
+                logger.info(
+                    "kinesis: cloudwatch:ListMetrics denied in %s; enhanced fan-out "
+                    "consumers cannot be judged and are withheld", self._region,
+                )
+                reason = 'cloudwatch:ListMetrics denied'
+                # Once per provider: permission_missing dedupes, but the
+                # human-readable permission_errors list does not, and every
+                # consumer in the region would be denied the same way.
+                if not getattr(self, '_kinesis_list_metrics_denial_recorded', False):
+                    self._kinesis_list_metrics_denial_recorded = True
+                    self._record_permission_error(
+                        resource="Kinesis consumer subscription check",
+                        permission="cloudwatch:ListMetrics", error=e,
+                    )
+            else:
+                self._warn_swallowed("Kinesis consumer subscription check", "cloudwatch:ListMetrics", e)
+                reason = f"ListMetrics read failed ({self._error_label(e)})"
+        self._note_idle_verdict_missing(
+            KINESIS_EFO_NOTE_SERVICE, resource_id, reason,
+            verdict=KINESIS_EFO_NOTE_VERDICT, evidence=KINESIS_EFO_NOTE_EVIDENCE,
+        )
+        return None
 
     async def get_firehose_delivery_streams(self) -> List[KinesisFirehoseData]:
         """Get all Kinesis Data Firehose delivery streams."""
@@ -6755,6 +6896,100 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             logger.debug(f"Failed to get backup copy jobs: {e}")
             return []
 
+    # CLO-589 follow-up (PR #1654 review MEDIUM 3): ListBackupVaults'
+    # ByVaultType values in botocore 1.40.21. The model does not say which
+    # types the unfiltered call returns, so every type is listed explicitly.
+    # The live client's model is preferred (a newer botocore may add a type);
+    # this is the fallback when it cannot be read.
+    _BACKUP_VAULT_TYPES = (
+        'BACKUP_VAULT', 'LOGICALLY_AIR_GAPPED_BACKUP_VAULT', 'RESTORE_ACCESS_BACKUP_VAULT',
+    )
+
+    def _backup_vault_types(self, backup) -> Tuple[str, ...]:
+        try:
+            shape = backup.meta.service_model.operation_model('ListBackupVaults').input_shape
+            enum = list(shape.members['ByVaultType'].enum)
+        except Exception:
+            enum = []
+        if not enum or not all(isinstance(v, str) for v in enum):
+            return self._BACKUP_VAULT_TYPES
+        return tuple(dict.fromkeys([*enum, *self._BACKUP_VAULT_TYPES]))
+
+    def _own_backup_vault_arns(self, region: str) -> Tuple[set, Optional[str]]:
+        """Every vault ARN ListBackupVaults reports in ``region``: the
+        unfiltered answer plus one paged read per ByVaultType. Returns the
+        union and None when every read completed, or the union so far and the
+        first failure's reason. Cached per Region for the provider's life."""
+        cache: Dict[str, Tuple[set, Optional[str]]] = self.__dict__.setdefault('_backup_vault_arns_by_region', {})
+        if region in cache:
+            return cache[region]
+        arns: set = set()
+        reason: Optional[str] = None
+        try:
+            backup = self._get_client('backup', region=region)
+        except Exception as e:
+            self._warn_swallowed("Backup Vaults", "backup:ListBackupVaults", e)
+            cache[region] = (arns, f"read failed ({self._error_label(e)})")
+            return cache[region]
+        filters: List[Dict[str, str]] = [{}]
+        filters += [{'ByVaultType': t} for t in self._backup_vault_types(backup)]
+        for kwargs in filters:
+            try:
+                for page in backup.get_paginator('list_backup_vaults').paginate(**kwargs):
+                    arns.update(
+                        v.get('BackupVaultArn') for v in page.get('BackupVaultList', []) or []
+                        if isinstance(v, dict)
+                    )
+            except Exception as e:
+                self._warn_swallowed("Backup Vaults", "backup:ListBackupVaults", e)
+                if reason is None:
+                    label = kwargs.get('ByVaultType', 'unfiltered')
+                    reason = f"read failed ({label}: {self._error_label(e)})"
+        cache[region] = (arns, reason)
+        return cache[region]
+
+    async def backup_vault_exists(self, vault_arn: str) -> Optional[bool]:
+        """CLO-589: look the vault up with ListBackupVaults in its own Region.
+
+        ListBackupVaults is already in the monitoring role (DescribeBackupVault
+        is not). It only lists the caller's own vaults, so a vault in another
+        account cannot be judged: None, noted.
+
+        CLO-589 follow-up (PR #1654 review MEDIUM 3): the unfiltered answer
+        may leave out a logically air-gapped or restore-access vault (the
+        model does not say), and absent from it used to read as False, a
+        silent withhold. Now True when ANY read lists the vault; False only
+        when the unfiltered read and one read per ByVaultType ALL completed
+        without it; otherwise None, noted. Cached per Region and per ARN."""
+        cache: Dict[str, Optional[bool]] = self.__dict__.setdefault('_backup_vault_exists', {})
+        if vault_arn in cache:
+            return cache[vault_arn]
+        result: Optional[bool] = None
+        reason = None
+        parts = vault_arn.split(':')
+        own_account = self._aws_account_id()
+        if len(parts) < 7 or parts[2] != 'backup' or parts[5] != 'backup-vault':
+            reason = 'vault ARN unparseable'
+        elif own_account is None:
+            reason = 'scanned account ID unknown'
+        elif parts[4] != own_account:
+            reason = 'destination vault in another account'
+        else:
+            arns, failure = self._own_backup_vault_arns(parts[3])
+            if vault_arn in arns:
+                result = True
+            elif failure is None:
+                result = False
+            else:
+                reason = failure
+        if reason:
+            self._note_idle_verdict_missing(
+                'backup', vault_arn, reason,
+                verdict='copy-policy-overreach', evidence='destination vault reads',
+            )
+        cache[vault_arn] = result
+        return result
+
     # =========================================================================
     # DocumentDB
     # =========================================================================
@@ -7572,8 +7807,31 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         CLO-485: None when the read fails. It used to return 0.0, which the
         unused-API, idle-cache and idle-subscription gates read as no traffic.
-        An empty series is still 0: these are counters (Latency SampleCount,
-        cache hit/miss counts), published only when there is traffic."""
+        An empty series is still 0 for a real counter (e.g. Latency
+        SampleCount), published only when there is traffic.
+
+        CLO-577: `CacheHitCount`/`CacheMissCount` under `AWS/AppSync` keyed by
+        `GraphQLAPIId` are not metrics AWS publishes at all (confirmed against
+        docs.aws.amazon.com/appsync/latest/devguide/monitoring.html). The only
+        documented cache metrics are the Enhanced (paid) `CacheHit`/`CacheMiss`,
+        keyed by `API_Id` + `Resolver`, emitted only when per-resolver enhanced
+        metrics are turned on. `GetMetricStatistics` on the bogus name/dimension
+        pair still succeeds with an empty `Datapoints`, which this method used
+        to sum to 0.0 — read by `_detect_appsync_idle_cache` as "zero cache
+        traffic" and turned into a HIGH-confidence false positive on every
+        AVAILABLE cache. Withhold instead of querying a metric that cannot
+        exist. Reading the real per-resolver `CacheHit`/`CacheMiss` needs
+        `cloudwatch:ListMetrics` (or `appsync:ListResolvers`) to find the
+        Resolver dimension values. `cloudwise-cur-setup-template.yaml` grants
+        `cloudwatch:ListMetrics` since 1.29.0, but no reader is built on it
+        yet: a per-resolver CacheHit/CacheMiss read is new verdict logic, a
+        follow-up (docs/reviews/template-1-29.md)."""
+        if metric_name in _APPSYNC_CACHE_METRICS_NOT_PUBLISHED:
+            self._note_idle_verdict_missing(
+                'appsync_idle_cache', api_id,
+                'cache hit/miss metric not published by AWS (CLO-577)',
+            )
+            return None
         try:
             cw = self._get_client('cloudwatch')
             response = cw.get_metric_statistics(
@@ -7871,11 +8129,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 StartTime=start_time, EndTime=end_time,
                 Period=86400 * days, Statistics=['Sum']
             )
-            gremlin_requests = int(sum(
+            # CLO-584: kept as a float. A lightly used cluster's
+            # GremlinRequestsPerSec Sum over the whole window can be well
+            # under 1 (e.g. ~0.12 requests/sec), and wrapping it in int()
+            # truncated it to 0 -- indistinguishable from true zero traffic,
+            # so idle_neptune fired on a cluster that was actually in use.
+            gremlin_requests = sum(
                 dp.get('Sum', 0) for dp in drop_pre_creation_datapoints(
                     gremlin_resp.get('Datapoints', []), cluster_create_time, 86400 * days,
                 )
-            ))
+            )
 
             # SPARQL requests
             sparql_resp = cw.get_metric_statistics(
@@ -7885,11 +8148,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 StartTime=start_time, EndTime=end_time,
                 Period=86400 * days, Statistics=['Sum']
             )
-            sparql_requests = int(sum(
+            # CLO-584: same truncation risk as gremlin_requests above.
+            sparql_requests = sum(
                 dp.get('Sum', 0) for dp in drop_pre_creation_datapoints(
                     sparql_resp.get('Datapoints', []), cluster_create_time, 86400 * days,
                 )
-            ))
+            )
 
             # CPU utilization
             cpu_resp = cw.get_metric_statistics(
@@ -8371,8 +8635,13 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         clusters = []
         try:
             emr = self._get_client('emr')
-            response = emr.list_clusters(ClusterStates=['WAITING', 'RUNNING'])
-            for c in response.get('Clusters', []):
+            # CLO-578: ListClusters paginates (Marker/50-per-page); a single
+            # call silently missed every cluster beyond the first page.
+            paginator = emr.get_paginator('list_clusters')
+            raw_clusters = []
+            for page in paginator.paginate(ClusterStates=['WAITING', 'RUNNING']):
+                raw_clusters.extend(page.get('Clusters', []))
+            for c in raw_clusters:
                 cluster_id = c['Id']
                 try:
                     details = emr.describe_cluster(ClusterId=cluster_id).get('Cluster', {})
