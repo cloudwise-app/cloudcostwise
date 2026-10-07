@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloudcostwise"
-version = "0.1.3"
-description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials; nothing leaves your machine."
+version = "0.1.4"
+description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials. Nothing is sent to CloudWise."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "FSL-1.1-ALv2" }

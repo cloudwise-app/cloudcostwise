@@ -13,7 +13,7 @@ from cloudcostwise import __version__
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cloudcostwise",
-        description="Find AWS waste locally with your own read-only credentials. Nothing leaves your machine.",
+        description="Find AWS waste locally with your own read-only credentials. Nothing is sent to CloudWise.",
     )
     p.add_argument("--version", action="version", version=f"cloudcostwise {__version__}")
     sub = p.add_subparsers(dest="command", required=True)

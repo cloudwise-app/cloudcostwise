@@ -9727,22 +9727,39 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     end_time = datetime.now(timezone.utc)
                     start_time = end_time - timedelta(days=30)
 
+                    # CLO-592: AWS publishes the Accelerator dimension as the
+                    # bare accelerator id (list-metrics, 2026-10-07), never the
+                    # ARN; reading by ARN returned no datapoints for every
+                    # accelerator, which detector 3 read as zero traffic.
+                    accelerator_id = arn.rsplit('/', 1)[-1]
+                    empty_series = []
                     for metric_name in ['ProcessedBytesIn', 'ProcessedBytesOut']:
                         response = cw.get_metric_statistics(
                             Namespace='AWS/GlobalAccelerator',
                             MetricName=metric_name,
-                            Dimensions=[{'Name': 'Accelerator', 'Value': arn}],
+                            Dimensions=[{'Name': 'Accelerator', 'Value': accelerator_id}],
                             StartTime=start_time,
                             EndTime=end_time,
                             Period=86400 * 30,
                             Statistics=['Sum'],
                         )
                         datapoints = response.get('Datapoints', [])
+                        if not datapoints:
+                            empty_series.append(metric_name)
                         total = sum(dp['Sum'] for dp in datapoints)
                         if metric_name == 'ProcessedBytesIn':
                             processed_in = total
                         else:
                             processed_out = total
+                    if len(empty_series) == 2:
+                        # No series at all is MISSING (CLO-592), never a
+                        # measured zero: idle is withheld and noted.
+                        processed_in = None
+                        processed_out = None
+                        self._note_idle_verdict_missing(
+                            'globalaccelerator', acc.get('Name') or arn,
+                            "no ProcessedBytes datapoints in 30 days",
+                        )
                 except Exception as e:
                     self._warn_swallowed(
                         "Global Accelerator processed bytes", "cloudwatch:GetMetricStatistics", e,
