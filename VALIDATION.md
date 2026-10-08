@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 42 at L1, 42 at L2, 7 at L3.
+Summary for the checks in this repository: 42 at L1, 38 at L2, 11 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -29,7 +29,7 @@ proven checks only.
 | `classic_lb_migration` | L2 |  | none |
 | `dynamodb_no_autoscaling` | L2 |  |  |
 | `dynamodb_no_deletion_protection` | L3 |  | covered |
-| `ecr_no_lifecycle_policy` | L2 |  | covered |
+| `ecr_no_lifecycle_policy` | L3 |  | covered |
 | `eip_on_stopped_instance` | L2 |  | covered |
 | `elasticache_data_tiering_opportunity` | L1 |  |  |
 | `elasticache_engine_migration` | L2 |  | none |
@@ -42,7 +42,7 @@ proven checks only.
 | `high_lcu_cost_alb` | L1 | yes |  |
 | `idle_dynamodb` | L2 |  | covered |
 | `idle_ec2` | L1 |  |  |
-| `idle_efs` | L2 |  | partial |
+| `idle_efs` | L3 |  | partial |
 | `idle_elasticache` | L1 |  |  |
 | `idle_lightsail` | L1 |  |  |
 | `idle_load_balancer` | L2 |  | partial |
@@ -70,7 +70,7 @@ proven checks only.
 | `old_ecr_images` | L3 |  | partial |
 | `old_log_group` | L1 |  |  |
 | `old_rds_snapshot` | L1 |  |  |
-| `opensearch_no_encryption_at_rest` | L2 |  | covered |
+| `opensearch_no_encryption_at_rest` | L3 |  | covered |
 | `orphaned_dns_record` | L3 |  |  |
 | `orphaned_ebs_snapshot` | L2 |  |  |
 | `over_provisioned_dynamodb` | L2 |  |  |
@@ -109,7 +109,7 @@ proven checks only.
 | `unencrypted_ebs_volume` | L2 |  | covered |
 | `unencrypted_efs_filesystem` | L2 |  | covered |
 | `unencrypted_rds_instance` | L2 |  | covered |
-| `untagged_ecr_images` | L2 |  | partial |
+| `untagged_ecr_images` | L3 |  | partial |
 | `unused_dashboard` | L1 |  |  |
 | `unused_lambda` | L1 |  |  |
 | `unused_vpc_endpoint` | L1 |  |  |

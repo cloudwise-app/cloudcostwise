@@ -1,6 +1,6 @@
 {
   "name": "cloudcostwise",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally. Nothing is sent to CloudWise.",
   "author": { "name": "CloudWise", "url": "https://cloudcostwise.io" },
   "homepage": "https://cloudcostwise.io/cli",

@@ -75,6 +75,7 @@ ADVISORY_WASTE_TYPES: frozenset[str] = frozenset({
 TRUSTED_WASTE_TYPES: frozenset[str] = frozenset({
     "ami_orphaned_snapshot",
     "appsync_idle_subscriptions",
+    "backup_copy_policy_overreach",
     "backup_no_lifecycle_tiering",
     "classic_lb_migration",
     "duplicate_cloudtrail",
@@ -152,7 +153,6 @@ TRUSTED_WASTE_TYPES: frozenset[str] = frozenset({
 UNVALIDATED_WASTE_TYPES: frozenset[str] = frozenset({
     "aurora_extended_support_cost",
     "aurora_to_rds_downgrade_opportunity",
-    "backup_copy_policy_overreach",
     "beanstalk_idle_traffic",
     "beanstalk_orphaned_rds",
     "beanstalk_over_provisioned",
