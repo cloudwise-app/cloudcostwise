@@ -334,7 +334,12 @@ class SecurityPostureDetectorsMixin:
                         },
                         metadata={
                             'bucket_name': bucket.bucket_name,
-                            'total_size_bytes': bucket.total_size_bytes,
+                            # CLO-580: None when the size was not read (another
+                            # region's bucket, or no datapoint and no listing),
+                            # never a 0 that reads as an empty bucket.
+                            'total_size_bytes': (
+                                bucket.total_size_bytes if bucket.contents_observed else None
+                            ),
                             'detection_mode': data_provider.provider_type,
                         },
                     ))

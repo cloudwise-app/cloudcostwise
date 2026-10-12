@@ -2056,15 +2056,18 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             if next_token:
                 request['NextToken'] = next_token
             response = cloudwatch.get_metric_data(**request)
+            next_token = response.get('NextToken')
             for result in response.get('MetricDataResults', []):
                 query_id = result.get('Id')
                 if query_id not in values:
                     continue
                 values[query_id].extend(result.get('Values', []))
-                status = result.get('StatusCode')
-                if status in ('InternalError', 'Forbidden'):
-                    failed_ids[query_id] = status
-            next_token = response.get('NextToken')
+                status = result.get('StatusCode', 'Complete')
+                # CLO-600: PartialData on the last page is an undercount
+                # (it could read as 0 invocations: unused); before the last
+                # page it only means "see NextToken".
+                if status in ('InternalError', 'Forbidden') or (status != 'Complete' and not next_token):
+                    failed_ids.setdefault(query_id, status)
             if not next_token:
                 break
 
@@ -2296,19 +2299,25 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         def work(name: str):
             if denied.is_set():
-                return name, None, skipped
+                return name, None, skipped, []
             limiter.acquire()
+            utilization_errors: List[Exception] = []
             try:
-                return name, self._list_pc_configs(lambda_client, name, cloudwatch), None
+                configs = self._list_pc_configs(lambda_client, name, cloudwatch, utilization_errors)
+                return name, configs, None, utilization_errors
             except Exception as e:  # noqa: BLE001 - reported on the calling thread
                 if self._is_access_denied(e):
                     denied.set()
-                return name, None, e
+                return name, None, e, utilization_errors
 
         workers = max(1, min(_LAMBDA_PC_LOOKUP_WORKERS, len(names)))
         permission_recorded = False
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cw-lambda-pc") as pool:
-            for name, configs, error in pool.map(work, names):
+            for name, configs, error, utilization_errors in pool.map(work, names):
+                # CLO-600: utilization read failures are counted here, on
+                # the calling thread, like everything else this loop writes.
+                for utilization_error in utilization_errors:
+                    self._warn_pc_utilization_failed(utilization_error)
                 if error is None:
                     result[name] = configs
                     continue
@@ -2357,11 +2366,19 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             f"are MISSING from this scan, not zero"
         )
 
+    def _warn_pc_utilization_failed(self, error: Exception) -> None:
+        self._warn_swallowed(
+            "Lambda provisioned concurrency utilization", "cloudwatch:GetMetricStatistics", error,
+        )
+
     def _list_pc_configs(
         self, lambda_client, function_name: str, cloudwatch=None,
+        utilization_errors: Optional[List[Exception]] = None,
     ) -> List[LambdaProvisionedConcurrencyData]:
         """One ListProvisionedConcurrencyConfigs call, plus the utilization
-        read for each config. Raises on a failed Lambda call."""
+        read for each config. Raises on a failed Lambda call. Failed
+        utilization reads go to ``utilization_errors`` when given (a worker
+        thread), else they are counted here."""
         configs = []
         response = lambda_client.list_provisioned_concurrency_configs(
             FunctionName=function_name
@@ -2372,7 +2389,13 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             allocated = pc.get('AllocatedProvisionedConcurrentExecutions', 0)
             
             # Get utilization metric from CloudWatch
-            avg_util = self._pc_utilization(function_name, qualifier, cloudwatch)
+            read_failed: List[Exception] = []
+            avg_util = self._pc_utilization(function_name, qualifier, cloudwatch, read_failed)
+            if utilization_errors is not None:
+                utilization_errors.extend(read_failed)
+            else:
+                for error in read_failed:
+                    self._warn_pc_utilization_failed(error)
             
             configs.append(LambdaProvisionedConcurrencyData(
                 function_name=function_name,
@@ -2383,6 +2406,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 allocated_provisioned_concurrent_executions=allocated,
                 status=pc.get('Status', 'UNKNOWN'),
                 avg_utilization_pct=avg_util,
+                utilization_read_failed=bool(read_failed),
             ))
         return configs
 
@@ -2394,9 +2418,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
     def _pc_utilization(
         self, function_name: str, qualifier: str, cloudwatch=None,
+        failed: Optional[List[Exception]] = None,
     ) -> Optional[float]:
         """Average ProvisionedConcurrencyUtilization over 14 days, as a
-        percentage, or None when there is no data or the read fails."""
+        percentage, or None when there is no data or the read fails.
+
+        CLO-600: a failure is counted. With ``failed``, the error is handed
+        back instead, for a worker thread whose caller counts it on the
+        calling thread (``_look_up_pc_configs``)."""
         try:
             if cloudwatch is None:
                 cloudwatch = self._get_client('cloudwatch')
@@ -2422,7 +2451,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 avg_util = sum(dp.get('Average', 0) for dp in datapoints) / len(datapoints)
                 return round(avg_util * 100, 2)
         except Exception as e:
-            logger.debug(f"Could not get PC utilization for {function_name}: {e}")
+            # CLO-600: a failure was a debug log only; it is a swallowed
+            # error now, and the idle check notes the verdict it withholds.
+            if failed is not None:
+                failed.append(e)
+            else:
+                self._warn_pc_utilization_failed(e)
         
         return None
     
@@ -2860,9 +2894,37 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 try:
                     location = s3.get_bucket_location(Bucket=bucket_name)
                     bucket_region = location.get('LocationConstraint') or 'us-east-1'
+                    # CLO-600: a bucket created with the legacy 'EU' location
+                    # constraint lives in eu-west-1. Unmapped, it matched no
+                    # region, so no scan ever judged its storage.
+                    if bucket_region == 'EU':
+                        bucket_region = 'eu-west-1'
                 except ClientError as e:
                     self._warn_swallowed("S3 bucket location", "s3:GetBucketLocation", e)
-                
+
+                # CLO-580: every region's scan lists every bucket, but only the
+                # bucket's own region judges its storage (storage.py skips a
+                # bucket whose known region is another one). Reading its
+                # lifecycle, uploads, CloudWatch sizes and listing in every
+                # other region was ~450 CloudWatch calls per region for
+                # nothing. Elsewhere the bucket keeps what the encryption
+                # check reads; the unread fields stay unknown (None /
+                # contents_observed=False), never "no policy" or "empty". A
+                # bucket whose location read failed is still read everywhere.
+                if bucket_region is not None and bucket_region != self._region:
+                    default_encryption_enabled, encryption_algorithm = (
+                        self._s3_default_encryption(s3, bucket_name)
+                    )
+                    buckets.append(S3BucketData(
+                        bucket_name=bucket_name,
+                        region=bucket_region,
+                        creation_date=bucket.get('CreationDate'),
+                        has_lifecycle_policy=None,
+                        default_encryption_enabled=default_encryption_enabled,
+                        encryption_algorithm=encryption_algorithm,
+                    ))
+                    continue
+
                 # Check lifecycle policy. CLO-551: NoSuchLifecycleConfiguration
                 # is AWS's real "no policy" answer; any other failure
                 # (AccessDenied, a bucket policy deny, throttling) is None
@@ -3110,23 +3172,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             "S3 bucket recent max object count", "cloudwatch:GetMetricStatistics", e,
                         )
 
-                # Check default encryption
-                default_encryption_enabled = True  # AWS default since Jan 2023
-                encryption_algorithm = None
-                try:
-                    enc_resp = s3.get_bucket_encryption(Bucket=bucket_name)
-                    enc_config = enc_resp.get('ServerSideEncryptionConfiguration', {})
-                    rules = enc_config.get('Rules', []) if isinstance(enc_config, dict) else []
-                    if rules and isinstance(rules, list) and len(rules) > 0:
-                        default_rule = rules[0]
-                        if isinstance(default_rule, dict):
-                            encryption_algorithm = default_rule.get(
-                                'ApplyServerSideEncryptionByDefault', {}
-                            ).get('SSEAlgorithm')
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'ServerSideEncryptionConfigurationNotFoundError':
-                        default_encryption_enabled = False
-                
+                default_encryption_enabled, encryption_algorithm = (
+                    self._s3_default_encryption(s3, bucket_name)
+                )
+
                 buckets.append(S3BucketData(
                     bucket_name=bucket_name,
                     region=bucket_region,
@@ -3155,8 +3204,28 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 self._warn_access_denied("S3 Buckets", "s3:ListBuckets", e)
                 raise
             logger.error(f"Error fetching S3 buckets: {e}")
-        
+
         return buckets
+
+    @staticmethod
+    def _s3_default_encryption(s3, bucket_name: str) -> Tuple[bool, Optional[str]]:
+        """A bucket's default encryption: (enabled, algorithm)."""
+        default_encryption_enabled = True  # AWS default since Jan 2023
+        encryption_algorithm = None
+        try:
+            enc_resp = s3.get_bucket_encryption(Bucket=bucket_name)
+            enc_config = enc_resp.get('ServerSideEncryptionConfiguration', {})
+            rules = enc_config.get('Rules', []) if isinstance(enc_config, dict) else []
+            if rules and isinstance(rules, list) and len(rules) > 0:
+                default_rule = rules[0]
+                if isinstance(default_rule, dict):
+                    encryption_algorithm = default_rule.get(
+                        'ApplyServerSideEncryptionByDefault', {}
+                    ).get('SSEAlgorithm')
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ServerSideEncryptionConfigurationNotFoundError':
+                default_encryption_enabled = False
+        return default_encryption_enabled, encryption_algorithm
     
     async def get_s3_cost_breakdown(self) -> Dict[str, S3CostBreakdown]:
         """Query Cost Explorer for per-bucket S3 cost breakdown by usage type.
@@ -3676,11 +3745,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     if not next_token:
                         break
             except (ClientError, BotoCoreError) as e:
-                if self._is_access_denied(e):
-                    self._record_permission_error(
-                        resource="VPC Endpoint Metrics",
-                        permission="cloudwatch:GetMetricData", error=e,
-                    )
+                # CLO-600: _warn_swallowed records an AccessDenied once.
                 self._warn_swallowed(
                     "VPC endpoint BytesProcessed", "cloudwatch:GetMetricData", e,
                 )
@@ -3912,11 +3977,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         is_idle=read_total == 0 and write_total == 0,
                     )
                 except ClientError as e:
-                    if self._is_access_denied(e):
-                        self._record_permission_error(
-                            resource="DynamoDB Metrics (per-resource)", permission="cloudwatch:GetMetricStatistics", error=e,
-                        )
-                        self._warn_access_denied("DynamoDB Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
+                    # CLO-600: _warn_swallowed records an AccessDenied once;
+                    # an explicit record here doubled it.
                     # CLO-485: a failed read is MISSING, not zero. It used to
                     # store a default DynamoDBMetricsData whose 0.0/0.0
                     # consumed capacity read as an idle table (the detector
@@ -4267,6 +4329,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     })
 
             series: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+            # CLO-600: nodes with a query that did not end Complete. Its
+            # series is an undercount (or empty, which used to fall through
+            # to GetTypeCmds+SetTypeCmds), so the node is MISSING.
+            failed_nodes: Dict[str, str] = {}
             try:
                 next_token: Optional[str] = None
                 while True:
@@ -4278,6 +4344,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     if next_token:
                         request['NextToken'] = next_token
                     response = cloudwatch.get_metric_data(**request)
+                    next_token = response.get('NextToken')
                     for res in response.get('MetricDataResults', []):
                         key = by_query.get(res.get('Id'))
                         if key is None:
@@ -4286,15 +4353,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         for ts, value in zip(res.get('Timestamps', []), res.get('Values', [])):
                             if value is not None:
                                 points.append({'Timestamp': ts, 'Sum': float(value)})
-                    next_token = response.get('NextToken')
+                        code = res.get('StatusCode', 'Complete')
+                        # PartialData before the last page only means "see NextToken".
+                        if code in ('InternalError', 'Forbidden') or (code != 'Complete' and not next_token):
+                            failed_nodes.setdefault(key[0], code)
                     if not next_token:
                         break
             except (ClientError, BotoCoreError) as e:
-                if self._is_access_denied(e):
-                    self._record_permission_error(
-                        resource="ElastiCache Request Metrics",
-                        permission="cloudwatch:GetMetricData", error=e,
-                    )
+                # CLO-600: _warn_swallowed records an AccessDenied once.
                 self._warn_swallowed(
                     "ElastiCache request metrics", "cloudwatch:GetMetricData", e,
                 )
@@ -4306,6 +4372,13 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 continue
 
             for cluster_id in batch:
+                if cluster_id in failed_nodes:
+                    self._note_idle_verdict_missing(
+                        'elasticache-serverless', cluster_id,
+                        f"metric read incomplete ({failed_nodes[cluster_id]})",
+                        verdict='serverless-estimate', evidence='command counts',
+                    )
+                    continue
                 created = (create_times or {}).get(cluster_id)
 
                 def _own(suffix: str, _id=cluster_id, _created=created) -> List[Dict[str, Any]]:
@@ -4487,6 +4560,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     wlm_wait_avg = 0.0
                     wlm_running_avg = 0.0
                     wlm_running_max = 0.0
+                    wlm_metrics_missing = False
                     try:
                         # WLM Queue Length
                         wlm_queue_response = cloudwatch.get_metric_statistics(
@@ -4527,14 +4601,24 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         wlm_running_dps = _own(wlm_running_response)
                         wlm_running_avg = sum(dp['Average'] for dp in wlm_running_dps) / len(wlm_running_dps) if wlm_running_dps else 0.0
                         wlm_running_max = max((dp['Maximum'] for dp in wlm_running_dps), default=0.0)
-                    except ClientError as e:
-                        logger.debug(f"Could not fetch WLM metrics for {cluster_id}: {e}")
+                    except (ClientError, BotoCoreError) as e:
+                        # CLO-600: a read that failed part-way left the later
+                        # WLM fields at 0, which the over-provisioned check
+                        # read as "few running queries" and fired on. The WLM
+                        # verdict is MISSING, never judged on defaults.
+                        wlm_metrics_missing = True
+                        self._warn_swallowed("Redshift WLM metrics", "cloudwatch:GetMetricStatistics", e)
+                        self._note_idle_verdict_missing(
+                            'redshift wlm', cluster_id, f"read failed ({self._error_label(e)})",
+                            verdict="WLM over-provisioned", evidence="WLM metrics",
+                        )
                     
                     # Concurrency Scaling metrics (Detector 6)
                     cs_seconds_avg = 0.0
                     cs_seconds_total = 0.0
                     cs_active_avg = 0.0
                     cs_active_max = 0.0
+                    cs_metrics_missing = False
                     try:
                         # ConcurrencyScalingSeconds — total per day
                         cs_seconds_response = cloudwatch.get_metric_statistics(
@@ -4563,8 +4647,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         cs_active_dps = _own(cs_active_response)
                         cs_active_avg = sum(dp['Average'] for dp in cs_active_dps) / len(cs_active_dps) if cs_active_dps else 0.0
                         cs_active_max = max((dp['Maximum'] for dp in cs_active_dps), default=0.0)
-                    except ClientError as e:
-                        logger.debug(f"Could not fetch Concurrency Scaling metrics for {cluster_id}: {e}")
+                    except (ClientError, BotoCoreError) as e:
+                        # CLO-600: MISSING, not "no scaling" (or a peak of 0).
+                        cs_metrics_missing = True
+                        self._warn_swallowed(
+                            "Redshift concurrency scaling metrics", "cloudwatch:GetMetricStatistics", e,
+                        )
+                        self._note_idle_verdict_missing(
+                            'redshift concurrency scaling', cluster_id, f"read failed ({self._error_label(e)})",
+                            verdict="concurrency-scaling waste", evidence="concurrency scaling metrics",
+                        )
                     
                     # CLO-485: "0 connections for N days" must be measured,
                     # not defaulted. An empty or sparse series (a new region,
@@ -4599,6 +4691,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         concurrency_scaling_seconds_total=round(cs_seconds_total, 2),
                         concurrency_scaling_active_clusters_avg=round(cs_active_avg, 2),
                         concurrency_scaling_active_clusters_max=round(cs_active_max, 2),
+                        wlm_metrics_missing=wlm_metrics_missing,
+                        cs_metrics_missing=cs_metrics_missing,
                     )
                 except ClientError as e:
                     # CLO-485: a failed read is MISSING, not zero: leave the
@@ -5808,14 +5902,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         period_days=days,
                         is_idle=records == 0 and total_bytes == 0,
                     )
-                except ClientError as e:
-                    if self._is_access_denied(e):
-                        self._record_permission_error(
-                            resource="Firehose Metrics (per-resource)", permission="cloudwatch:GetMetricStatistics", error=e,
-                        )
-                        self._warn_access_denied("Firehose Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
-                    logger.warning(f"Error fetching Firehose metrics for {name}: {e}")
-                    metrics[name] = KinesisFirehoseMetricsData(delivery_stream_name=name, period_days=days)
+                except (ClientError, BotoCoreError) as e:
+                    # CLO-600: a failed read is MISSING, not zero: leave the
+                    # stream out of the map (the idle check skips a stream
+                    # with no metrics) instead of storing a default model.
+                    self._warn_swallowed(
+                        "Firehose Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e,
+                    )
+                    self._note_idle_verdict_missing(
+                        'firehose', name, f"read failed ({self._error_label(e)})",
+                    )
         except Exception as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
@@ -7457,24 +7553,23 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         dimension pair ``ServiceMetric=StateTransition`` + ``StateMachineArn`` (verified
         against the Step Functions CloudWatch metrics docs, 2026-07). Sum over the
         window yields the total transitions consumed.
+
+        CLO-600: a failed read raises; it used to return 0, which read as "no
+        transitions" and silently suppressed both checks that use it.
         """
-        try:
-            resp = cw.get_metric_statistics(
-                Namespace='AWS/States',
-                MetricName='ConsumedCapacity',
-                Dimensions=[
-                    {'Name': 'ServiceMetric', 'Value': 'StateTransition'},
-                    {'Name': 'StateMachineArn', 'Value': state_machine_arn},
-                ],
-                StartTime=start_time,
-                EndTime=end_time,
-                Period=period,
-                Statistics=['Sum'],
-            )
-            return int(sum(d.get('Sum', 0) for d in resp.get('Datapoints', [])))
-        except Exception as e:
-            logger.debug(f"Failed to get SFN state-transition metric for {state_machine_arn}: {e}")
-            return 0
+        resp = cw.get_metric_statistics(
+            Namespace='AWS/States',
+            MetricName='ConsumedCapacity',
+            Dimensions=[
+                {'Name': 'ServiceMetric', 'Value': 'StateTransition'},
+                {'Name': 'StateMachineArn', 'Value': state_machine_arn},
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=period,
+            Statistics=['Sum'],
+        )
+        return int(sum(d.get('Sum', 0) for d in resp.get('Datapoints', [])))
 
     async def get_step_function_state_machines(self) -> List[Dict[str, Any]]:
         """Get all Step Functions state machines."""
@@ -7676,11 +7771,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 period_days=days,
             )
         except Exception as e:
-            if self._is_access_denied(e):
-                self._record_permission_error(
-                    resource="Step Function Retry Metrics", permission="cloudwatch:GetMetricStatistics", error=e,
-                )
-                self._warn_access_denied("Step Function Retry Metrics", "cloudwatch:GetMetricStatistics", e)
+            # CLO-600: counted (and recorded once when denied) and noted;
+            # a non-permission failure used to be a debug log only.
+            self._warn_swallowed(
+                "Step Function Retry Metrics", "cloudwatch:GetMetricStatistics", e,
+            )
+            self._note_idle_verdict_missing(
+                'step functions retry', state_machine_arn.rsplit(':', 1)[-1],
+                f"read failed ({self._error_label(e)})",
+                verdict="retry-storm", evidence="execution metrics",
+            )
             logger.debug(f"Failed to get SFN retry metrics for {state_machine_arn}: {e}")
             return None
 
@@ -7744,11 +7844,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 period_days=days,
             )
         except Exception as e:
-            if self._is_access_denied(e):
-                self._record_permission_error(
-                    resource="Step Function Transition Metrics", permission="cloudwatch:GetMetricStatistics", error=e,
-                )
-                self._warn_access_denied("Step Function Transition Metrics", "cloudwatch:GetMetricStatistics", e)
+            # CLO-600: counted (and recorded once when denied) and noted;
+            # a non-permission failure used to be a debug log only.
+            self._warn_swallowed(
+                "Step Function Transition Metrics", "cloudwatch:GetMetricStatistics", e,
+            )
+            self._note_idle_verdict_missing(
+                'step functions transition', state_machine_arn.rsplit(':', 1)[-1],
+                f"read failed ({self._error_label(e)})",
+                verdict="transition-density", evidence="execution metrics",
+            )
             logger.debug(f"Failed to get SFN transition metrics for {state_machine_arn}: {e}")
             return None
 
@@ -8287,6 +8392,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         created = getattr(broker, 'created', None)
         start_time = metric_start_time(end_time, days, created)
         points: Dict[str, Dict[Any, float]] = {'msg': {}, 'con': {}, 'pro': {}, 'cpu': {}}
+        # CLO-600: a metric whose query (on any instance) did not end
+        # Complete. A partial series can miss the only busy hours, and a
+        # failed active instance would be maxed against the standby's
+        # zeros, so the metric is MISSING, never a low peak.
+        incomplete: Dict[str, str] = {}
         try:
             cw = self._get_client('cloudwatch')
             next_token: Optional[str] = None
@@ -8312,6 +8422,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         # pair publishes little or nothing).
                         prior = points[key].get(ts)
                         points[key][ts] = value if prior is None else max(prior, value)
+                    code = res.get('StatusCode', 'Complete')
+                    # PartialData before the last page only means "see NextToken".
+                    if code in ('InternalError', 'Forbidden') or (code != 'Complete' and not next_token):
+                        incomplete.setdefault(key, code)
                 if not next_token:
                     break
         except Exception as e:  # noqa: BLE001 - a failed read is MISSING, never idle
@@ -8331,16 +8445,25 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return None
 
         needed = days * 24 * 0.75
-        activity_ok = all(len(points[key]) >= needed for key in ('msg', 'con', 'pro'))
-        cpu_ok = len(points['cpu']) >= needed
+        activity_ok = all(
+            len(points[key]) >= needed and key not in incomplete for key in ('msg', 'con', 'pro')
+        )
+        cpu_ok = len(points['cpu']) >= needed and 'cpu' not in incomplete
         if not activity_ok:
+            failed = [key for key in ('msg', 'con', 'pro') if key in incomplete]
             missing = [key for key in ('msg', 'con', 'pro') if len(points[key]) < needed]
-            reason = 'no datapoints' if all(not points[k] for k in missing) else 'under 75% coverage'
+            if failed:
+                reason = f"metric read incomplete ({incomplete[failed[0]]})"
+            else:
+                reason = 'no datapoints' if all(not points[k] for k in missing) else 'under 75% coverage'
             self._note_idle_verdict_missing('mq', broker_id, reason, evidence='broker activity metrics')
         if not cpu_ok:
+            if 'cpu' in incomplete:
+                reason = f"metric read incomplete ({incomplete['cpu']})"
+            else:
+                reason = 'no datapoints' if not points['cpu'] else 'under 75% coverage'
             self._note_idle_verdict_missing(
-                'mq', broker_id, 'no datapoints' if not points['cpu'] else 'under 75% coverage',
-                verdict='oversized', evidence='broker CPU metrics',
+                'mq', broker_id, reason, verdict='oversized', evidence='broker CPU metrics',
             )
         if not activity_ok and not cpu_ok:
             cache[(broker_id, days)] = None
@@ -8808,15 +8931,22 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 running_steps=len(running),
                 pending_steps=len(pending),
             )
-        except ClientError as e:
+        except (ClientError, BotoCoreError) as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
                     resource="EMR Step Summary", permission="emr:ListSteps", error=e,
                 )
                 self._warn_access_denied("EMR Step Summary", "emr:ListSteps", e)
                 raise
-            logger.warning(f"Error listing EMR steps for {cluster_id}: {e}")
-            return EMRStepSummaryData(cluster_id=cluster_id)
+            # CLO-600: the default summary (no last step, 0 running) read as
+            # "no recent steps" and fired long_running_emr on any old
+            # RUNNING cluster whose ListSteps was throttled. MISSING instead.
+            self._warn_swallowed("EMR Step Summary", "emr:ListSteps", e)
+            self._note_idle_verdict_missing(
+                'emr steps', cluster_id, f"read failed ({self._error_label(e)})",
+                verdict="long-running", evidence="step history",
+            )
+            return EMRStepSummaryData(cluster_id=cluster_id, read_failed=True)
 
     async def get_emr_metrics(
         self,
@@ -8878,14 +9008,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         apps_running_avg=apps_avg,
                         period_days=days,
                     )
-                except ClientError as e:
-                    if self._is_access_denied(e):
-                        self._record_permission_error(
-                            resource="EMR Metrics (per-resource)", permission="cloudwatch:GetMetricStatistics", error=e,
-                        )
-                        self._warn_access_denied("EMR Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
-                    logger.warning(f"Error fetching EMR metrics for {cluster_id}: {e}")
-                    metrics[cluster_id] = EMRMetricsData(cluster_id=cluster_id, period_days=days)
+                except (ClientError, BotoCoreError) as e:
+                    # CLO-600: a failed read is MISSING, not zero: leave the
+                    # cluster out of the map (the EMR checks skip a cluster
+                    # with no metrics) instead of storing a default model.
+                    self._warn_swallowed(
+                        "EMR Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e,
+                    )
+                    self._note_idle_verdict_missing(
+                        'emr yarn', cluster_id, f"read failed ({self._error_label(e)})",
+                        verdict="over-provisioned", evidence="YARN metrics",
+                    )
         except Exception as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
@@ -9777,7 +9910,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 ip_sets = acc.get('IpSets', [])
                 ip_addresses = []
                 if ip_sets:
-                    ip_addresses = [ip.get('IpAddress', '') for ip in ip_sets[0].get('IpAddresses', [])]
+                    # AWS returns IpAddresses as a list of plain strings; one
+                    # raising .get() here dropped every accelerator (CLO-597).
+                    ip_addresses = [
+                        ip if isinstance(ip, str) else ip.get('IpAddress', '')
+                        for ip in ip_sets[0].get('IpAddresses', [])
+                    ]
 
                 results.append(GlobalAcceleratorData(
                     name=acc['Name'],
@@ -9808,6 +9946,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 )
                 self._warn_access_denied("Global Accelerator Resources", "globalaccelerator:ListAccelerators", e)
                 raise
-            logger.debug(f"Global Accelerator data fetch error: {e}")
+            # CLO-597: this was logger.debug, so a provider bug dropped every
+            # accelerator for six months with DetectorErrors 0. Warn and count.
+            self._warn_swallowed(
+                "Global Accelerator Resources", "globalaccelerator:ListAccelerators", e,
+            )
 
         return results

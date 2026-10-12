@@ -766,6 +766,13 @@ class OpenComputeDetectorsMixin:
                             if metrics and metrics.invocations_total == 0:
                                 utilization_pct = 0.0
                             else:
+                                # CLO-600: a failed read is noted, never silent.
+                                note = getattr(data_provider, '_note_idle_verdict_missing', None)
+                                if getattr(pc, 'utilization_read_failed', False) and note:
+                                    note(
+                                        'lambda provisioned concurrency', f"{func_name}:{pc.function_qualifier}",
+                                        "read failed", evidence="provisioned concurrency utilization",
+                                    )
                                 continue  # Can't determine — skip
                         
                         if utilization_pct >= 10.0:

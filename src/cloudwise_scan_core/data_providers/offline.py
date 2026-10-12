@@ -1658,6 +1658,10 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 contents_observed = True
             
             bucket_region = bucket.get('region') or bucket.get('Location') or 'us-east-1'
+            if bucket_region == 'EU':
+                # CLO-600: the legacy 'EU' location constraint is eu-west-1,
+                # not an anonymized region.
+                bucket_region = 'eu-west-1'
             if not self._AWS_REGION_RE.match(str(bucket_region)):
                 # CLO-488: not a region code (a pre-1.13.0 --anonymize export
                 # hashed it). The detector's region filter used to drop every
@@ -1717,6 +1721,9 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 default_encryption_enabled=default_encryption_enabled,
                 encryption_algorithm=encryption_algorithm,
                 contents_observed=contents_observed,
+                # CLO-555: absent (None) on an export older than 1.25.0;
+                # the detector falls back to matching the bucket name itself.
+                is_infra=self._s3_infra_flag(bucket),
             ))
         
         return buckets
@@ -1738,6 +1745,16 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return int(latest.get('Average', 0))
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _s3_infra_flag(bucket: Dict[str, Any]) -> Optional[bool]:
+        """CLO-555: the export's per-bucket ``Infra`` flag, or None when
+        absent (pre-1.25.0 export) or not a real boolean (defensive; the
+        export always writes a bare JSON literal)."""
+        value = bucket.get('Infra')
+        if isinstance(value, bool):
+            return value
+        return None
 
     @staticmethod
     def _s3_key_count_sample(bucket: Dict[str, Any]) -> Optional[int]:
@@ -5598,8 +5615,10 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             ip_sets = acc.get('IpSets', [])
             ip_addresses = []
             if ip_sets:
+                # AWS returns IpAddresses as plain strings (CLO-597).
                 ip_addresses = [
-                    ip.get('IpAddress', '') for ip in ip_sets[0].get('IpAddresses', [])
+                    ip if isinstance(ip, str) else ip.get('IpAddress', '')
+                    for ip in ip_sets[0].get('IpAddresses', [])
                 ]
 
             results.append(GlobalAcceleratorData(

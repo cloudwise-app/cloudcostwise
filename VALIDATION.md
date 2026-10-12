@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 42 at L1, 38 at L2, 11 at L3.
+Summary for the checks in this repository: 40 at L1, 34 at L2, 17 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -51,7 +51,7 @@ proven checks only.
 | `idle_sagemaker_endpoint` | L1 |  |  |
 | `idle_sagemaker_notebook` | L1 |  |  |
 | `idle_workspace` | L1 | yes |  |
-| `incomplete_multipart` | L1 |  |  |
+| `incomplete_multipart` | L3 |  | partial |
 | `lambda_arm64_migration` | L2 |  | none |
 | `lambda_excessive_timeout` | L2 |  | partial |
 | `lambda_old_runtime` | L2 |  | covered |
@@ -72,7 +72,7 @@ proven checks only.
 | `old_rds_snapshot` | L1 |  |  |
 | `opensearch_no_encryption_at_rest` | L3 |  | covered |
 | `orphaned_dns_record` | L3 |  |  |
-| `orphaned_ebs_snapshot` | L2 |  |  |
+| `orphaned_ebs_snapshot` | L2 |  | none |
 | `over_provisioned_dynamodb` | L2 |  |  |
 | `over_provisioned_iops` | L1 |  |  |
 | `over_provisioned_lambda` | L2 |  | covered |
@@ -85,8 +85,8 @@ proven checks only.
 | `oversized_workspace` | L1 |  |  |
 | `previous_gen_sagemaker_instance` | L2 |  | none |
 | `rds_extended_support_cost` | L1 |  |  |
-| `rds_no_deletion_protection` | L2 |  | covered |
-| `rds_publicly_accessible` | L2 |  | covered |
+| `rds_no_deletion_protection` | L3 |  | covered |
+| `rds_publicly_accessible` | L3 |  | covered |
 | `resource_without_backup_coverage` | L3 |  | covered |
 | `ri_opportunity_ec2` | L1 | yes |  |
 | `ri_opportunity_elasticache` | L1 | yes |  |
@@ -102,13 +102,13 @@ proven checks only.
 | `sp_opportunity_ec2` | L1 | yes |  |
 | `sp_opportunity_sagemaker` | L1 | yes |  |
 | `stopped_ec2_with_ebs` | L2 |  | covered |
-| `stopped_sagemaker_notebook_storage` | L1 |  |  |
+| `stopped_sagemaker_notebook_storage` | L3 |  | none |
 | `unattached_ebs` | L3 |  | covered |
 | `unattached_eip` | L3 |  | covered |
 | `unencrypted_documentdb_cluster` | L2 |  | covered |
-| `unencrypted_ebs_volume` | L2 |  | covered |
+| `unencrypted_ebs_volume` | L3 |  | covered |
 | `unencrypted_efs_filesystem` | L2 |  | covered |
-| `unencrypted_rds_instance` | L2 |  | covered |
+| `unencrypted_rds_instance` | L3 |  | covered |
 | `untagged_ecr_images` | L3 |  | partial |
 | `unused_dashboard` | L1 |  |  |
 | `unused_lambda` | L1 |  |  |

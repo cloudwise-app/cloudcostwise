@@ -984,11 +984,23 @@ class OpenStorageDetectorsMixin:
         if age_days < 30:
             return []
 
-        # Skip infrastructure buckets
-        bucket_lower = bucket.bucket_name.lower()
-        for pattern in self._S3_INFRA_PATTERNS:
-            if pattern in bucket_lower:
+        # Skip infrastructure buckets. CLO-555: an Air-Gapped export made
+        # with --anonymize carries only a pseudonym (res_<hash>/
+        # bucket-<hash>), so this name-pattern match can never fire and the
+        # bucket's real name never leaves the account. Export 1.25.0+
+        # computes an ``Infra`` flag in-account, from the bucket's real name
+        # and these same patterns, BEFORE anonymization, and carries it as a
+        # bare boolean. Use it when the export supplied it; fall back to the
+        # name match for the online provider (always has the real name) and
+        # an export older than 1.25.0 (bucket.is_infra is None there).
+        if bucket.is_infra is not None:
+            if bucket.is_infra:
                 return []
+        else:
+            bucket_lower = bucket.bucket_name.lower()
+            for pattern in self._S3_INFRA_PATTERNS:
+                if pattern in bucket_lower:
+                    return []
 
         # CLO-385 (METHOD.md pinned decision 4): a bucket a workload writes
         # to and a lifecycle expiration rule then clears is in use, even

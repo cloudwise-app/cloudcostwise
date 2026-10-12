@@ -225,6 +225,9 @@ class LambdaProvisionedConcurrencyData:
     allocated_provisioned_concurrent_executions: int
     status: str  # 'READY', 'IN_PROGRESS', 'FAILED'
     avg_utilization_pct: Optional[float] = None  # From CloudWatch
+    # CLO-600: True when the utilization read failed (None above is then
+    # MISSING, not "no datapoints").
+    utilization_read_failed: bool = False
 
 
 @dataclass
@@ -300,6 +303,17 @@ class S3BucketData:
     # fire on them. S3 publishes no storage datapoints for an empty bucket,
     # so an empty CloudWatch series is missing data, not zero.
     contents_observed: bool = False
+    # CLO-555: whether this is an infrastructure bucket (CDK, CloudFormation,
+    # logging, etc.), computed in-account from the bucket's real name before
+    # --anonymize runs, and carried as a bare boolean (no name). Export
+    # 1.25.0+ sets this from the same substring patterns as
+    # StorageDetectorsMixin._S3_INFRA_PATTERNS; an older export leaves it
+    # None, and the detector falls back to matching the (online, or
+    # unanonymized offline) bucket name directly. Only online and an
+    # anonymized export actually need the fallback or the flag respectively —
+    # an unanonymized offline export could use either and gets the flag when
+    # the export is new enough.
+    is_infra: Optional[bool] = None
 
 
 @dataclass
@@ -649,6 +663,11 @@ class RedshiftMetricsData:
     concurrency_scaling_seconds_total: float = 0.0
     concurrency_scaling_active_clusters_avg: float = 0.0
     concurrency_scaling_active_clusters_max: float = 0.0
+    # CLO-600: True when the WLM / concurrency-scaling reads failed; the
+    # fields above are then defaults, not measurements, and the matching
+    # check withholds its verdict.
+    wlm_metrics_missing: bool = False
+    cs_metrics_missing: bool = False
     # CLO-485: hourly DatabaseConnections datapoints inside the idle claim
     # window (redshift_idle_days). is_idle requires 75% of its hours; None =
     # not reported (the offline export is pre-aggregated).
@@ -1642,6 +1661,9 @@ class EMRStepSummaryData:
     last_step_end_time: Optional[datetime] = None
     running_steps: int = 0
     pending_steps: int = 0
+    # CLO-600: True when ListSteps failed; the counts above are then
+    # defaults, not history, and long_running_emr withholds its verdict.
+    read_failed: bool = False
 
 
 @dataclass
