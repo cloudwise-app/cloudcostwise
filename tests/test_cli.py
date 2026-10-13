@@ -58,6 +58,8 @@ def test_footer_and_cost_explorer_note():
     report = _report(calls={"ce": 13, "ec2": 4})
     assert render.footer(report).startswith("20 of 46 service checks run locally. The other 26,")
     assert "connect?utm_source=cloudcostwise&utm_medium=cli" in render.footer(report)
+    assert "issues/1" in render.footer(report)
+    assert "leave out account IDs and resource names" in render.footer(report)
     assert "13 Cost Explorer request(s)" in render.cost_explorer_note(report)
     assert "about $0.13" in render.cost_explorer_note(report)
     assert render.cost_explorer_note(_report(calls={"ec2": 4})) == ""

@@ -20,6 +20,9 @@ from cloudcostwise.scan import ScanReport
 HOSTED_URL = "https://cloudcostwise.io/connect?utm_source=cloudcostwise&utm_medium=cli"
 TOTAL_ENTRYPOINTS = 46
 OPEN_ENTRYPOINTS = 20
+FEEDBACK_URL = "https://github.com/cloudwise-app/cloudcostwise/issues/1"
+FEEDBACK_NOTE = (f"Wrong, or missed something? Tell us at {FEEDBACK_URL} or cloudwise@cloudcostwise.io. "
+                 "Waste types and counts are enough; leave out account IDs and resource names.")
 CE_SKIPPED_NOTE = ("RI/Savings Plans checks skipped (--no-cost-explorer); "
                    "extended-support surcharges are estimates, not billed amounts.")
 
@@ -74,7 +77,8 @@ def footer(report: ScanReport) -> str:
     # Counts the open checks, not how many ran: a check the user switched off
     # (--no-cost-explorer) is still a local one, not one of the hosted 26.
     return (f"{OPEN_ENTRYPOINTS} of {TOTAL_ENTRYPOINTS} service checks run locally. "
-            f"The other {TOTAL_ENTRYPOINTS - OPEN_ENTRYPOINTS}, history, alerts and safe fixes: {HOSTED_URL}")
+            f"The other {TOTAL_ENTRYPOINTS - OPEN_ENTRYPOINTS}, history, alerts and safe fixes: {HOSTED_URL}\n"
+            f"{FEEDBACK_NOTE}")
 
 
 def scope_notes(report: ScanReport) -> List[str]:
@@ -122,7 +126,9 @@ def as_markdown(report: ScanReport) -> str:
             out.append(f"| {name} | {i.region or '-'} | `{i.resource_id}` | {_money(float(i.monthly_savings or 0))} |")
     out += ["", f"**Estimated savings: {_money(counted_total(report))}/month** (advisory excluded)"]
     note = cost_explorer_note(report)
-    out += ["", *[n + "\n" for n in scope_notes(report)], *( [note, ""] if note else [] ), footer(report)]
+    # A single newline is a soft break in markdown; keep each footer sentence on its own line.
+    out += ["", *[n + "\n" for n in scope_notes(report)], *( [note, ""] if note else [] ),
+            footer(report).replace("\n", "\n\n")]
     return "\n".join(out)
 
 
