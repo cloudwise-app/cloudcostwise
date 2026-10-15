@@ -174,6 +174,81 @@ class MSKMetrics:
     # on at least one broker (``cpu_user`` is then a placeholder 0.0, not 0%
     # CPU). None is unused today — both providers count it.
     cpu_datapoints: Optional[int] = None
+    # CLO-606: which rule resolved ``is_idle=True`` — today only
+    # 'no_user_partitions' (UserPartitionExists==0 on every broker). Empty
+    # when is_idle is False (the field is unused) or for a caller that
+    # builds MSKMetrics directly without setting it. The detector's
+    # customer-facing idle finding cites this rather than a generic
+    # "canary-range" claim it cannot prove on its own.
+    idle_evidence: str = ''
+
+
+# CLO-606: every MSK cluster — provisioned, with or without a real
+# producer/consumer — runs AWS's own internal "canary": the service-managed
+# topics `__amazon_msk_canary` and `__amazon_msk_canary_state`, which AWS's
+# troubleshooting guide describes as internal topics "Amazon MSK creates and
+# uses for cluster health and diagnostic metrics" that "are negligible in
+# size and can't be deleted" (docs.aws.amazon.com/msk/latest/developerguide/
+# troubleshooting.html#amazon_msk_canary). Per AWS re:Post, the canary runs
+# its own consumer group PER BROKER (``amazon.msk.canary.group.broker-N``),
+# so its traffic scales with broker count. That traffic is real but tiny, so
+# the strict `== 0` check this replaced never fired on a genuinely idle
+# cluster — a false negative measured live (read-only
+# ``cloudwatch:GetMetricStatistics``) on a fixture
+# cluster cwfx-w8b-msk (the fixture account, us-east-1), which had no producer or
+# consumer for 7 days: the mean of each broker's hourly ``Average`` over
+# that window was ~0.046-0.068 msg/s and ~9.0-11.6 B/s in; the busiest single
+# hour (the ``Maximum`` statistic) peaked at ~0.10 msg/s and ~20.7 B/s in;
+# BytesOutPerSec was 0 on broker 1 and ~5.5 B/s mean (~6.9 B/s peak) on
+# broker 2.
+#
+# CLO-606 v2 (adversarial review): a flat per-broker "idle" threshold set
+# high enough to clear the canary (the first version of this fix used 1.0
+# msg/s) is NOT safe on its own — it would also call a real, low-volume
+# producer idle (e.g. 1 msg/min = 0.017 msg/s, which is already below the
+# canary's OWN measured rate above) and advise deleting it at HIGH
+# confidence. Traffic at or under these ceilings is only "canary-level" —
+# consistent with having no real traffic, NOT proof of it. ``is_idle`` is
+# decided (see online.py/offline.py get_msk_metrics) by, in order:
+#
+#   1. ``UserPartitionExists`` == 0 on every broker for the whole window
+#      (DEFAULT-level boolean per broker: "A value of 1 indicates the
+#      presence of partitions on the broker" — docs.aws.amazon.com/msk/
+#      latest/developerguide/metrics-details.html) AND traffic at/under the
+#      ceilings below: no user-owned partition ever existed, so there is
+#      nothing for a low-volume producer to have written to. Idle, HIGH
+#      confidence. An empty or unmeasured series for ``UserPartitionExists``
+#      on ANY broker is MISSING, never read as a measured 0.
+#   2. Otherwise, if traffic is at/under the ceilings below but a user
+#      topic exists (``UserPartitionExists`` is 1 on some broker) or
+#      ``UserPartitionExists`` itself is unmeasured: BOTH verdicts are
+#      withheld — never idle, never oversized, noted. Cluster-level
+#      metrics alone cannot tell an idle cluster from a low-volume producer
+#      or consumer (an earlier draft of this fix tried to resolve this case
+#      with PER_TOPIC_PER_BROKER evidence; that path was dropped on review
+#      — few customers enable that monitoring level, and the draft had its
+#      own correctness problems: an empty per-topic series read as a
+#      measured zero rather than MISSING, query targets built as the full
+#      topic x broker cross product instead of the discovered pairs, an
+#      internal-only topic list treated as proof of no user topic even
+#      when ``UserPartitionExists`` said otherwise, no check of per-topic
+#      BytesOutPerSec (a consumer-only topic would have read idle), an
+#      unsafe assumption that a ``__``-prefixed name is always an internal
+#      topic, and a ``ListMetrics`` call with no ``MetricName`` filter or
+#      page cap).
+#   3. Otherwise (traffic above the ceilings): unchanged from before
+#      CLO-606 — not idle, falls through to the oversized check.
+#
+# The ceilings are PER BROKER (every broker must be at/under both, not the
+# cluster's sum — the canary's traffic scales with broker count), mean rate
+# over the whole ``msk_idle_days`` window, roughly 3x the single 2-broker
+# sample's peak canary figures above (BytesIn's 20.7 B/s peak; the message
+# ceiling rounds up from it rather than from 0.10 msg/s, since a margin
+# much tighter than bytes' would leave less room for sampling noise on a
+# metric this small). This is one sample, from one cluster, over one week —
+# not a statistically characterized canary rate.
+MSK_CANARY_MESSAGES_PER_SEC_CEILING = 0.3   # messages/sec, per broker
+MSK_CANARY_BYTES_PER_SEC_CEILING = 64.0     # bytes/sec, per broker (in or out)
 
 
 @dataclass

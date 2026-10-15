@@ -25,7 +25,10 @@ from cloudwise_scan_core.data_providers.missing_data import (
     KINESIS_EFO_NOTE_VERDICT,
     MissingDataNotesMixin,
 )
-from cloudwise_scan_core.cloudwatch_metrics_service import MSKMetrics, MQMetrics
+from cloudwise_scan_core.cloudwatch_metrics_service import (
+    MSKMetrics, MQMetrics,
+    MSK_CANARY_MESSAGES_PER_SEC_CEILING, MSK_CANARY_BYTES_PER_SEC_CEILING,
+)
 from cloudwise_scan_core.metric_window import (
     _as_utc,
     drop_pre_creation_datapoints,
@@ -45,6 +48,7 @@ from cloudwise_scan_core.cpu_sizing import (
 )
 from cloudwise_scan_core.data_providers.models import (
     CounterRead,
+    merge_beanstalk_statuses,
     EC2InstanceData,
     EC2MetricsData,
     EBSVolumeData,
@@ -54,6 +58,7 @@ from cloudwise_scan_core.data_providers.models import (
     RDSInstanceData,
     RDSMetricsData,
     RDSSnapshotData,
+    RDSSnapshotSharingData,
     LambdaFunctionData,
     LambdaMetricsData,
     LambdaProvisionedConcurrencyData,
@@ -172,6 +177,19 @@ LOAD_BALANCERS_MAX_PAGES = 5
 # get_rds_instances reports the list as incomplete.
 RDS_INSTANCES_MAX_PAGES = 20
 
+# CLO-608: DescribeDBSnapshots pages at the API's default MaxRecords (100).
+# 100 pages = 10,000 manual snapshots per region, far above the default
+# manual snapshot quota (100, adjustable); past that the rest are not
+# judged (noted).
+RDS_SNAPSHOTS_MAX_PAGES = 100
+
+# CLO-612: DescribeDBSnapshotAttributes has no batch form -- one call per
+# candidate snapshot. Capped so a region with an unusually large backlog of
+# old manual snapshots cannot turn one old_rds_snapshot scan into hundreds of
+# extra API calls; past the cap the rest are flagged with sharing unchecked
+# (never withheld for it), same as any other unreadable sharing status.
+RDS_SNAPSHOT_SHARING_MAX_CALLS = 200
+
 
 def _describe_target_groups_bounded(elbv2, load_balancer_arn: str) -> Tuple[List[Dict[str, Any]], bool]:
     """A load balancer's target groups, following NextMarker for at most
@@ -247,15 +265,19 @@ _EC2_CPU_METRIC_QUERIES: Tuple[Tuple[str, str], ...] = (
 _EC2_INSTANCES_PER_METRIC_DATA_CALL = _METRIC_DATA_MAX_QUERIES_PER_CALL // len(_EC2_CPU_METRIC_QUERIES)
 
 # CLO-549: AWS/Kafka publishes broker metrics per broker ("Cluster Name" +
-# "Broker ID", DEFAULT monitoring level). Five queries per broker, so 100
-# brokers per GetMetricData request; a 7-day hourly window is 168 datapoints
-# per query (84,000 for a full chunk, one page). A cluster costs one request.
+# "Broker ID", DEFAULT monitoring level). Six queries per broker (CLO-606
+# added UserPartitionExists), so 83 brokers per GetMetricData request; a
+# 7-day hourly window is 168 datapoints per query (84,000 for a full chunk,
+# one page). A cluster costs one request.
 _MSK_BROKER_METRICS: Tuple[Tuple[str, str], ...] = (
     ('msg', 'MessagesInPerSec'),
     ('bin', 'BytesInPerSec'),
     ('bout', 'BytesOutPerSec'),
     ('cusr', 'CpuUser'),
     ('csys', 'CpuSystem'),
+    # CLO-606: DEFAULT-level boolean, "the presence of a user-owned
+    # partition on a broker" — rule 1 of the canary-vs-idle decision.
+    ('upe', 'UserPartitionExists'),
 )
 # One query is kept for the broker-id probe (get_msk_metrics).
 _MSK_BROKERS_PER_METRIC_DATA_CALL = (_METRIC_DATA_MAX_QUERIES_PER_CALL - 1) // len(_MSK_BROKER_METRICS)
@@ -1698,6 +1720,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 db_instance_arn=db.get('DBInstanceArn', ''),
                 backup_retention_period=db.get('BackupRetentionPeriod', 0),
                 instance_create_time=db.get('InstanceCreateTime'),
+                dbi_resource_id=db.get('DbiResourceId'),
             ))
         return instances
     
@@ -1819,32 +1842,33 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         snapshot_type: str = "manual",
         age_threshold_days: int = 90,
     ) -> List[RDSSnapshotData]:
-        """Get RDS snapshots in the region."""
+        """Get RDS snapshots in the region.
+
+        CLO-608: every DescribeDBSnapshots page (Marker), bounded by
+        RDS_SNAPSHOTS_MAX_PAGES; it used to read only the first page (100
+        records). Every call sends ``SnapshotType``; later ones add only
+        ``Marker`` (what botocore's paginator sends). A capped read keeps
+        the pages already read and says so in ``data_warnings``.
+        """
         snapshots = []
-        
+        rows: List[Dict[str, Any]] = []
+
         try:
             rds = self._get_client('rds')
-            response = rds.describe_db_snapshots(SnapshotType=snapshot_type)
-            
-            for snapshot in response.get('DBSnapshots', []):
-                create_time = snapshot.get('SnapshotCreateTime')
-                age_days = 0
-                if create_time:
-                    age_days = (datetime.now(timezone.utc) - create_time).days
-                
-                if age_days >= age_threshold_days:
-                    snapshots.append(RDSSnapshotData(
-                        snapshot_id=snapshot.get('DBSnapshotIdentifier', ''),
-                        db_instance_id=snapshot.get('DBInstanceIdentifier'),
-                        snapshot_type=snapshot.get('SnapshotType', 'manual'),
-                        status=snapshot.get('Status', ''),
-                        region=self._region,
-                        allocated_storage_gb=snapshot.get('AllocatedStorage', 0),
-                        create_time=create_time,
-                        encrypted=snapshot.get('Encrypted', False),
-                        engine=snapshot.get('Engine'),
-                        age_days=age_days,
-                    ))
+            kwargs: Dict[str, Any] = {'SnapshotType': snapshot_type}
+            for _ in range(RDS_SNAPSHOTS_MAX_PAGES):
+                response = rds.describe_db_snapshots(**kwargs)
+                rows.extend(response.get('DBSnapshots', []) or [])
+                marker = response.get('Marker')
+                if not marker:
+                    break
+                kwargs = {'SnapshotType': snapshot_type, 'Marker': marker}
+            else:
+                self._warn_once(
+                    f"rds: more than {len(rows)} {snapshot_type} RDS snapshots in {self._region}; "
+                    f"DescribeDBSnapshots stopped at {RDS_SNAPSHOTS_MAX_PAGES} pages. Snapshots past "
+                    "that are not judged: MISSING, not zero"
+                )
         except ClientError as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
@@ -1852,20 +1876,146 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 )
                 self._warn_access_denied("RDS Snapshots", "rds:DescribeDbSnapshots", e)
                 raise
+            # A later page's failure keeps the pages already read.
             logger.error(f"Error fetching RDS snapshots: {e}")
-        
+
+        for snapshot in rows:
+            create_time = snapshot.get('SnapshotCreateTime')
+            age_days = 0
+            if create_time:
+                age_days = (datetime.now(timezone.utc) - create_time).days
+
+            if age_days >= age_threshold_days:
+                snapshots.append(RDSSnapshotData(
+                    snapshot_id=snapshot.get('DBSnapshotIdentifier', ''),
+                    db_instance_id=snapshot.get('DBInstanceIdentifier'),
+                    snapshot_type=snapshot.get('SnapshotType', 'manual'),
+                    status=snapshot.get('Status', ''),
+                    region=self._region,
+                    allocated_storage_gb=snapshot.get('AllocatedStorage', 0),
+                    create_time=create_time,
+                    encrypted=snapshot.get('Encrypted', False),
+                    engine=snapshot.get('Engine'),
+                    age_days=age_days,
+                    dbi_resource_id=snapshot.get('DbiResourceId'),
+                    original_create_time=snapshot.get('OriginalSnapshotCreateTime'),
+                ))
+
         return snapshots
-    
+
+    async def get_rds_snapshot_sharing(
+        self,
+        snapshot_ids: List[str],
+    ) -> Dict[str, RDSSnapshotSharingData]:
+        """CLO-612: DescribeDBSnapshotAttributes, one call per snapshot id —
+        there is no batch/list form of this read. Called only with the ids
+        old_rds_snapshot would otherwise recommend for deletion, never a
+        whole region's snapshots.
+
+        A snapshot's ``restore`` attribute lists who else can restore from
+        it: an AWS account id for each account it is shared with, or the
+        literal ``all`` if it is public. Any other attribute name is
+        ignored (RDS defines none today).
+
+        CLO-612 revision (Rick, delegated product decision): an id this
+        cannot confirm comes back with ``missing=True`` — the caller no
+        longer withholds for that; it flags with a lower confidence and a
+        risk-text warning instead, since the only-copy data-loss guard
+        (which this never touches) is the bigger harm this detector guards
+        against. What this method still guarantees: no call here ever
+        raises past ``_detect_rds_waste``, every requested id gets an
+        entry, and a permission denial is recorded once, not per snapshot,
+        so the "update your role" notice can still fire.
+
+        One snapshot's failure (ANY exception, not just AccessDenied —
+        botocore can raise a non-ClientError BotoCoreError too, e.g. a
+        connection problem) never fails the others: each is recorded
+        ``missing=True`` on its own and the loop continues. The one
+        exception is AccessDenied itself: once seen, every remaining id is
+        marked missing WITHOUT another call — the permission is absent for
+        the whole account/region, so further calls would only repeat the
+        same denial for no new information.
+
+        Past ``RDS_SNAPSHOT_SHARING_MAX_CALLS`` candidates, the rest are
+        marked missing without being called at all, and one scan note
+        records that the cap was hit.
+        """
+        result: Dict[str, RDSSnapshotSharingData] = {}
+        if not snapshot_ids:
+            return result
+
+        to_call = snapshot_ids
+        if len(snapshot_ids) > RDS_SNAPSHOT_SHARING_MAX_CALLS:
+            to_call = snapshot_ids[:RDS_SNAPSHOT_SHARING_MAX_CALLS]
+            for snapshot_id in snapshot_ids[RDS_SNAPSHOT_SHARING_MAX_CALLS:]:
+                result[snapshot_id] = RDSSnapshotSharingData(missing=True)
+            self._warn_once(
+                f"old_rds_snapshot: more than {RDS_SNAPSHOT_SHARING_MAX_CALLS} old manual "
+                f"snapshots in {self._region} would need a sharing check this scan; stopped "
+                "there. The rest are flagged with sharing unchecked (lower confidence), never "
+                "withheld for it."
+            )
+
+        rds = self._get_client('rds')
+        denial_recorded = False
+        denied = False
+        for snapshot_id in to_call:
+            if denied:
+                result[snapshot_id] = RDSSnapshotSharingData(missing=True)
+                continue
+            try:
+                response = rds.describe_db_snapshot_attributes(DBSnapshotIdentifier=snapshot_id)
+            except Exception as e:
+                if self._is_access_denied(e):
+                    denied = True
+                    if not denial_recorded:
+                        self._record_permission_error(
+                            resource="RDS Snapshot Attributes",
+                            permission="rds:DescribeDBSnapshotAttributes",
+                            error=e,
+                        )
+                        self._warn_access_denied(
+                            "RDS Snapshot Attributes", "rds:DescribeDBSnapshotAttributes", e,
+                        )
+                        denial_recorded = True
+                else:
+                    logger.error(f"Error fetching snapshot attributes for {snapshot_id}: {e}")
+                result[snapshot_id] = RDSSnapshotSharingData(missing=True)
+                continue
+
+            values: List[str] = []
+            attrs_result = response.get('DBSnapshotAttributesResult') or {}
+            for attr in attrs_result.get('DBSnapshotAttributes') or []:
+                if str(attr.get('AttributeName', '')).strip().lower() == 'restore':
+                    values.extend(attr.get('AttributeValues') or [])
+            public = 'all' in values
+            shared_account_count = sum(1 for v in values if v != 'all')
+            result[snapshot_id] = RDSSnapshotSharingData(
+                shared_account_count=shared_account_count,
+                public=public,
+            )
+        return result
+
     # =========================================================================
     # Lambda / Serverless
     # =========================================================================
-    
+
     async def get_lambda_functions(self) -> List[LambdaFunctionData]:
-        """Get all Lambda functions in the region."""
+        """Get all Lambda functions in the region.
+
+        Sets ``self.lambda_functions_complete`` (CLO-609): True only when
+        every page was read. A non-permission error is logged and returns
+        what was read so far, which is not the region's whole list."""
         functions = []
+        self.lambda_functions_complete = False
         try:
             lambda_client = self._get_client('lambda')
-            all_functions = self._paginate(lambda_client, 'list_functions', 'Functions')
+            # CLO-609: paged here, not through _paginate, whose guard
+            # swallows a non-permission error mid-way and returns the pages
+            # read so far as if they were the whole list.
+            all_functions = []
+            for page in lambda_client.get_paginator('list_functions').paginate():
+                all_functions.extend(page.get('Functions', []))
             
             for func in all_functions:
                 functions.append(LambdaFunctionData(
@@ -1883,6 +2033,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     description=func.get('Description'),
                     architecture=func.get('Architectures', ['x86_64'])[0],
                 ))
+            self.lambda_functions_complete = True
         except ClientError as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
@@ -1890,6 +2041,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 )
                 self._warn_access_denied("Lambda Functions", "lambda:ListFunctions", e)
                 raise
+            logger.error(f"Error fetching Lambda functions: {e}")
+        except BotoCoreError as e:
             logger.error(f"Error fetching Lambda functions: {e}")
         
         return functions
@@ -6104,13 +6257,35 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         A series left empty (nothing published, or all of it a deleted
         namesake's) is MISSING, never idle: with MessagesInPerSec or
         BytesInPerSec unmeasured on any broker this returns None (noted).
-        Idle also needs BytesOutPerSec measured and zero on every broker (a
-        consumer-only cluster is in use); unmeasured BytesOut returns None.
-        BytesInPerSec is published only once a topic exists, so a cluster
-        that never had a topic is withheld too, not called idle. Unmeasured
-        BytesOutPerSec returns None for both verdicts (oversized would read
-        it as network headroom), and unmeasured CPU gives
-        ``cpu_datapoints`` 0, which vetoes oversized.
+        Idle also needs BytesOutPerSec measured and under threshold on every
+        broker (a consumer-only cluster is in use); unmeasured BytesOut
+        returns None. BytesInPerSec is published only once a topic exists,
+        so a cluster that never had a topic is withheld too, not called
+        idle. Unmeasured BytesOutPerSec returns None for both verdicts
+        (oversized would read it as network headroom), and unmeasured CPU
+        gives ``cpu_datapoints`` 0, which vetoes oversized.
+
+        CLO-606: idle no longer needs an exact zero, and no longer trusts a
+        flat traffic ceiling alone — every MSK cluster runs AWS's own
+        internal canary (the service-managed ``__amazon_msk_canary`` /
+        ``__amazon_msk_canary_state`` topics), which is real but tiny
+        traffic that never reads as zero, yet a real low-volume producer
+        can read smaller than the canary itself. Idle is decided by, in
+        order: (1) ``UserPartitionExists`` == 0 on every broker (no
+        user-owned partition ever existed) with traffic at/under the
+        canary ceiling; (2) otherwise, at canary-level traffic with a user
+        topic present (or ``UserPartitionExists`` itself unmeasured), BOTH
+        verdicts are withheld — cluster-level metrics alone cannot tell an
+        idle cluster from a low-volume producer or consumer; (3) otherwise
+        (above the ceiling), unchanged from before CLO-606. A per-topic
+        check (PER_TOPIC_PER_BROKER evidence) was deliberately dropped: it
+        needs a monitoring level few customers enable, and a review of its
+        first draft found an empty-series-as-zero bug, an unsafe ``__``
+        internal-topic filter, and an unbounded/unfiltered ListMetrics call
+        — all real false-positive risk for little coverage gained. See
+        ``MSK_CANARY_MESSAGES_PER_SEC_CEILING`` / ``MSK_CANARY_BYTES_PER_SEC_CEILING``
+        in cloudwatch_metrics_service.py for the ceilings and the evidence
+        behind them.
 
         Returns:
             MSKMetrics object with utilisation data, or None on error or
@@ -6210,6 +6385,15 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         messages_in = sum(msg_means.values())
         bytes_in = sum(bin_means.values())
+        # CLO-606: the canary-level CEILING is PER BROKER (every broker's
+        # own mean at/under it), not on these cluster sums — AWS's canary
+        # runs one consumer group per broker, so its traffic scales with
+        # broker count and a summed ceiling would let a large canary-only
+        # cluster hide above the line. At/under the ceiling means "cannot
+        # be distinguished from canary-only using this traffic alone" —
+        # NOT "idle": see the decision rules below.
+        msg_at_ceiling = max(msg_means.values()) <= MSK_CANARY_MESSAGES_PER_SEC_CEILING
+        bin_at_ceiling = max(bin_means.values()) <= MSK_CANARY_BYTES_PER_SEC_CEILING
         bout_means, bout_why = _per_broker('BytesOutPerSec')
         if bout_means is None:
             # Both verdicts need BytesOut: a consumer-only cluster (no
@@ -6217,13 +6401,63 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # would read it as network headroom. Unmeasured is MISSING.
             self._note_idle_verdict_missing(
                 'msk', cluster_name, bout_why,
-                verdict='idle' if messages_in == 0 and bytes_in == 0 else 'oversized',
+                verdict='idle' if msg_at_ceiling and bin_at_ceiling else 'oversized',
                 evidence='per-broker BytesOutPerSec',
             )
             return None
         bytes_out = sum(bout_means.values())
-        # Idle needs no inbound AND no outbound traffic on any broker.
-        is_idle = messages_in == 0 and bytes_in == 0 and bytes_out == 0
+        bout_at_ceiling = max(bout_means.values()) <= MSK_CANARY_BYTES_PER_SEC_CEILING
+        at_canary_level = msg_at_ceiling and bin_at_ceiling and bout_at_ceiling
+        idle_evidence = ''
+
+        if not at_canary_level:
+            # Rule 3 (CLO-606): traffic is clearly above canary levels on at
+            # least one broker/metric -- unchanged from before CLO-606, not
+            # idle, falls through to the oversized check.
+            is_idle = False
+        else:
+            # Rule 1 (CLO-606): UserPartitionExists is already in this
+            # broker's own batched read (_MSK_BROKER_METRICS); checking it
+            # costs no extra call. An empty/unmeasured series on ANY broker
+            # is MISSING (``_own``/``_per_broker`` already treat it that
+            # way, never as a measured 0), so ``upe_means`` is None rather
+            # than silently reading that broker as 0.
+            upe_means, upe_why = _per_broker('UserPartitionExists')
+            no_user_partitions = upe_means is not None and all(v == 0 for v in upe_means.values())
+            if no_user_partitions:
+                # No user-owned partition ever existed on any broker, so
+                # there is nothing a low-volume producer or consumer could
+                # have written to or read from. Idle.
+                is_idle = True
+                idle_evidence = 'no_user_partitions'
+            else:
+                # Rule 2 (CLO-606): canary-level traffic, but either a user
+                # topic exists (UserPartitionExists=1 on some broker) or
+                # UserPartitionExists itself is unmeasured -- cluster-level
+                # metrics alone cannot tell an idle cluster from a
+                # low-volume producer/consumer. Withhold BOTH verdicts
+                # rather than guess; never advise downsizing a
+                # possibly-idle cluster.
+                # A SHORT category (it is a Counter key across every
+                # withheld cluster, not a one-off sentence) that stays true
+                # whichever sub-case produced it: 'proof of no user topics'
+                # is missing both when UserPartitionExists was measured as
+                # 1 (we have proof of presence, not of absence) and when it
+                # was never measured at all -- so one evidence phrase
+                # covers both, but the reason itself still has to name
+                # which sub-case this cluster is in, since "user topics
+                # present" would be false to assert for an unmeasured
+                # broker.
+                reason = (
+                    "canary-level traffic, user topics present" if upe_means is not None
+                    else "canary-level traffic, UserPartitionExists unmeasured"
+                )
+                self._note_idle_verdict_missing(
+                    'msk', cluster_name, reason,
+                    verdict='idle or oversized',
+                    evidence='proof of no user topics',
+                )
+                return None
 
         # CPU: per broker, the hours with both CpuUser and CpuSystem; the
         # cluster's figure is the busiest broker's mean user + system.
@@ -6261,6 +6495,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             period_days=days,
             is_idle=is_idle,
             cpu_datapoints=cpu_datapoints,
+            idle_evidence=idle_evidence,
         )
 
     # =========================================================================
@@ -9260,6 +9495,18 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             )
             raise
         return environments
+
+    async def get_beanstalk_environment_statuses(self) -> Optional[Dict[str, str]]:
+        """CLO-609: ``{environment name: Status}`` for the region's
+        environments, or None when DescribeEnvironments failed (MISSING: a
+        caller must not read "not listed" as "gone"). Deleted environments
+        are not listed (IncludeDeleted=False)."""
+        try:
+            environments = await self.get_beanstalk_environments()
+        except Exception as e:  # noqa: BLE001 - any failure is MISSING
+            logger.debug("Beanstalk environment statuses unavailable in %s: %s", self._region, type(e).__name__)
+            return None
+        return merge_beanstalk_statuses((env.environment_name, env.status) for env in environments)
 
     async def get_beanstalk_configurations(self) -> Dict[str, BeanstalkConfigData]:
         """Get configuration settings for all Beanstalk environments."""

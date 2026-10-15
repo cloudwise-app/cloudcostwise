@@ -1105,6 +1105,14 @@ class WasteDetectionSettings:
     s3_growth_min_absolute_gb: float = 10.0   # Minimum absolute growth to flag
     s3_tiering_min_size_gb: float = 50.0      # Minimum size for tiering recommendation
     s3_tiering_savings_pct: float = 40.0      # Conservative savings estimate %
+    # CLO-610: no production path (online or offline/export) currently
+    # supplies a per-bucket access-pattern signal for this estimate — see
+    # _s3_tiering_savings_estimate's docstring. Every real scan takes this
+    # no-signal path, so it's the primary defense against overstating the
+    # saving on a bucket that's actually read all the time: half of
+    # s3_tiering_savings_pct, not the whole thing, absent any evidence the
+    # bucket's data really does go cold.
+    s3_tiering_no_signal_factor: float = 0.5
     s3_lifecycle_min_size_gb: float = 10.0    # Only flag buckets > 10 GB for no lifecycle
     s3_request_transfer_min_cost_usd: float = 10.0      # Minimum total S3 cost to flag
     s3_request_transfer_ratio_threshold: float = 1.0    # Non-storage must exceed storage
@@ -1194,6 +1202,7 @@ class WasteDetectionSettings:
             "s3_growth_min_absolute_gb": self.s3_growth_min_absolute_gb,
             "s3_tiering_min_size_gb": self.s3_tiering_min_size_gb,
             "s3_tiering_savings_pct": self.s3_tiering_savings_pct,
+            "s3_tiering_no_signal_factor": self.s3_tiering_no_signal_factor,
             "s3_lifecycle_min_size_gb": self.s3_lifecycle_min_size_gb,
             "s3_request_transfer_min_cost_usd": self.s3_request_transfer_min_cost_usd,
             "s3_request_transfer_ratio_threshold": self.s3_request_transfer_ratio_threshold,
@@ -1289,6 +1298,7 @@ class WasteDetectionSettings:
             s3_growth_min_absolute_gb=data.get("s3_growth_min_absolute_gb", 10.0),
             s3_tiering_min_size_gb=data.get("s3_tiering_min_size_gb", 50.0),
             s3_tiering_savings_pct=data.get("s3_tiering_savings_pct", 40.0),
+            s3_tiering_no_signal_factor=data.get("s3_tiering_no_signal_factor", 0.5),
             s3_lifecycle_min_size_gb=data.get("s3_lifecycle_min_size_gb", 10.0),
             s3_request_transfer_min_cost_usd=data.get("s3_request_transfer_min_cost_usd", 10.0),
             s3_request_transfer_ratio_threshold=data.get("s3_request_transfer_ratio_threshold", 1.0),
@@ -1493,9 +1503,38 @@ ALB_LCU_HOURLY = 0.008    # ALB LCU-hour rate (us-east-1)
 NLB_NLCU_HOURLY = 0.006   # NLB NLCU-hour rate (us-east-1)
 VPC_ENDPOINT_MONTHLY = 7.20  # Per AZ per month
 
-# S3 pricing constants (us-east-1, first 50 TB tier)
+# S3 pricing constants (us-east-1, first 50 TB tier). Confirmed 2026-10-14
+# against the AWS Price List API offer file (pricing.us-east-1.amazonaws.com/
+# offers/v1.0/aws/AmazonS3/current/us-east-1/index.json, publicationDate
+# 2026-10-12T23:11:02Z, version 20261012231102): SKU 7DR3RFK9W2W43KSC (fee
+# code "S3-Monitoring and Automation-ObjectCount") prices $0.0025 per 1,000
+# objects/month; SKU WP9ANXZGBYYSGJEA (General Purpose / Standard) and SKU
+# M7WA952JTYFHTE64 (Intelligent-Tiering, Infrequent Access tier) price
+# $0.023 and $0.0125 per GB-month; SKU ZWQ6Q48CRJXX4FXE ("GET and all other
+# requests", usage type Requests-Tier2) prices $0.0000004/request ($0.004
+# per 10,000 requests).
 S3_STANDARD_PER_GB = 0.023        # S3 Standard per GB-month
 S3_IT_MONITORING_PER_1K = 0.0025  # Intelligent-Tiering monitoring fee per 1,000 objects
+# CLO-610: GET/SELECT/HEAD ("Tier2") request price, used only to convert a
+# CUR cost breakdown's request_tier2_cost back into an estimated request
+# count (there's no per-bucket GET *count* anywhere in this pipeline, only
+# $ costs) for the access-pattern signal below.
+S3_TIER2_REQUEST_PRICE = 0.0000004
+# CLO-610: Intelligent-Tiering's Infrequent Access tier, the one a bucket
+# normally reaches after 30 days with no access. Caps the assumed savings
+# rate so a detector can never claim more than this, the real Standard ->
+# Standard-IA discount (~45.7%) — never the deeper Archive Instant Access
+# rate, which needs 90 days of inactivity Intelligent-Tiering does not
+# guarantee.
+S3_STANDARD_IA_PER_GB = 0.0125
+# CLO-610: per aws.amazon.com/s3/pricing (fetched 2026-10-14): "S3
+# Intelligent-Tiering can store objects smaller than 128 KB, but
+# auto-tiering has a minimum eligible object size of 128 KB. These smaller
+# objects will not be monitored and will always be charged at the Frequent
+# Access tier rates, with no monitoring and automation charge." An object
+# under this size never moves out of Standard/Frequent Access and is never
+# billed the monitoring fee.
+S3_IT_MIN_TIERABLE_BYTES = 128 * 1024
 
 
 def _region_price_multiplier(region: Optional[str]) -> float:

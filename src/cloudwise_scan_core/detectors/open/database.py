@@ -7,7 +7,8 @@ closed detectors. Moved verbatim from ``detectors/database.py`` (CLO-562).
 
 import logging
 import uuid
-from datetime import date, datetime, timezone
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
 from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_rds_monthly_cost
 from cloudwise_scan_core.cpu_sizing import has_min_coverage, is_as_old_as_window
@@ -198,6 +199,439 @@ ELASTICACHE_SERVERLESS_RATES = {
 
 
 
+# CLO-608: RDS backup storage (manual snapshots), us-east-1 list price per
+# GB-month. RDS bills a DB's snapshots incrementally (the first holds a full
+# copy of the data actually stored, later ones only the blocks changed since),
+# and while the DB runs AWS includes backup storage up to its provisioned size
+# at no extra charge. The finding's figure is an ESTIMATE of one full copy of
+# allocated storage per source DB, not a bill: a quiet DB's snapshots bill
+# less, a DB with heavy churn can bill more.
+RDS_SNAPSHOT_GB_MONTH_USD = 0.095
+
+# The aggregated scan note for withheld old_rds_snapshot verdicts starts
+# with this, so a re-run on the same provider replaces it instead of adding.
+RDS_SNAPSHOT_NOTE_PREFIX = 'old_rds_snapshot:'
+_RDS_SNAPSHOT_NOTE_EXAMPLES = 3
+
+# DescribeDBInstances statuses that clearly mean "this DB exists and keeps
+# its automated backups". Anything else (deleting, failed, creating,
+# incompatible-*, inaccessible-*, restore-error, storage-full, an unknown or
+# empty status) is NOT confirmed live, so its newest snapshot is withheld.
+RDS_LIVE_DB_STATUSES = frozenset({
+    'available', 'backing-up', 'modifying', 'stopped', 'stopping', 'starting',
+    'rebooting', 'maintenance', 'upgrading', 'storage-optimization', 'renaming',
+    'configuring-enhanced-monitoring', 'configuring-iam-database-auth',
+    'configuring-log-exports', 'resetting-master-credentials',
+})
+
+# Withheld reasons: each stands alone in the scan note.
+_SOURCE_GONE = 'the newest manual snapshot of a DB instance that no longer exists'
+_SOURCE_NO_BACKUPS = (
+    'the newest manual snapshot of a DB instance with no automated backups (BackupRetentionPeriod 0)'
+)
+_SOURCE_NOT_LIVE = (
+    'the newest manual snapshot of a DB instance that is not in a live state (for example deleting or failed)'
+)
+_SOURCE_UNCONFIRMED = (
+    'the newest manual snapshot whose source DB instance cannot be confirmed (the instance '
+    'with that name reports no DbiResourceId)'
+)
+_SOURCE_UNKNOWN = 'a snapshot with no source DB instance recorded'
+_GROUP_UNSETTLED = (
+    'a snapshot of a DB instance that has a newer snapshot which is not available yet '
+    '(creating, failed or similar), so the copy to keep cannot be chosen'
+)
+_KEEP_BECAUSE = {
+    _SOURCE_GONE: 'its DB instance no longer exists',
+    _SOURCE_NO_BACKUPS: 'its DB instance has no automated backups (BackupRetentionPeriod 0)',
+    _SOURCE_NOT_LIVE: 'its DB instance is not in a live state',
+    _SOURCE_UNCONFIRMED: 'its source DB instance cannot be confirmed',
+}
+
+# CLO-612: a CONFIRMED shared or public snapshot is withheld rather than
+# flagged -- deleting it would silently remove that access. These apply to
+# any flagged snapshot, not just "the newest" (the only-copy guard's reasons
+# above), so they are worded without that qualifier. Each ``withheld`` entry
+# below is tagged with a category (_ONLY_COPY / _SHARING) so the aggregated
+# note can use reason-specific closing text instead of one blanket sentence
+# that only fit the only-copy guard.
+_ONLY_COPY = 'only_copy'
+_SHARING = 'sharing'
+
+_SHARING_PUBLIC = 'a manual snapshot made public (its restore attribute lists "all")'
+
+# CLO-612 revision (Rick, delegated product decision): an UNREADABLE sharing
+# status (AccessDenied, a stack/CLI policy below 1.30.0, a network error, an
+# absent offline file, or an id the file never mentions) no longer withholds
+# -- it fires as before #1789's guard existed, just at a lower confidence
+# and with this risk-text warning, since the harm of maybe-deleting a shared
+# snapshot is far smaller than the only-copy data-loss CLO-608 already
+# guards against, and silently losing every old_rds_snapshot finding on
+# every stack/CLI install below 1.30.0 until it updates is worse than that.
+_SHARING_UNCHECKED_WARNING = (
+    "CloudWise could not check whether this snapshot is shared with other accounts; confirm it "
+    "isn't shared before deleting, because deleting a shared snapshot removes their access."
+)
+
+
+def _sharing_shared_reason(account_count: int) -> str:
+    plural = '' if account_count == 1 else 's'
+    return f'a manual snapshot shared with {account_count} other AWS account{plural}'
+
+
+def _rds_snapshot_rate(region: Optional[str]) -> float:
+    """RDS snapshot $/GB-month for ``region``. The pricing service holds no
+    RDS backup-storage price, so this scales the us-east-1 rate by its
+    region table (the CLO-359 multipliers RDS instance prices use). An
+    unlisted region keeps the us-east-1 rate (1.0), not the table's 1.15
+    default, which would bias the saving up."""
+    from cloudwise_scan_core.aws_pricing_service import AWSPricingService
+
+    return RDS_SNAPSHOT_GB_MONTH_USD * AWSPricingService.REGION_PRICE_MULTIPLIERS.get(region or '', 1.0)
+
+
+def _aware(value) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _rds_snapshot_time(snapshot, now: datetime) -> datetime:
+    """When the snapshot's DATA was captured: OriginalSnapshotCreateTime
+    (unchanged by a copy), else SnapshotCreateTime (reset by a copy), else
+    from its age. Ordering on the copy time would let a recent copy of an
+    old snapshot pass as the newest state of the DB."""
+    original = _aware(getattr(snapshot, 'original_create_time', None))
+    if original is not None:
+        return original
+    created = _aware(getattr(snapshot, 'create_time', None))
+    if created is not None:
+        return created
+    return now - timedelta(days=int(getattr(snapshot, 'age_days', 0) or 0))
+
+
+def _rds_snapshot_available(snapshot) -> bool:
+    return str(getattr(snapshot, 'status', '') or '').strip().lower() == 'available'
+
+
+def _rds_snapshot_source(snapshot, by_resource_id: dict, by_name: dict):
+    """(group key, live source instance or None, reason it is not usable).
+
+    The source is matched on DbiResourceId, the instance's immutable id
+    (copies keep it): an instance recreated under the snapshot's
+    DBInstanceIdentifier is a different database, so the snapshot's own
+    source counts as gone. When the snapshot carries a DbiResourceId but
+    the same-named instance reports none, the match cannot be confirmed and
+    is NOT made by name. Only a snapshot with no DbiResourceId at all falls
+    back to the identifier. DescribeDBSnapshots returns instance snapshots
+    only; Aurora and Multi-AZ DB cluster snapshots never reach this check.
+    """
+    resource_id = getattr(snapshot, 'dbi_resource_id', None)
+    name = getattr(snapshot, 'db_instance_id', None)
+    if resource_id:
+        key = ('rid', resource_id)
+        instance = by_resource_id.get(resource_id)
+        if instance is None:
+            named = by_name.get(name)
+            if named is not None and not getattr(named, 'dbi_resource_id', None):
+                return key, None, _SOURCE_UNCONFIRMED
+            return key, None, _SOURCE_GONE
+    elif name:
+        key = ('name', name)
+        instance = by_name.get(name)
+        if instance is None:
+            return key, None, _SOURCE_GONE
+    else:
+        return None, None, _SOURCE_UNKNOWN
+    status = str(getattr(instance, 'status', '') or '').strip().lower()
+    if status not in RDS_LIVE_DB_STATUSES:
+        return key, None, _SOURCE_NOT_LIVE
+    if (getattr(instance, 'backup_retention_period', 0) or 0) <= 0:
+        return key, instance, _SOURCE_NO_BACKUPS
+    return key, instance, None
+
+
+def _note_rds_snapshots_withheld(data_provider, withheld: List[tuple]) -> None:
+    """One aggregated ``data_warnings`` note (both providers carry the list)
+    naming the snapshots whose deletion was not recommended, and why.
+
+    ``withheld`` entries are ``(snapshot_id, reason, category)``, category
+    being ``_ONLY_COPY`` (CLO-608: may be the last copy of that data) or
+    ``_SHARING`` (CLO-612: confirmed shared with another account, or
+    public). The closing sentence is built from whichever categories are
+    actually present in this batch -- a sharing-only batch never claims
+    "only remaining copy", and an only-copy-only batch never claims
+    anything about sharing (CLO-612 review)."""
+    warnings = getattr(data_provider, 'data_warnings', None)
+    if not isinstance(warnings, list) or not withheld:
+        return
+    ids = [snap_id for snap_id, _, _ in withheld]
+    reasons = Counter(reason for _, reason, _ in withheld)
+    categories = {category for _, _, category in withheld}
+    examples = ', '.join(ids[:_RDS_SNAPSHOT_NOTE_EXAMPLES])
+    if len(ids) > _RDS_SNAPSHOT_NOTE_EXAMPLES:
+        examples += ', ...'
+    why = '; '.join(f"{reason} (x{n})" for reason, n in sorted(reasons.items()))
+    region = getattr(data_provider, 'region', None) or 'this region'
+    count = len(ids)
+    closing_bits = []
+    if _ONLY_COPY in categories:
+        closing_bits.append(
+            "Each withheld for the only-copy guard may be the only remaining copy of that data, "
+            "and a deleted snapshot cannot be restored."
+        )
+    if _SHARING in categories:
+        closing_bits.append(
+            "Each withheld for sharing is confirmed shared with another AWS account, or made "
+            "public; deleting it would remove that access."
+        )
+    closing = ' '.join(closing_bits)
+    note = (
+        f"{RDS_SNAPSHOT_NOTE_PREFIX} deletion not recommended for {count} old manual "
+        f"snapshot{'s' if count != 1 else ''} in {region} ({examples}). Each is {why}. "
+        f"{closing} Review these by hand; they are withheld, not judged as waste"
+    )
+    for i, existing in enumerate(warnings):
+        if isinstance(existing, str) and existing.startswith(RDS_SNAPSHOT_NOTE_PREFIX):
+            warnings[i] = note
+            return
+    warnings.append(note)
+    logger.warning(
+        "old_rds_snapshot: %d manual snapshot(s) withheld in %s (%s)",
+        count, region, '/'.join(sorted(categories)),
+    )
+
+
+async def old_rds_snapshot_items(data_provider, settings, instances, snapshots) -> List[WasteItem]:
+    """CLO-608: old_rds_snapshot findings, with the only-copy guard.
+    CLO-612 adds the sharing guard on top.
+
+    Snapshots are grouped by source DB and ordered by when their data was
+    captured (OriginalSnapshotCreateTime, so a copy keeps its original
+    place). Only ``available`` snapshots are ever flagged.
+
+    Unless the source DB is confirmed live (same DbiResourceId, a clearly
+    live status) AND has automated backups, the NEWEST available snapshot is
+    protected: withheld with a scan note, since it may be the last copy of
+    the data. When a group has a newer snapshot that is not available
+    (creating, failed, ...), the copy to keep cannot be chosen, and the
+    whole group is withheld. An incomplete instance list can only make a
+    live DB look gone, which withholds more, never less.
+
+    CLO-612: a snapshot that survives the only-copy guard is checked for
+    sharing (DescribeDBSnapshotAttributes) -- one call per snapshot id,
+    spent only on ids that would otherwise be recommended for deletion. A
+    CONFIRMED shared or public snapshot is withheld, noted, never flagged --
+    deleting it would silently remove another account's access. An
+    UNCONFIRMABLE one (a failed or denied read, a stack/CLI policy below
+    1.30.0, an absent offline file, a missing entry) is a Rick-delegated
+    product decision: it still fires as it did before this guard existed,
+    just at a lower confidence, with an explicit risk-text warning and
+    ``metadata['sharing_checked'] = False`` -- withholding every such
+    finding would silently drop old_rds_snapshot for every pre-1.30.0 stack
+    and every CLI install without the new policy line, which is worse than
+    the (smaller) harm a shared-snapshot deletion causes. The only-copy
+    data-loss guard above still applies regardless.
+
+    Savings are an ESTIMATE of one full copy of allocated storage per source
+    DB (the region's rate), split evenly over that source's flagged
+    snapshots (after the sharing guard): RDS bills a DB's snapshots
+    incrementally.
+    """
+    threshold = settings.snapshot_age_days
+    now = datetime.now(timezone.utc)
+    by_resource_id = {
+        i.dbi_resource_id: i for i in instances if getattr(i, 'dbi_resource_id', None)
+    }
+    by_name = {i.db_instance_id: i for i in instances}
+    rate = _rds_snapshot_rate(getattr(data_provider, 'region', None))
+
+    groups: Dict[tuple, list] = {}
+    sources: Dict[tuple, tuple] = {}
+    withheld: List[tuple] = []
+    for snap in snapshots:
+        key, live, reason = _rds_snapshot_source(snap, by_resource_id, by_name)
+        if key is None:
+            # No source id at all: there is no way to tell whether this is
+            # the newest copy of anything, so it is never recommended.
+            if snap.age_days >= threshold:
+                withheld.append((snap.snapshot_id, reason, _ONLY_COPY))
+            continue
+        groups.setdefault(key, []).append(snap)
+        sources[key] = (live, reason)
+
+    # Pass 1: the only-copy guard, per source DB. ``pending`` holds exactly
+    # the snapshots that would be recommended if sharing were never checked.
+    pending: Dict[tuple, tuple] = {}
+    candidate_ids: List[str] = []
+    for key, group in groups.items():
+        live, protected_reason = sources[key]
+        available = [s for s in group if _rds_snapshot_available(s)]
+        if not available:
+            continue
+        protected_ids = set()
+        if protected_reason:
+            newest_available = max(_rds_snapshot_time(s, now) for s in available)
+            unsettled = any(
+                not _rds_snapshot_available(s) and _rds_snapshot_time(s, now) > newest_available
+                for s in group
+            )
+            if unsettled:
+                withheld.extend(
+                    (s.snapshot_id, _GROUP_UNSETTLED, _ONLY_COPY)
+                    for s in available if s.age_days >= threshold
+                )
+                continue
+            # Every available snapshot captured at the newest time is
+            # protected (a tie cannot be broken safely).
+            protected_ids = {
+                s.snapshot_id for s in available if _rds_snapshot_time(s, now) == newest_available
+            }
+
+        flagged = []
+        for snap in available:
+            if snap.age_days < threshold:
+                continue
+            if snap.snapshot_id in protected_ids:
+                withheld.append((snap.snapshot_id, protected_reason, _ONLY_COPY))
+                continue
+            flagged.append(snap)
+        if not flagged:
+            continue
+
+        pending[key] = (live, protected_reason, flagged)
+        candidate_ids.extend(s.snapshot_id for s in flagged)
+
+    # CLO-612: one sharing check, spent only on candidates that survived
+    # the only-copy guard above -- never a whole region's snapshots.
+    sharing = await data_provider.get_rds_snapshot_sharing(candidate_ids) if candidate_ids else {}
+
+    items: List[WasteItem] = []
+    for key, (live, protected_reason, flagged_before_sharing) in pending.items():
+        flagged = []
+        # CLO-612 revision: only a CONFIRMED shared or public snapshot is
+        # withheld here. An id the sharing read could not confirm (missing)
+        # still fires -- unchecked_ids marks which ones, so the item loop
+        # below can drop their confidence and add the warning instead of
+        # silently claiming they were checked.
+        unchecked_ids = set()
+        for snap in flagged_before_sharing:
+            info = sharing.get(snap.snapshot_id)
+            if info is not None and info.public:
+                withheld.append((snap.snapshot_id, _SHARING_PUBLIC, _SHARING))
+            elif info is not None and info.shared_account_count:
+                withheld.append(
+                    (snap.snapshot_id, _sharing_shared_reason(info.shared_account_count), _SHARING)
+                )
+            else:
+                flagged.append(snap)
+                if info is None or info.missing:
+                    unchecked_ids.add(snap.snapshot_id)
+        if not flagged:
+            continue
+
+        flagged.sort(key=lambda s: _rds_snapshot_time(s, now))
+        full_gb = max(int(s.allocated_storage_gb or 0) for s in flagged)
+        one_copy = full_gb * rate
+        n = len(flagged)
+        share = one_copy / n
+        # CLO-612 revision: the sharing sentence is per-snapshot (checked vs
+        # unchecked), so it is built below, inside the per-snapshot loop --
+        # risk_base/risk_suffix hold only what is uniform across the group.
+        risk_base = (
+            'Deleting a snapshot cannot be undone. Check AWS Backup policies and any retention '
+            'requirement first.'
+        )
+        risk_suffix = ''
+        if protected_reason:
+            keep = (
+                'A newer manual snapshot of this DB is kept (not recommended for deletion) '
+                f'because {_KEEP_BECAUSE[protected_reason]}.'
+            )
+        else:
+            keep = 'Its DB instance is live with automated backups.'
+            risk_suffix = (
+                ' Manual snapshots are often kept past the automated backup window (35 days at '
+                'most) for compliance or as a rollback point taken before a change; automated '
+                'backups cannot restore the database to a time before that window.'
+            )
+        if n > 1:
+            figure = (
+                f"Estimated at ${one_copy:.2f}/month for this DB's {n} old manual snapshots "
+                f"together (one full copy per source database; actual billing is incremental); "
+                f"${share:.2f} is this one's share."
+            )
+            split = (
+                f', split over the {n} old manual snapshots of this DB (${share:.2f}/month each)'
+            )
+        else:
+            figure = (
+                f"Estimated savings ${one_copy:.2f}/month (one full copy per source database; "
+                "actual billing is incremental)."
+            )
+            split = ''
+        for snap in flagged:
+            age_days = snap.age_days
+            # CLO-612 revision: a snapshot whose sharing status could not be
+            # confirmed still fires, at a lower confidence, with a risk-text
+            # warning instead of the "checked, confirmed unshared" sentence,
+            # and metadata saying so explicitly.
+            sharing_checked = snap.snapshot_id not in unchecked_ids
+            confidence = ConfidenceLevel.MEDIUM if sharing_checked else ConfidenceLevel.LOW
+            if sharing_checked:
+                sharing_sentence = (
+                    ' This scan checked DescribeDBSnapshotAttributes: this snapshot is not '
+                    'shared with another AWS account and not public as of this scan.'
+                )
+            else:
+                sharing_sentence = ' ' + _SHARING_UNCHECKED_WARNING
+            risk = risk_base + sharing_sentence + risk_suffix
+            items.append(WasteItem(
+                id=str(uuid.uuid4()),
+                resource_id=snap.snapshot_id,
+                resource_type=ResourceType.RDS_SNAPSHOT,
+                waste_type=WasteType.OLD_RDS_SNAPSHOT,
+                title=f"Old RDS Snapshot ({age_days} days)",
+                description=(
+                    f"Snapshot '{snap.snapshot_id}' ({snap.allocated_storage_gb}GB) is {age_days} "
+                    f"days old. {figure}"
+                ),
+                monthly_savings=share,
+                confidence=confidence,
+                action="Delete this snapshot if no longer needed.",
+                action_command=f"aws rds delete-db-snapshot --db-snapshot-identifier {snap.snapshot_id}",
+                explanation={
+                    'detection': f'RDS manual snapshot is {age_days} days old. {keep}',
+                    'threshold': f'> {threshold} days old',
+                    'pricing': (
+                        'Estimate based on one full copy per source database: '
+                        f'{full_gb} GB allocated x ${rate:.4f}/GB-month = ${one_copy:.2f}/month{split}. '
+                        'Actual billing is incremental: RDS bills the data a snapshot actually '
+                        'stores (at most the allocated size), later snapshots of a DB hold only the '
+                        'blocks changed since the previous one, and while the DB runs, backup '
+                        'storage up to its provisioned size is included. A quiet DB\'s snapshots '
+                        'bill less than this; a DB with heavy churn can bill more.'
+                    ),
+                    'why_waste': f'Old RDS snapshots accumulate storage charges. At {age_days} days old, this snapshot likely represents a database state that is no longer relevant for recovery.',
+                    'risk': risk,
+                },
+                metadata={
+                    'allocated_storage_gb': snap.allocated_storage_gb,
+                    'age_days': age_days,
+                    'detection_mode': data_provider.provider_type,
+                    'savings_is_estimate': True,
+                    'pricing_basis': 'estimate_one_full_copy_per_source_db',
+                    'price_per_gb_month': round(rate, 4),
+                    'source_db_instance_id': snap.db_instance_id,
+                    'source_db_live': live is not None,
+                    'source_snapshots_flagged': n,
+                    'sharing_checked': sharing_checked,
+                },
+            ))
+
+    _note_rds_snapshots_withheld(data_provider, withheld)
+    return items
+
 class OpenDatabaseDetectorsMixin:
     """Open detectors from ``DatabaseDetectorsMixin``."""
 
@@ -282,37 +716,11 @@ class OpenDatabaseDetectorsMixin:
                             }
                         ))
             
-            # Check old snapshots
-            snapshots = await data_provider.get_rds_snapshots(age_threshold_days=settings.snapshot_age_days)
-            
-            for snapshot in snapshots:
-                age_days = snapshot.age_days
-                monthly_cost = snapshot.allocated_storage_gb * 0.095
-                
-                waste_items.append(WasteItem(
-                    id=str(uuid.uuid4()),
-                    resource_id=snapshot.snapshot_id,
-                    resource_type=ResourceType.RDS_SNAPSHOT,
-                    waste_type=WasteType.OLD_RDS_SNAPSHOT,
-                    title=f"Old RDS Snapshot ({age_days} days)",
-                    description=f"Snapshot '{snapshot.snapshot_id}' ({snapshot.allocated_storage_gb}GB) is {age_days} days old.",
-                    monthly_savings=monthly_cost,
-                    confidence=ConfidenceLevel.MEDIUM,
-                    action="Delete this snapshot if no longer needed.",
-                    action_command=f"aws rds delete-db-snapshot --db-snapshot-identifier {snapshot.snapshot_id}",
-                    explanation={
-                        'detection': f'RDS snapshot is {age_days} days old',
-                        'threshold': f'> {settings.snapshot_age_days} days old',
-                        'pricing': f'{snapshot.allocated_storage_gb} GB × $0.095/GB = ${monthly_cost:.2f}/month',
-                        'why_waste': f'Old RDS snapshots accumulate storage charges. At {age_days} days old, this snapshot likely represents a database state that is no longer relevant for recovery.',
-                        'risk': 'Verify this is not the only backup. Check automated backup retention and AWS Backup policies before deleting manual snapshots.',
-                    },
-                    metadata={
-                        'allocated_storage_gb': snapshot.allocated_storage_gb,
-                        'age_days': age_days,
-                        'detection_mode': data_provider.provider_type,
-                    }
-                ))
+            # Old manual snapshots (CLO-608: only-copy guard, one-copy
+            # estimate pricing). age_threshold_days=0: the guard must see the newest
+            # snapshot of each DB even when it is younger than the gate.
+            snapshots = await data_provider.get_rds_snapshots(age_threshold_days=0)
+            waste_items.extend(await old_rds_snapshot_items(data_provider, settings, instances, snapshots))
 
             # Extended support surcharge detection for non-Aurora RDS engines
             ext_items = await self._detect_rds_extended_support(data_provider, settings)

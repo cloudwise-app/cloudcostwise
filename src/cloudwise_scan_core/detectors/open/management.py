@@ -7,11 +7,13 @@ closed detectors. Moved verbatim from ``detectors/management.py`` (CLO-562).
 
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
 from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel
+from cloudwise_scan_core.data_providers.models import merge_beanstalk_statuses
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
 
@@ -54,6 +56,34 @@ def _log_activity_deadline(started: float) -> float:
 
 
 
+# CLO-609: log groups another service writes to by name. An empty one whose
+# owner still exists is live and quiet (its events expired under
+# retention), not orphaned, and the finding carries a delete command.
+_LAMBDA_LOG_PREFIX = '/aws/lambda/'
+_BEANSTALK_LOG_PREFIX = '/aws/elasticbeanstalk/'
+
+# Lambda@Edge writes /aws/lambda/<origin region>.<function> in every region
+# that serves the function; the function itself lives in the origin region,
+# so this region's function list can't confirm it either way.
+_LAMBDA_EDGE_REPLICA_RE = re.compile(r'^[a-z]{2}(?:-gov)?-[a-z]+-\d+\.')
+
+# The Air-Gapped export's --anonymize replaces a log group's whole name
+# ("/aws/anon/<hex>" from its ARN, "logg_<hex>" from logGroupName), so its
+# owner can't be read. Offline only: online names are the customer's own.
+_ANONYMIZED_LOG_GROUP_RE = re.compile(r'^(?:/aws/anon/|logg_)[0-9a-f]{8,16}$')
+
+_OWNER_LIVE = 'live'
+_OWNER_UNKNOWN = 'unknown'
+
+
+def _beanstalk_env_from_log_group(name: str) -> Optional[str]:
+    """The environment name in /aws/elasticbeanstalk/<env>/..., or None."""
+    if not name.startswith(_BEANSTALK_LOG_PREFIX):
+        return None
+    env = name[len(_BEANSTALK_LOG_PREFIX):].split('/', 1)[0]
+    return env or None
+
+
 class OpenManagementDetectorsMixin:
     """Open detectors from ``ManagementDetectorsMixin``."""
 
@@ -81,38 +111,75 @@ class OpenManagementDetectorsMixin:
             # CLO-382: an empty `/aws/lambda/<fn>` group whose function still
             # exists is not orphaned — it may just be quiet, with its events
             # already expired by retention (METHOD.md pinned decision 3).
-            # Fetch the live function set once, online only: an offline
-            # export's `lambda_functions` key is empty both when the account
-            # genuinely has zero functions and when the export couldn't
-            # capture them (missing permission, a skipped section), and
-            # there's no signal in the export to tell those apart. Treating
-            # "not in an untrustworthy list" as "gone" would manufacture new
-            # false positives offline, so the owner check only runs online,
-            # where `lambda:ListFunctions` is a live, trustworthy read.
+            # CLO-609: the same holds for `/aws/elasticbeanstalk/<env>/...`
+            # while the environment exists. An owner list the scan could not
+            # read in full (a failed or partial ListFunctions /
+            # DescribeEnvironments, an export that can't vouch for its list)
+            # is MISSING: the group is withheld with a note, never flagged on
+            # age alone. Offline, the export's list is used when it can vouch
+            # for it (``lambda_functions_complete``); before CLO-609 offline
+            # skipped the owner check and flagged on age alone.
+            is_offline = data_provider.provider_type == 'offline'
+            note_missing = getattr(data_provider, '_note_idle_verdict_missing', None)
+
+            def _withhold(name: str, reason: str) -> None:
+                if callable(note_missing):
+                    note_missing(
+                        'cloudwatch-logs', name, reason,
+                        verdict='empty', evidence='log group owners',
+                    )
+
             live_lambda_function_names = None
-            if data_provider.provider_type == 'online':
+            if not is_offline or getattr(data_provider, 'lambda_functions_complete', False) is True:
                 try:
-                    live_lambda_function_names = {
-                        fn.function_name for fn in await data_provider.get_lambda_functions()
-                    }
+                    functions = await data_provider.get_lambda_functions()
+                    if getattr(data_provider, 'lambda_functions_complete', True):
+                        live_lambda_function_names = {fn.function_name for fn in functions}
                 except Exception as lambda_err:
-                    # Can't confirm either way — never let a failed owner
-                    # check suppress an otherwise-real finding. Falling back
-                    # to None restores today's behaviour (flag on age alone).
                     logger.debug(f"Could not fetch Lambda functions for owner check: {lambda_err}")
                     live_lambda_function_names = None
 
-            def owned_by_live_lambda(name: str) -> bool:
-                # CLO-382: an empty group whose Lambda owner still exists is
-                # not orphaned — it's live and quiet, with its logs already
-                # expired by retention. Only the `/aws/lambda/<fn>` naming
-                # convention; every other log group (API Gateway access
-                # logs, ECS, custom app logs, ...) is judged on activity.
-                return (
-                    live_lambda_function_names is not None
-                    and name.startswith('/aws/lambda/')
-                    and name[len('/aws/lambda/'):] in live_lambda_function_names
-                )
+            # Read only when a 0-byte Beanstalk group exists, so a region
+            # without one costs no DescribeEnvironments call here.
+            beanstalk_statuses: Optional[Dict[str, str]] = None
+            if any(
+                g.stored_bytes == 0 and g.log_group_name.startswith(_BEANSTALK_LOG_PREFIX)
+                for g in log_groups
+            ):
+                fetch = getattr(data_provider, 'get_beanstalk_environment_statuses', None)
+                statuses = None
+                if callable(fetch):
+                    try:
+                        statuses = await fetch()
+                    except Exception as eb_err:
+                        logger.debug(f"Could not fetch Beanstalk environments for owner check: {eb_err}")
+                        statuses = None
+                if statuses is not None:
+                    beanstalk_statuses = merge_beanstalk_statuses(statuses.items(), fold_case=True)
+
+            def owner_check(name: str):
+                """(state, reason): state is _OWNER_LIVE, _OWNER_UNKNOWN
+                (reason says why) or None (no owner by name, or it's gone)."""
+                if name.startswith(_LAMBDA_LOG_PREFIX):
+                    function = name[len(_LAMBDA_LOG_PREFIX):]
+                    if _LAMBDA_EDGE_REPLICA_RE.match(function):
+                        return _OWNER_UNKNOWN, "Lambda@Edge replica, function is in its origin region"
+                    if live_lambda_function_names is None:
+                        return _OWNER_UNKNOWN, "Lambda function list not read in full"
+                    if function in live_lambda_function_names:
+                        return _OWNER_LIVE, None
+                    return None, None
+                env = _beanstalk_env_from_log_group(name)
+                if env is not None:
+                    if beanstalk_statuses is None:
+                        return _OWNER_UNKNOWN, "Elastic Beanstalk environment list not read"
+                    status = beanstalk_statuses.get(env.lower())
+                    if status is not None and status != 'Terminated':
+                        return _OWNER_LIVE, None
+                    return None, None
+                if is_offline and _ANONYMIZED_LOG_GROUP_RE.match(name):
+                    return _OWNER_UNKNOWN, "log group name anonymized in export"
+                return None, None
 
             # CLO-516: DescribeLogGroups carries no lastEventTimestamp, so a
             # group's last activity is read from its newest log stream — one
@@ -140,7 +207,7 @@ class OpenManagementDetectorsMixin:
                 empty_candidate = (
                     log_group.stored_bytes == 0
                     and age >= EMPTY_LOG_GROUP_MIN_DAYS
-                    and not owned_by_live_lambda(log_group.log_group_name)
+                    and owner_check(log_group.log_group_name)[0] is None
                 )
                 stale_candidate = stored_gb > OLD_LOG_GROUP_MIN_GB and age > OLD_LOG_GROUP_MIN_DAYS
                 if empty_candidate or stale_candidate:
@@ -314,11 +381,21 @@ class OpenManagementDetectorsMixin:
                     ))
                 
                 # ── Detector 4: Empty log group (0 bytes, 30+ days) ──────
+                owner, owner_reason = (
+                    owner_check(log_group_name) if log_group.stored_bytes == 0 else (None, None)
+                )
+                if owner == _OWNER_UNKNOWN:
+                    # CLO-609: an owner the scan can't confirm gone is
+                    # MISSING. Noted only for a group old enough that it
+                    # would otherwise have been judged.
+                    group_age = age_days(log_group)
+                    if group_age is not None and group_age >= EMPTY_LOG_GROUP_MIN_DAYS:
+                        _withhold(log_group_name, owner_reason)
                 if (
                     log_group.stored_bytes is not None
                     and log_group.stored_bytes == 0
                     and activity_known
-                    and not owned_by_live_lambda(log_group_name)
+                    and owner is None
                 ):
                     # days_empty counts from the last event; a group that
                     # never received one counts from its creation.

@@ -24,6 +24,7 @@ from cloudwise_scan_core.data_providers.models import (
     RDSInstanceData,
     RDSMetricsData,
     RDSSnapshotData,
+    RDSSnapshotSharingData,
     LambdaFunctionData,
     LambdaMetricsData,
     LambdaProvisionedConcurrencyData,
@@ -263,7 +264,32 @@ class WasteDataProvider(ABC):
             List of RDSSnapshotData
         """
         pass
-    
+
+    @abstractmethod
+    async def get_rds_snapshot_sharing(
+        self,
+        snapshot_ids: List[str],
+    ) -> Dict[str, RDSSnapshotSharingData]:
+        """
+        CLO-612: sharing/public status for manual RDS snapshots, from
+        DescribeDBSnapshotAttributes' ``restore`` attribute. old_rds_snapshot
+        calls this with only the snapshot ids that survived every other
+        guard and would otherwise be recommended for deletion -- never the
+        whole region's snapshots.
+
+        Args:
+            snapshot_ids: manual snapshot ids to check
+
+        Returns:
+            Dict mapping snapshot_id to RDSSnapshotSharingData. An id this
+            cannot confirm (the read failed, was denied, or the id is
+            simply absent from the result) should come back MISSING
+            (``missing=True``), never as "confirmed not shared" -- the
+            caller withholds a MISSING one rather than risk deleting
+            something still shared with another account.
+        """
+        pass
+
     # =========================================================================
     # Lambda / Serverless
     # =========================================================================

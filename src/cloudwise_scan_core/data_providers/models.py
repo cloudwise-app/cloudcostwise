@@ -144,6 +144,11 @@ class RDSInstanceData:
     # reused identifier inherits its predecessor's datapoints unless the
     # metric window is cut at this time (cloudwise_scan_core.metric_window).
     instance_create_time: Optional[datetime] = None
+    # CLO-608: DescribeDBInstances' DbiResourceId, the instance's immutable
+    # id. old_rds_snapshot matches a snapshot to its source on it, so an
+    # instance recreated under a reused identifier is not mistaken for the
+    # snapshot's (deleted) source.
+    dbi_resource_id: Optional[str] = None
 
 
 @dataclass
@@ -183,6 +188,34 @@ class RDSSnapshotData:
     encrypted: bool = False
     engine: Optional[str] = None
     age_days: int = 0
+    # CLO-608: DescribeDBSnapshots' DbiResourceId, the source instance's
+    # immutable id (see RDSInstanceData.dbi_resource_id).
+    dbi_resource_id: Optional[str] = None
+    # CLO-608: OriginalSnapshotCreateTime, when the data was captured. A copy
+    # gets a new SnapshotCreateTime but keeps this, so the only-copy guard
+    # orders a DB's snapshots on it.
+    original_create_time: Optional[datetime] = None
+
+
+@dataclass
+class RDSSnapshotSharingData:
+    """CLO-612: a manual RDS snapshot's sharing status, from
+    DescribeDBSnapshotAttributes' ``restore`` attribute (the account ids and/or
+    ``all`` it lists). Read only for a snapshot old_rds_snapshot would
+    otherwise recommend for deletion -- deleting a shared or public snapshot
+    silently removes that access for whoever it was shared with.
+
+    ``missing`` means the read itself failed or was denied: the snapshot's
+    sharing status could not be confirmed. CLO-612 revision (Rick, delegated
+    product decision): this no longer withholds the finding -- an
+    unconfirmable snapshot still fires, at a lower confidence, with a
+    risk-text warning and ``metadata['sharing_checked'] = False``. Only a
+    CONFIRMED shared or public snapshot (``shared_account_count`` or
+    ``public`` set) is withheld. The default (no explicit account ids, no
+    ``all``, not missing) is "confirmed not shared"."""
+    shared_account_count: int = 0
+    public: bool = False
+    missing: bool = False
 
 
 @dataclass
@@ -1761,6 +1794,24 @@ class BeanstalkConfigData:
     rds_instance_type: str = ''
     ebs_volume_type: str = 'gp3'
     ebs_volume_size: int = 10                  # GB
+
+
+def merge_beanstalk_statuses(pairs, fold_case: bool = False) -> Dict[str, str]:
+    """CLO-609: ``{environment name: Status}`` from ``(name, status)`` pairs.
+
+    A name can appear more than once: DescribeEnvironments may list a
+    recently terminated environment next to a live one recreated under the
+    same name. On a collision any status other than "Terminated" wins, in
+    either order, so the live environment is never read as gone.
+    ``fold_case`` keys by the lowercased name."""
+    merged: Dict[str, str] = {}
+    for name, status in pairs:
+        if not name:
+            continue
+        key = name.lower() if fold_case else name
+        if key not in merged or merged[key] == 'Terminated':
+            merged[key] = status or ''
+    return merged
 
 
 def beanstalk_rds_marks(tags: Dict[str, str]) -> Optional[Dict[str, str]]:

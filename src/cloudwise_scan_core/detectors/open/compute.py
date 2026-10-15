@@ -32,6 +32,10 @@ _EC2_MANAGED_TAG_KEYS = {
     'eks:cluster-name': 'EKS cluster',
     'aws:eks:cluster-name': 'EKS cluster',
     'elasticbeanstalk:environment-name': 'Elastic Beanstalk environment',
+    # CLO-609: Elastic Beanstalk writes both of its default tags (and Name =
+    # the environment name) on every resource it creates, and they can't be
+    # edited through Beanstalk. Either one is enough.
+    'elasticbeanstalk:environment-id': 'Elastic Beanstalk environment',
     'aws:elasticmapreduce:job-flow-id': 'EMR cluster',
     'aws:ec2spot:fleet-request-id': 'Spot Fleet',
     'aws:ec2:fleet-id': 'EC2 Fleet',
@@ -61,14 +65,31 @@ _EC2_INSTANCE_STATES = frozenset({
 })
 
 
+# CLO-609: tag keys are case-sensitive in AWS and the services above write
+# them exactly as listed; matching them case-insensitively only ever skips
+# more, never judges an owned instance.
+_EC2_MANAGED_TAG_KEYS_LOWER = {key.lower(): owner for key, owner in _EC2_MANAGED_TAG_KEYS.items()}
+
+
+# CLO-609: Elastic Beanstalk builds every environment with a CloudFormation
+# stack named awseb-<environment id>-stack, and CloudFormation tags what it
+# creates with aws:cloudformation:stack-name. The key starts with "aws:", so
+# it survives --anonymize (its value does not).
+_EC2_CFN_STACK_TAG_KEY = 'aws:cloudformation:stack-name'
+_BEANSTALK_STACK_PREFIX = 'awseb-'
+
+
 def _ec2_managed_by(tags: Dict[str, str]) -> "str | None":
     """The service that owns this instance, from its tags, or None."""
-    for key in tags or {}:
-        if key in _EC2_MANAGED_TAG_KEYS:
-            return _EC2_MANAGED_TAG_KEYS[key]
+    for key, value in (tags or {}).items():
+        lowered = (key or '').lower()
+        if lowered in _EC2_MANAGED_TAG_KEYS_LOWER:
+            return _EC2_MANAGED_TAG_KEYS_LOWER[lowered]
         for prefix, owner in _EC2_MANAGED_TAG_PREFIXES.items():
-            if key.startswith(prefix):
+            if lowered.startswith(prefix):
                 return owner
+        if lowered == _EC2_CFN_STACK_TAG_KEY and (value or '').lower().startswith(_BEANSTALK_STACK_PREFIX):
+            return 'Elastic Beanstalk environment'
     return None
 
 

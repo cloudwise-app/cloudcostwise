@@ -14,7 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
-from cloudwise_scan_core.cloudwatch_metrics_service import MSKMetrics, MQMetrics
+from cloudwise_scan_core.cloudwatch_metrics_service import (
+    MSKMetrics, MQMetrics,
+    MSK_CANARY_MESSAGES_PER_SEC_CEILING, MSK_CANARY_BYTES_PER_SEC_CEILING,
+)
 from cloudwise_scan_core.cpu_sizing import (
     ec2_cpu_is_idle,
     has_min_coverage,
@@ -41,6 +44,7 @@ from cloudwise_scan_core.data_providers.models import (
     RDSInstanceData,
     RDSMetricsData,
     RDSSnapshotData,
+    RDSSnapshotSharingData,
     LambdaFunctionData,
     LambdaMetricsData,
     LambdaProvisionedConcurrencyData,
@@ -992,6 +996,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 db_instance_arn=db.get('DBInstanceArn', ''),
                 backup_retention_period=db.get('BackupRetentionPeriod', 0),
                 instance_create_time=self._parse_datetime(db.get('InstanceCreateTime')),
+                dbi_resource_id=db.get('DbiResourceId'),
             ))
 
         return instances
@@ -1116,10 +1121,79 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     encrypted=snapshot.get('Encrypted', False),
                     engine=snapshot.get('Engine'),
                     age_days=age_days,
+                    dbi_resource_id=snapshot.get('DbiResourceId'),
+                    original_create_time=self._parse_datetime(snapshot.get('OriginalSnapshotCreateTime')),
                 ))
-        
+
         return snapshots
-    
+
+    async def get_rds_snapshot_sharing(
+        self,
+        snapshot_ids: List[str],
+    ) -> Dict[str, RDSSnapshotSharingData]:
+        """CLO-612: sharing status from the export's
+        rds_snapshot_attributes.json — cloudwise-export.sh's own
+        describe-db-snapshot-attributes call per manual snapshot, following
+        the lb_target_health.json pattern: a snapshot whose read failed
+        writes no entry at all, rather than an empty "restore" list that
+        would read as "not shared". An export with no such file (older than
+        the script version that added it, or removed by --anonymize because
+        it could not be anonymized safely), or a snapshot younger than the
+        export's own pre-filter, or one past its per-region call cap, all
+        come back the same way: MISSING.
+
+        CLO-612 revision: MISSING is no longer withheld by the caller --
+        old_rds_snapshot still fires, at a lower confidence, with a risk-text
+        warning. This is still the single source of truth for "could this
+        be confirmed", so it stays conservative about returning anything
+        else.
+        """
+        if not snapshot_ids:
+            return {}
+        if self._is_removed('rds_snapshot_attributes') or 'rds_snapshot_attributes' not in self._export_data:
+            return {sid: RDSSnapshotSharingData(missing=True) for sid in snapshot_ids}
+
+        raw = self._export_data.get('rds_snapshot_attributes')
+        # The export writes {"snapshot_attributes": [...], "capped": bool}
+        # (a dict), matching every other AWS-CLI-shaped export file; accept
+        # a bare list too (no "capped" key to read then).
+        rows = raw.get('snapshot_attributes', []) if isinstance(raw, dict) else raw
+        if isinstance(raw, dict) and raw.get('capped'):
+            note = (
+                "old_rds_snapshot: cloudwise-export.sh stopped collecting RDS snapshot sharing "
+                f"attributes at its per-region cap in {self._region}; snapshots past that are "
+                "flagged with sharing unchecked (lower confidence), never withheld for it."
+            )
+            if note not in self.data_warnings:
+                self.data_warnings.append(note)
+        by_id: Dict[str, Dict[str, Any]] = {}
+        if isinstance(rows, list):
+            for row in rows:
+                block = row.get('DBSnapshotAttributesResult') if isinstance(row, dict) else None
+                if not isinstance(block, dict):
+                    continue
+                snapshot_id = block.get('DBSnapshotIdentifier')
+                if snapshot_id:
+                    by_id[snapshot_id] = block
+
+        result: Dict[str, RDSSnapshotSharingData] = {}
+        for snapshot_id in snapshot_ids:
+            block = by_id.get(snapshot_id)
+            if block is None:
+                result[snapshot_id] = RDSSnapshotSharingData(missing=True)
+                continue
+            values: List[str] = []
+            for attr in block.get('DBSnapshotAttributes') or []:
+                if str(attr.get('AttributeName', '')).strip().lower() == 'restore':
+                    values.extend(attr.get('AttributeValues') or [])
+            public = 'all' in values
+            shared_account_count = sum(1 for v in values if v != 'all')
+            result[snapshot_id] = RDSSnapshotSharingData(
+                shared_account_count=shared_account_count,
+                public=public,
+            )
+        return result
+
     # =========================================================================
     # Lambda / Serverless
     # =========================================================================
@@ -3330,6 +3404,11 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         broker_ids = [str(i) for i in range(1, broker_count + 1)]
         metric_prefixes = (
             'msk_messages_', 'msk_bytes_in_', 'msk_bytes_out_', 'msk_cpu_', 'msk_cpu_system_',
+            # CLO-606: DEFAULT-level boolean, exported the same way as the
+            # other per-broker MSK metrics once cloudwise-export.sh collects
+            # it (tracked separately; MISSING until then, same as any
+            # pre-1.x export missing a newer msk_* key).
+            'msk_user_partition_',
         )
 
         def _raw_series(metric_prefix: str, broker_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -3440,6 +3519,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         messages_in = sum(msg_means.values())
         bytes_in = sum(bin_means.values())
+        # CLO-606: the canary-level CEILING is PER BROKER (every broker's
+        # own mean at/under it), not on these cluster sums — mirrors
+        # OnlineDataProvider (see its comment for why: AWS's canary runs one
+        # consumer group per broker, so a summed ceiling would let a large
+        # canary-only cluster hide above the line). At/under the ceiling
+        # means "cannot be distinguished from canary-only" -- NOT "idle":
+        # see the decision rules below.
+        msg_at_ceiling = max(msg_means.values()) <= MSK_CANARY_MESSAGES_PER_SEC_CEILING
+        bin_at_ceiling = max(bin_means.values()) <= MSK_CANARY_BYTES_PER_SEC_CEILING
 
         bout_means, bout_why = _per_broker('msk_bytes_out_')
         if bout_means is None:
@@ -3448,13 +3536,51 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # would read it as network headroom. Unmeasured is MISSING.
             self._note_idle_verdict_missing(
                 'msk', cluster_name, bout_why,
-                verdict='idle' if messages_in == 0 and bytes_in == 0 else 'oversized',
+                verdict='idle' if msg_at_ceiling and bin_at_ceiling else 'oversized',
                 evidence='per-broker BytesOutPerSec',
             )
             return None
         bytes_out = sum(bout_means.values())
-        # Idle needs no inbound AND no outbound traffic on any broker.
-        is_idle = messages_in == 0 and bytes_in == 0 and bytes_out == 0
+        bout_at_ceiling = max(bout_means.values()) <= MSK_CANARY_BYTES_PER_SEC_CEILING
+        at_canary_level = msg_at_ceiling and bin_at_ceiling and bout_at_ceiling
+        idle_evidence = ''
+
+        if not at_canary_level:
+            # Rule 3 (CLO-606): traffic is clearly above canary levels on at
+            # least one broker/metric -- unchanged from before CLO-606, not
+            # idle, falls through to the oversized check.
+            is_idle = False
+        else:
+            # Rule 1 (CLO-606), mirroring OnlineDataProvider. An
+            # empty/unmeasured series on any broker is MISSING
+            # (``_series``/``_per_broker`` already treat it that way, never
+            # as a measured 0), so ``upe_means`` is None rather than
+            # silently reading that broker as 0.
+            upe_means, upe_why = _per_broker('msk_user_partition_')
+            no_user_partitions = upe_means is not None and all(v == 0 for v in upe_means.values())
+            if no_user_partitions:
+                is_idle = True
+                idle_evidence = 'no_user_partitions'
+            else:
+                # Rule 2 (CLO-606): canary-level traffic, but either a user
+                # topic exists or UserPartitionExists itself is unmeasured
+                # -- withhold BOTH verdicts, mirroring OnlineDataProvider.
+                # A SHORT category (a Counter key across every withheld
+                # cluster): 'proof of no user topics' is missing both when
+                # UserPartitionExists was measured as 1 (proof of presence,
+                # not absence) and when it was never measured -- one
+                # evidence phrase covers both, but the reason still names
+                # which sub-case this cluster is in.
+                reason = (
+                    "canary-level traffic, user topics present" if upe_means is not None
+                    else "canary-level traffic, UserPartitionExists unmeasured"
+                )
+                self._note_idle_verdict_missing(
+                    'msk', cluster_name, reason,
+                    verdict='idle or oversized',
+                    evidence='proof of no user topics',
+                )
+                return None
 
         # CPU: per broker, the hours with both CpuUser and CpuSystem,
         # matched by Timestamp exactly as online does (the export's two CPU
@@ -3498,6 +3624,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             period_days=days,
             is_idle=is_idle,
             cpu_datapoints=cpu_datapoints,
+            idle_evidence=idle_evidence,
         )
 
     # =========================================================================
@@ -5409,6 +5536,44 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 solution_stack_name=env.get('SolutionStackName', ''),
             ))
         return environments
+
+    def _trusted_export_list(self, key: str, list_field: str) -> Optional[List[Any]]:
+        """CLO-609: the export's ``key`` list when it can vouch for it, else
+        None (MISSING). A failed read leaves a 0-byte file the loader skips
+        (key absent); --anonymize may remove a file (CLO-554); and an export
+        older than 1.19.0 wrote an empty-list document on failure, so there
+        an EMPTY list can't be told from "none exist" (CLO-550)."""
+        if self._is_removed(key):
+            return None
+        data = self._export_data.get(key)
+        if isinstance(data, dict):
+            data = data.get(list_field)
+        if not isinstance(data, list):
+            return None
+        if not data and self._legacy_failed_reads:
+            return None
+        return data
+
+    async def get_beanstalk_environment_statuses(self) -> Optional[Dict[str, str]]:
+        """CLO-609: ``{environment name: Status}`` from the export, or None
+        when the export can't vouch for its environment list. The export runs
+        ``describe-environments`` with the CLI default, so recently
+        terminated environments may be listed with Status "Terminated"."""
+        raw = self._trusted_export_list('beanstalk_environments', 'Environments')
+        if raw is None:
+            return None
+        # Imported here so the module's line numbers that tests cite stay put.
+        from cloudwise_scan_core.data_providers.models import merge_beanstalk_statuses
+        return merge_beanstalk_statuses(
+            (env.get('EnvironmentName', ''), env.get('Status', ''))
+            for env in raw if isinstance(env, dict)
+        )
+
+    @property
+    def lambda_functions_complete(self) -> bool:
+        """CLO-609: whether the export's Lambda function list can be read as
+        the region's whole list (see ``_trusted_export_list``)."""
+        return self._trusted_export_list('lambda_functions', 'Functions') is not None
 
     async def get_beanstalk_configurations(self) -> Dict[str, BeanstalkConfigData]:
         """Get Beanstalk configuration settings from offline export."""

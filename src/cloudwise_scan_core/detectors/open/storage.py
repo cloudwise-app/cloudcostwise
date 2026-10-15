@@ -11,10 +11,11 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, TYPE_CHECKING
-from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, _region_price_multiplier, S3_STANDARD_PER_GB, S3_IT_MONITORING_PER_1K
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, _region_price_multiplier, S3_STANDARD_PER_GB, S3_IT_MONITORING_PER_1K, S3_STANDARD_IA_PER_GB, S3_IT_MIN_TIERABLE_BYTES, S3_TIER2_REQUEST_PRICE
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
+    from cloudwise_scan_core.data_providers.models import S3CostBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -547,10 +548,24 @@ class OpenStorageDetectorsMixin:
         6. S3_HIGH_REQUEST_AND_TRANSFER_COST – Non-storage costs dominate (CUR-based)
         """
         waste_items = []
-        
+
         try:
             buckets = await data_provider.get_s3_buckets()
-            
+
+            # CLO-610: fetched once, up front, and reused by both
+            # no_lifecycle and wrong_storage_class below (per-bucket access
+            # signal for their shared savings estimate). Detector 6 further
+            # down (_detect_s3_high_request_and_transfer_cost) still makes
+            # its own, separate call to the same method rather than reusing
+            # this dict — today that's harmless (CUR data offline, an empty
+            # dict online; see get_s3_cost_breakdown's docstring, never a
+            # billed call either way), but it is a second call, not zero.
+            try:
+                s3_cost_breakdowns = await data_provider.get_s3_cost_breakdown()
+            except Exception as e:
+                logger.warning(f"S3 cost breakdown unavailable: {e}")
+                s3_cost_breakdowns = {}
+
             for bucket in buckets:
                 # CRITICAL: Filter by region — S3 buckets are global but we scan per-region
                 if bucket.region and bucket.region != data_provider.region:
@@ -574,8 +589,9 @@ class OpenStorageDetectorsMixin:
                              evidence='lifecycle configurations (s3:GetLifecycleConfiguration)')
                     waste_items.extend(self._detect_s3_empty_bucket(bucket, settings))
                     continue
-                no_lifecycle = self._detect_s3_no_lifecycle(bucket, settings)
-                wrong_class = self._detect_s3_wrong_storage_class(bucket, settings)
+                bucket_cost_breakdown = s3_cost_breakdowns.get(bucket.bucket_name)
+                no_lifecycle = self._detect_s3_no_lifecycle(bucket, settings, bucket_cost_breakdown)
+                wrong_class = self._detect_s3_wrong_storage_class(bucket, settings, bucket_cost_breakdown)
                 if no_lifecycle and wrong_class:
                     # CLO-513: both estimate the same move of Standard bytes
                     # to cheaper classes; count it once, on wrong_storage_class.
@@ -682,10 +698,144 @@ class OpenStorageDetectorsMixin:
                 'detection_mode': getattr(self, '_provider_type', 'unknown'),
             }
         )]
+    def _s3_tiering_savings_estimate(
+        self,
+        standard_bytes: int,
+        object_count: int,
+        settings: WasteDetectionSettings,
+        cost_breakdown: Optional["S3CostBreakdown"] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """CLO-610: conservative Intelligent-Tiering savings estimate, shared
+        by ``_detect_s3_wrong_storage_class`` and ``_detect_s3_no_lifecycle``
+        (both recommend the same move of Standard bytes to IT and must agree
+        on the math — see CLO-513's "counted once" dance below).
+
+        Fixes three problems the flat ``s3_tiering_savings_pct`` of Standard
+        bytes had: it ignored that auto-tiering has a 128 KB minimum eligible
+        object size (smaller objects never move and are never billed the
+        monitoring fee); it computed the monitoring fee but never subtracted
+        it; and it had no access-pattern signal, so a bucket whose objects
+        are read all the time (no 30-day idle window to tier) was estimated
+        the same as one that never is.
+
+        There's no per-object size distribution available, only a bucket-wide
+        byte total and object count, so the 128 KB exclusion uses the
+        conservative bound: every object could be sized just under 128 KB, so
+        at most ``object_count * 128 KiB`` of the bytes are too small to tier.
+        An object count that is zero (or missing) while bytes are present
+        can't be bounded at all, so the tierable amount is treated as zero —
+        the conservative answer, not a guess.
+
+        IMPORTANT, read before trusting the ``cost_breakdown`` branch below:
+        as of this fix, nothing in production ever populates a per-bucket CUR
+        cost breakdown. The online provider's ``get_s3_cost_breakdown``
+        unconditionally returns ``{}`` (CUR/Athena integration isn't wired up
+        there yet); the Air-Gapped upload path has a ``_parse_cur_file`` that
+        parses an uploaded CUR CSV but nothing calls it, so an uploaded
+        export's ``s3_cost_breakdown`` is never populated either. Every real
+        scan today takes the ``cost_breakdown is None`` branch. That branch
+        (``s3_tiering_no_signal_factor``, default 0.5 of the base rate) is
+        therefore the one actually protecting a customer from an overstated
+        saving on a bucket that's read constantly — not the CUR branch, which
+        exists for when that plumbing lands (it already backs the older,
+        equally-unwired ``s3_high_request_and_transfer_cost`` detector) and is
+        exercised only by this fix's own tests.
+
+        Returns None only when there is nothing to compute at all
+        (``standard_bytes <= 0``). Otherwise always returns the figures,
+        including a ``net_savings`` that may be zero, negative, or below
+        ``settings.min_waste_threshold_usd`` — each caller applies its own
+        floor semantics (see the note above the return statement below).
+        """
+        if standard_bytes <= 0:
+            return None
+
+        std_gb = standard_bytes / self.GB
+        standard_cost = std_gb * S3_STANDARD_PER_GB
+
+        if object_count <= 0:
+            tierable_bytes = 0
+            monitored_objects = 0
+        else:
+            tierable_bytes = max(0, standard_bytes - object_count * S3_IT_MIN_TIERABLE_BYTES)
+            monitored_objects = min(object_count, standard_bytes // S3_IT_MIN_TIERABLE_BYTES)
+        tierable_gb = tierable_bytes / self.GB
+        monitoring_fee = monitored_objects / 1000 * S3_IT_MONITORING_PER_1K
+
+        # Never claim more than the real Standard -> Standard-IA discount,
+        # regardless of what the (configurable) base rate says.
+        max_pct = (S3_STANDARD_PER_GB - S3_STANDARD_IA_PER_GB) / S3_STANDARD_PER_GB * 100.0
+        base_pct = min(settings.s3_tiering_savings_pct, max_pct)
+
+        estimated_gets_per_object = None
+        if cost_breakdown is not None and cost_breakdown.storage_cost > 0:
+            access_signal = 'cur'
+            # Two independent, conservative reads of the same bucket's CUR
+            # data; the lower (more "this bucket is hot") of the two wins.
+            #
+            # 1. GET/SELECT/HEAD request volume per tierable object per
+            #    month. request_tier2_cost is a $ figure, not a count, so
+            #    it's converted back to an estimated request count via the
+            #    Tier2 unit price (S3_TIER2_REQUEST_PRICE) — a $-to-$ ratio
+            #    against storage cost (tried and reverted during this fix)
+            #    is structurally near-zero for a large-object bucket
+            #    regardless of how often it's actually read, since GET
+            #    requests are priced per call, not per byte transferred.
+            #    >= 1 GET per object per month is treated as fully hot.
+            monitored_objects_safe = max(monitored_objects, 1)
+            estimated_gets = cost_breakdown.request_tier2_cost / S3_TIER2_REQUEST_PRICE
+            gets_per_object = estimated_gets / monitored_objects_safe
+            gets_factor = max(0.0, 1.0 - min(1.0, gets_per_object))
+
+            # 2. Egress vs. storage cost — the stronger signal for a bucket
+            #    whose objects are large and downloaded often (few GETs,
+            #    each moving a lot of data): egress at or above the storage
+            #    bill means this bucket is actively served, not archival.
+            estimated_gets_per_object = gets_per_object  # surfaced for metadata/tests
+            egress_ratio = cost_breakdown.transfer_out_cost / max(cost_breakdown.storage_cost, 0.01)
+            egress_factor = max(0.0, 1.0 - min(1.0, egress_ratio))
+
+            read_activity_factor = min(gets_factor, egress_factor)
+            effective_pct = base_pct * read_activity_factor
+        else:
+            # CLO-610: no access-pattern signal was available for this
+            # bucket (today: always — see the docstring above). Apply the
+            # documented no-signal derating rather than the undiminished
+            # base rate, so the common case doesn't quietly overstate a
+            # bucket that happens to be read all the time.
+            access_signal = 'none'
+            effective_pct = base_pct * settings.s3_tiering_no_signal_factor
+
+        gross_savings = tierable_gb * S3_STANDARD_PER_GB * (effective_pct / 100.0)
+        net_savings = gross_savings - monitoring_fee
+
+        # CLO-610: the floor is NOT applied here. net_savings can come back
+        # zero, negative (fee exceeds the gross estimate) or below
+        # settings.min_waste_threshold_usd, and the two callers disagree on
+        # what that means: s3_wrong_storage_class drops the finding (its own
+        # floor check), but s3_no_lifecycle_policy is a GOVERNANCE_WASTE_TYPES
+        # row that must always report, at $0 when there's nothing to claim
+        # (the CLO-513 precedent this fix must not regress) — reusing this
+        # helper must not silently delete that governance finding the way an
+        # early return here would have.
+        return {
+            'standard_gb': std_gb,
+            'standard_cost': standard_cost,
+            'tierable_gb': tierable_gb,
+            'monitored_objects': monitored_objects,
+            'base_savings_pct': base_pct,
+            'effective_savings_pct': effective_pct,
+            'access_signal': access_signal,
+            'estimated_gets_per_object': estimated_gets_per_object,
+            'monitoring_fee': monitoring_fee,
+            'gross_savings': gross_savings,
+            'net_savings': net_savings,
+        }
     def _detect_s3_no_lifecycle(
         self,
         bucket,
         settings: WasteDetectionSettings,
+        cost_breakdown: Optional["S3CostBreakdown"] = None,
     ) -> List[WasteItem]:
         """
         Detect large S3 buckets without lifecycle policies.
@@ -706,17 +856,85 @@ class OpenStorageDetectorsMixin:
         # to cheaper classes, so the saving is the same share of S3 Standard
         # storage s3_wrong_storage_class estimates (s3_tiering_savings_pct),
         # on the Standard bytes only (other classes are already cheaper).
+        # CLO-610: that share is now computed by the same conservative,
+        # fee-subtracted estimate s3_wrong_storage_class uses (see
+        # _s3_tiering_savings_estimate) — this detector used to claim the
+        # flat 40% of Standard bytes undiminished, which overstated the
+        # saving the same way, on any bucket where wrong_storage_class
+        # didn't also fire to zero it out below.
         breakdown = bucket.storage_class_breakdown or {}
         standard_bytes = (
             breakdown.get('StandardStorage', 0) if breakdown else bucket.total_size_bytes
         )
         standard_gb = standard_bytes / self.GB
         monthly_cost = standard_gb * S3_STANDARD_PER_GB
-        savings_pct = settings.s3_tiering_savings_pct / 100.0
-        estimated_savings = monthly_cost * savings_pct
 
-        if estimated_savings < settings.min_waste_threshold_usd:
+        # CLO-610 review (PR #1787): the governance "always report" change
+        # below must not apply to a bucket that was never a candidate in
+        # the first place. A bucket with no (or negligible) Standard bytes
+        # — Glacier-only, IA-only, already on Intelligent-Tiering — has
+        # nothing for a lifecycle rule to move out of Standard; main never
+        # reported it (its old flat estimate rounded to $0 and the
+        # min_waste_threshold_usd check below dropped it), and this
+        # detector's own why_waste text ("objects remain in S3 Standard")
+        # would be false for it. Keep that gate, using the plain
+        # uncapped/undiminished base rate the same way main did — it is
+        # only a "could this possibly be worth reporting" check, not the
+        # real (fee-subtracted, derated) estimate. Only a bucket that
+        # clears THIS gate, and whose detailed estimate still comes out at
+        # or below zero (small objects, unknown count, the fee eating a
+        # thin margin), falls through to the governance $0 below.
+        if standard_bytes <= 0:
             return []
+        if monthly_cost * (settings.s3_tiering_savings_pct / 100.0) < settings.min_waste_threshold_usd:
+            return []
+
+        est = self._s3_tiering_savings_estimate(
+            standard_bytes, bucket.object_count, settings, cost_breakdown
+        )
+        # CLO-610: NO_LIFECYCLE_POLICY is a GOVERNANCE_WASTE_TYPES row
+        # (models.py) — once the gates above pass (a real candidate: a
+        # mostly-Standard bucket large enough to matter), it must always be
+        # reported, at $0 when the detailed estimate has nothing to claim,
+        # the same CLO-513 precedent as the "counted once" dance a few
+        # lines down in _detect_s3_waste. est is never None here — the
+        # helper only returns None when standard_bytes <= 0, already
+        # excluded above — but the fallback values are kept so this stays
+        # correct even if that guard is ever loosened.
+        if est is None or est['net_savings'] <= 0:
+            estimated_savings = 0.0
+            tierable_gb_for_metadata = est['tierable_gb'] if est is not None else 0.0
+            monitoring_fee_for_metadata = est['monitoring_fee'] if est is not None else 0.0
+            access_signal_for_metadata = est['access_signal'] if est is not None else 'none'
+            no_saving_reason = (
+                'the estimate is at or below the Intelligent-Tiering monitoring fee'
+                if est is not None else 'the bucket has no measurable Standard bytes'
+            )
+            pricing_detail = (
+                f'S3 Standard: {standard_gb:.1f} GB × ${S3_STANDARD_PER_GB:.4f}/GB = ${monthly_cost:.2f}/month. '
+                f'No tiering saving is claimed: {no_saving_reason} (most of this bucket\'s objects may be under '
+                f'128 KB, the auto-tiering minimum, or its object count is unavailable to bound that).'
+            )
+        else:
+            estimated_savings = est['net_savings']
+            tierable_gb_for_metadata = est['tierable_gb']
+            monitoring_fee_for_metadata = est['monitoring_fee']
+            access_signal_for_metadata = est['access_signal']
+            no_signal_pct = round(settings.s3_tiering_no_signal_factor * 100)
+            pricing_detail = (
+                f'S3 Standard: {standard_gb:.1f} GB × ${S3_STANDARD_PER_GB:.4f}/GB = ${monthly_cost:.2f}/month. '
+                f'Estimate: {est["tierable_gb"]:.1f} GB eligible for tiering (objects under 128 KB are excluded; '
+                f'auto-tiering never moves them) × {est["effective_savings_pct"]:.1f}% assumed Standard -> '
+                f'Standard-IA discount, minus the ${est["monitoring_fee"]:.4f}/month Intelligent-Tiering '
+                f'monitoring fee ({est["monitored_objects"]:,} objects × $0.0025/1,000) = net '
+                f'${estimated_savings:.2f}/month. '
+                + (f'No access-pattern data was available for this bucket, so the base rate is already derated '
+                   f'to {no_signal_pct}% of itself for this estimate; the real share still depends on how often '
+                   f'these objects are read.' if est['access_signal'] == 'none' else
+                   f'Based on this bucket\'s estimated GET/SELECT/HEAD requests per tierable object '
+                   f'({est["estimated_gets_per_object"]:.2f}/month) and its egress vs. storage cost, both of '
+                   f'which already discount the estimate for a bucket that is read or downloaded often.')
+            )
 
         return [WasteItem(
             id=str(uuid.uuid4()),
@@ -726,7 +944,12 @@ class OpenStorageDetectorsMixin:
             title="S3 Bucket Without Lifecycle Policy",
             description=(
                 f"Bucket '{bucket.bucket_name}' ({size_gb:.1f} GB) has no lifecycle policy. "
-                f"Without lifecycle rules, objects accumulate indefinitely."
+                f"Without lifecycle rules, objects accumulate indefinitely. "
+                + (f"Estimated net saving from moving older objects to a cheaper storage class (e.g. via a "
+                   f"lifecycle rule to Intelligent-Tiering or Standard-IA): ${estimated_savings:.2f}/month "
+                   f"(estimate; see pricing below)." if estimated_savings > 0 else
+                   f"No tiering saving is claimed for this bucket today (see pricing below) — a lifecycle rule "
+                   f"may still be worth adding as a hygiene measure.")
             ),
             monthly_savings=estimated_savings,
             confidence=ConfidenceLevel.MEDIUM,
@@ -737,11 +960,7 @@ class OpenStorageDetectorsMixin:
             explanation={
                 'detection': f'Bucket has no S3 Lifecycle Configuration and is {size_gb:.1f} GB ({bucket.object_count:,} objects)',
                 'threshold': f'> {settings.s3_lifecycle_min_size_gb} GB with no lifecycle rules',
-                'pricing': (
-                    f'S3 Standard: {standard_gb:.1f} GB × ${S3_STANDARD_PER_GB:.4f}/GB = ${monthly_cost:.2f}/month. '
-                    f'Estimated saving from transitioning older objects: {settings.s3_tiering_savings_pct:.0f}% '
-                    f'= ${estimated_savings:.2f}/month (the real share depends on object age and access).'
-                ),
+                'pricing': pricing_detail,
                 'why_waste': f'Without lifecycle policies, objects remain in S3 Standard indefinitely. Older objects that are rarely accessed could be automatically transitioned to cheaper tiers.',
                 'risk': 'Adding lifecycle rules is non-destructive. Start with transition rules (Standard → IA after 90 days) before adding expiration rules.',
             },
@@ -749,9 +968,13 @@ class OpenStorageDetectorsMixin:
                 'bucket_name': bucket.bucket_name,
                 'total_size_gb': round(size_gb, 2),
                 'standard_size_gb': round(standard_gb, 2),
+                'tierable_size_gb': round(tierable_gb_for_metadata, 2),
                 'object_count': bucket.object_count,
                 'monthly_cost_usd': round(monthly_cost, 2),
                 'estimated_savings_usd': round(estimated_savings, 2),
+                'monitoring_fee_monthly_usd': round(monitoring_fee_for_metadata, 4),
+                'savings_is_estimate': True,
+                'access_signal': access_signal_for_metadata,
             }
         )]
     def _detect_s3_rapid_growth(
@@ -846,39 +1069,44 @@ class OpenStorageDetectorsMixin:
         self,
         bucket,
         settings: WasteDetectionSettings,
+        cost_breakdown: Optional["S3CostBreakdown"] = None,
     ) -> List[WasteItem]:
         """
         Detect S3 buckets where Standard storage should be Intelligent-Tiering.
-        
+
         Criteria (ALL must be true):
           1. Bucket has size metrics available
           2. StandardStorage bytes > s3_tiering_min_size_gb (default 50 GB)
           3. StandardStorage is > 90% of total bucket size
           4. Bucket does NOT already have Intelligent-Tiering
           5. Bucket does NOT have lifecycle rules transitioning to cheaper classes
-          6. Monthly storage cost >= min_waste_threshold_usd
+          6. The net saving (see _s3_tiering_savings_estimate) is above the
+             reporting floor — CLO-610: a flat 40% of Standard bytes used to
+             be reported even when the monitoring fee ate it, the bucket was
+             mostly small objects IT never tiers, or the bucket's own
+             GET/request cost showed it is read all the time.
         """
         if bucket.total_size_bytes <= 0:
             return []
-        
+
         standard_bytes = bucket.storage_class_breakdown.get('StandardStorage', 0)
         if standard_bytes <= 0:
             return []
-        
+
         # Minimum Standard size threshold
         min_tiering_bytes = int(settings.s3_tiering_min_size_gb * self.GB)
         if standard_bytes < min_tiering_bytes:
             return []
-        
+
         # Must be primarily Standard (> 90%)
         standard_pct = round((standard_bytes / bucket.total_size_bytes) * 100, 1)
         if standard_pct < 90.0:
             return []
-        
+
         # Skip if already using Intelligent-Tiering
         if bucket.has_intelligent_tiering:
             return []
-        
+
         # Skip if lifecycle already transitions to cheaper classes
         _TIERING_CLASSES = {
             'INTELLIGENT_TIERING', 'STANDARD_IA', 'ONEZONE_IA',
@@ -893,16 +1121,42 @@ class OpenStorageDetectorsMixin:
         )
         if has_tiering_transitions:
             return []
-        
+
         std_gb = standard_bytes / self.GB
         standard_cost = std_gb * S3_STANDARD_PER_GB
-        savings_pct = settings.s3_tiering_savings_pct / 100.0
-        estimated_savings = standard_cost * savings_pct
-        monitoring_fee = round(bucket.object_count / 1000 * S3_IT_MONITORING_PER_1K, 2)
-        
-        if standard_cost < settings.min_waste_threshold_usd:
+
+        est = self._s3_tiering_savings_estimate(
+            standard_bytes, bucket.object_count, settings, cost_breakdown
+        )
+        # CLO-610: unlike s3_no_lifecycle_policy (a GOVERNANCE_WASTE_TYPES
+        # row that must always report, at $0 if need be), this is a regular
+        # savings finding — drop it below the floor rather than show $0 or
+        # a negative number.
+        if (
+            est is None
+            or est['net_savings'] <= 0
+            or est['net_savings'] < settings.min_waste_threshold_usd
+        ):
             return []
-        
+        estimated_savings = est['net_savings']
+
+        if est['access_signal'] == 'cur':
+            access_note = (
+                f"This bucket's estimated GET/SELECT/HEAD requests per tierable object "
+                f"({est['estimated_gets_per_object']:.2f}/month) and its egress vs. storage cost are "
+                f"factored into the estimate below — a bucket that is read or downloaded "
+                f"often keeps more of its data in the (same-price) Frequent Access tier."
+            )
+        else:
+            no_signal_pct = round(settings.s3_tiering_no_signal_factor * 100)
+            access_note = (
+                f"No access-pattern data was available for this bucket, so the "
+                f"{est['base_savings_pct']:.0f}% base rate is already derated to {no_signal_pct}% of itself "
+                f"for this estimate. This is still an estimate: a bucket whose objects are downloaded "
+                f"often will save even less than shown, since Intelligent-Tiering only discounts "
+                f"objects that go untouched for 30+ consecutive days."
+            )
+
         return [WasteItem(
             id=str(uuid.uuid4()),
             resource_id=bucket.bucket_name,
@@ -913,9 +1167,8 @@ class OpenStorageDetectorsMixin:
                 f"S3 bucket '{bucket.bucket_name}' has {std_gb:.1f} GB in Standard storage "
                 f"(${standard_cost:.2f}/month) with no Intelligent-Tiering configuration. "
                 f"Enable S3 Intelligent-Tiering to automatically move infrequently-accessed "
-                f"objects to cheaper tiers. Estimated savings: ${estimated_savings:.2f}/month "
-                f"({settings.s3_tiering_savings_pct:.0f}%). "
-                f"No retrieval fees, no access pattern analysis required."
+                f"objects to cheaper tiers. Estimated net savings: ${estimated_savings:.2f}/month "
+                f"(estimate, after the monitoring fee — see pricing below). {access_note}"
             ),
             monthly_savings=estimated_savings,
             confidence=ConfidenceLevel.LOW,
@@ -923,27 +1176,41 @@ class OpenStorageDetectorsMixin:
                 f"S3 bucket '{bucket.bucket_name}' has {std_gb:.1f} GB in Standard storage "
                 f"(${standard_cost:.2f}/month) with no Intelligent-Tiering configuration. "
                 f"Enable S3 Intelligent-Tiering to automatically move infrequently-accessed "
-                f"objects to cheaper tiers. Estimated savings: ${estimated_savings:.2f}/month "
-                f"({settings.s3_tiering_savings_pct:.0f}%). "
-                f"No retrieval fees, no access pattern analysis required."
+                f"objects to cheaper tiers. Estimated net savings: ${estimated_savings:.2f}/month "
+                f"(estimate, after the monitoring fee)."
             ),
             explanation={
                 'detection': f'{std_gb:.1f} GB ({standard_pct}%) of bucket storage is in Standard class with no Intelligent-Tiering',
                 'threshold': f'> {settings.s3_tiering_min_size_gb} GB in Standard with no tiering configuration',
-                'pricing': f'Standard: ${standard_cost:.2f}/month. IT monitoring fee: ${monitoring_fee:.2f}/month. Net savings: ~${estimated_savings:.2f}/month ({settings.s3_tiering_savings_pct:.0f}%)',
+                'pricing': (
+                    f'Standard: ${standard_cost:.2f}/month ({std_gb:.1f} GB). Tierable (>= 128 KB, the auto-tiering '
+                    f'minimum object size): {est["tierable_gb"]:.1f} GB. Assumed Standard -> Standard-IA discount: '
+                    f'{est["effective_savings_pct"]:.1f}% (capped at the real tier difference, 45.7%). Gross estimate: '
+                    f'${est["gross_savings"]:.2f}/month, minus the ${est["monitoring_fee"]:.4f}/month Intelligent-Tiering '
+                    f'monitoring fee ({est["monitored_objects"]:,} objects x $0.0025 per 1,000 objects) = net '
+                    f'${estimated_savings:.2f}/month. {access_note}'
+                ),
                 'why_waste': f'S3 Intelligent-Tiering automatically moves infrequently accessed objects to lower-cost tiers with no retrieval fees. Without it, all objects stay in the most expensive tier.',
-                'risk': f'Intelligent-Tiering has a small per-object monitoring fee (${S3_IT_MONITORING_PER_1K:.4f} per 1,000 objects). Best suited for buckets with unpredictable access patterns.',
+                'risk': f'Intelligent-Tiering has a small per-object monitoring fee (${S3_IT_MONITORING_PER_1K:.4f} per 1,000 objects). Best suited for buckets with unpredictable access patterns; a bucket that is read constantly saves little or nothing after the fee.',
             },
             metadata={
                 'bucket_name': bucket.bucket_name,
                 'standard_size_gb': round(std_gb, 2),
                 'total_size_gb': round(bucket.total_size_bytes / self.GB, 2),
+                'tierable_size_gb': round(est['tierable_gb'], 2),
                 'standard_pct': standard_pct,
                 'object_count': bucket.object_count,
                 'current_monthly_cost_usd': round(standard_cost, 2),
                 'estimated_savings_usd': round(estimated_savings, 2),
                 'recommended_class': 'S3 Intelligent-Tiering',
-                'monitoring_fee_monthly': monitoring_fee,
+                'monitoring_fee_monthly': round(est['monitoring_fee'], 4),
+                'base_savings_pct': round(est['base_savings_pct'], 2),
+                'effective_savings_pct': round(est['effective_savings_pct'], 2),
+                'access_signal': est['access_signal'],
+                'estimated_gets_per_object': (
+                    round(est['estimated_gets_per_object'], 3) if est['estimated_gets_per_object'] is not None else None
+                ),
+                'savings_is_estimate': True,
                 'has_lifecycle_policy': bucket.has_lifecycle_policy,
                 'has_tiering_transitions': has_tiering_transitions,
             }
