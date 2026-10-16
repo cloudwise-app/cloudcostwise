@@ -28,14 +28,28 @@ class ScanReport:
     blocked_calls: Dict[str, int] = field(default_factory=dict)
     entrypoints: int = 0
     cost_explorer_skipped: bool = False
+    # Checks denied a read (AccessDenied), and free AWS inputs the account has
+    # not enabled: their findings are MISSING, not zero.
+    permission_errors: List[str] = field(default_factory=list)
+    coverage_notes: List[str] = field(default_factory=list)
 
 
-def service_class(include_cost_explorer: bool = True) -> Type[OpenWasteDetectionService]:
+def full_engine_class() -> Type[OpenWasteDetectionService]:
+    """All 46 service checks: needs the partner build, which ships the other 26.
+
+    The free distribution doesn't contain them, so this raises ImportError there.
+    """
+    from cloudwise_scan_core.hosted_service import WasteDetectionService
+
+    return WasteDetectionService
+
+
+def service_class(include_cost_explorer: bool = True, full: bool = False) -> Type[OpenWasteDetectionService]:
+    base = full_engine_class() if full else OpenWasteDetectionService
     if include_cost_explorer:
-        return OpenWasteDetectionService
-    base = OpenWasteDetectionService
+        return base
     return type(
-        "OpenWasteDetectionServiceNoCE",
+        f"{base.__name__}NoCE",
         (base,),
         {
             "DETECTOR_METHODS": {k: v for k, v in base.DETECTOR_METHODS.items() if k not in COST_EXPLORER_DETECTORS},
@@ -71,10 +85,12 @@ class RegionResult:
     blocked: Dict[str, int]
     violations: List[str]
     seconds: float
+    permission_errors: List[str] = field(default_factory=list)
+    coverage_notes: List[str] = field(default_factory=list)
 
 
 def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
-                log_level: Optional[int] = None) -> RegionResult:
+                log_level: Optional[int] = None, full: bool = False) -> RegionResult:
     """Scan one region in THIS process, under its own read-only guard.
 
     Runs in a worker process when regions are scanned in parallel: the engine
@@ -97,7 +113,7 @@ def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
                             force=True)
 
     configure_local_runtime()
-    cls = service_class(include_cost_explorer)
+    cls = service_class(include_cost_explorer, full)
     blocked = frozenset() if include_cost_explorer else frozenset({COST_EXPLORER_SERVICE})
     started = time.monotonic()
     with read_only_guard(blocked) as guard:
@@ -111,6 +127,8 @@ def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
         errors=[f"{region}: {e}" for e in result.errors],
         calls=dict(guard.calls), blocked=dict(guard.blocked), violations=list(guard.violations),
         seconds=round(time.monotonic() - started, 1),
+        permission_errors=[f"{region}: {p}" for p in result.permission_errors],
+        coverage_notes=[f"{region}: {n.get('source', '?')} {n.get('state', '?')}" for n in result.coverage_notes],
     )
 
 
@@ -123,24 +141,25 @@ async def run_scan_async(
     include_cost_explorer: bool = True,
     on_region: Optional[Callable[[RegionResult], None]] = None,
     parallel: int = DEFAULT_PARALLEL_REGIONS,
+    full: bool = False,
 ) -> ScanReport:
     """Scan regions, up to ``parallel`` at a time, each in its own process.
 
     ``on_region`` is called as each region finishes (progress). The report
     lists regions and findings in the order requested, whatever order they
-    finished in.
+    finished in. ``full`` runs all 46 service checks (partner build only).
     """
     import concurrent.futures
     import logging
     import multiprocessing
 
     report = ScanReport(account_id=creds.account_id, regions=list(regions),
-                        entrypoints=len(service_class(include_cost_explorer).DETECTOR_METHODS),
+                        entrypoints=len(service_class(include_cost_explorer, full).DETECTOR_METHODS),
                         cost_explorer_skipped=not include_cost_explorer)
     results: Dict[str, RegionResult] = {}
     if parallel <= 1 or len(regions) <= 1:
         for region in regions:
-            results[region] = await asyncio.to_thread(scan_region, creds, region, include_cost_explorer)
+            results[region] = await asyncio.to_thread(scan_region, creds, region, include_cost_explorer, None, full)
             if on_region:
                 on_region(results[region])
     else:
@@ -148,7 +167,7 @@ async def run_scan_async(
         ctx = multiprocessing.get_context("spawn")  # never fork a process holding boto3 sessions/threads
         with concurrent.futures.ProcessPoolExecutor(max_workers=min(parallel, len(regions)), mp_context=ctx) as pool:
             level = logging.getLogger().getEffectiveLevel()  # workers follow the parent's verbosity
-            pending = {loop.run_in_executor(pool, scan_region, creds, r, include_cost_explorer, level): r
+            pending = {loop.run_in_executor(pool, scan_region, creds, r, include_cost_explorer, level, full): r
                        for r in regions}
             for done in asyncio.as_completed(list(pending)):
                 res = await done
@@ -164,6 +183,8 @@ async def run_scan_async(
         report.findings.extend(res.findings)
         report.warnings.extend(res.warnings)
         report.errors.extend(res.errors)
+        report.permission_errors.extend(res.permission_errors)
+        report.coverage_notes.extend(res.coverage_notes)
         calls.update(res.calls)
         blocked.update(res.blocked)
         violations.extend(res.violations)
@@ -180,5 +201,6 @@ def run_scan(
     include_cost_explorer: bool = True,
     on_region: Optional[Callable[[RegionResult], None]] = None,
     parallel: int = DEFAULT_PARALLEL_REGIONS,
+    full: bool = False,
 ) -> ScanReport:
-    return asyncio.run(run_scan_async(creds, regions, include_cost_explorer, on_region, parallel))
+    return asyncio.run(run_scan_async(creds, regions, include_cost_explorer, on_region, parallel, full))

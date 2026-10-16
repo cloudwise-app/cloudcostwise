@@ -1955,7 +1955,7 @@ class WasteDetectionServiceBase:
             # permissions), not a breaker-worthy transient fault. Record
             # it as a separate metric so dashboards can distinguish.
             if 'AccessDenied' in error_str or 'AccessDeniedException' in error_str:
-                logger.warning(f"Detector {detector_name} AccessDenied - user needs to update CloudFormation: {e}")
+                logger.warning(f"Detector {detector_name} AccessDenied - the role or credentials used for the scan lack a permission: {e}")
                 _emit(
                     DetectorMetricEvent(
                         environment=environment,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
@@ -45,9 +45,10 @@ class _Session:
     report: Optional[ScanReport] = None
     by_id: Dict[str, object] = field(default_factory=dict)
     footer_shown: bool = False
+    upsell: bool = True
 
     def footer_once(self) -> str:
-        if self.footer_shown or self.report is None:
+        if not self.upsell or self.footer_shown or self.report is None:
             return ""
         self.footer_shown = True
         return "\n\n" + render.footer(self.report)
@@ -57,10 +58,21 @@ def _money(x) -> str:
     return f"${float(x or 0):,.2f}"
 
 
-def build_server() -> MCPServer:
+def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcostwise",
+                 version: str = __version__,
+                 register: Optional[Callable[[MCPServer, Callable[[], Optional[ScanReport]]], None]] = None,
+                 transform: Optional[Callable[[ScanReport], ScanReport]] = None,
+                 ) -> MCPServer:
+    """The MCP server. The defaults are the free tool.
+
+    ``full`` runs all 46 service checks (partner build only), ``upsell=False``
+    drops the hosted-product footer and links, and ``register(server,
+    last_report)`` lets a build add its own tools over the last scan, and
+    ``transform`` rewrites each scan before any tool shows it.
+    """
     configure_local_runtime()
-    session = _Session()
-    server = MCPServer(name="cloudcostwise", version=__version__, instructions=INSTRUCTIONS)
+    session = _Session(upsell=upsell)
+    server = MCPServer(name=name, version=version, instructions=INSTRUCTIONS)
 
     # Same one-line decorator shape as the other three tools: directories that
     # list tools by reading the source (mcprush) missed this one when its
@@ -88,11 +100,13 @@ def build_server() -> MCPServer:
                     f"{res.region}: {len(res.findings)} finding(s) in {res.seconds:.0f}s"))
 
             report = await run_scan_async(creds, region_list, include_cost_explorer=include_cost_explorer,
-                                          on_region=progress)
+                                          on_region=progress, full=full)
         except CredentialsError as e:
             return f"Could not scan: {e}"
         except ReadOnlyViolation as e:
             return f"Scan stopped: {e}. This is a bug in cloudcostwise; nothing was changed in AWS."
+        if transform is not None:
+            report = transform(report)
         session.report = report
         session.by_id = {str(i.id): i for i in report.findings}
         lines = [f"Account {report.account_id}, regions {', '.join(report.regions)}: "
@@ -109,6 +123,12 @@ def build_server() -> MCPServer:
             lines.append(note)
         if report.warnings:
             lines.append(f"{len(report.warnings)} data warning(s): those findings are MISSING, not zero.")
+        if report.permission_errors:
+            lines.append(f"{len(report.permission_errors)} check(s) were denied access by these credentials: "
+                         "their findings are MISSING, not zero.")
+        if report.coverage_notes:
+            lines.append(f"{len(report.coverage_notes)} AWS input(s) not enabled in this account: "
+                         "the findings they feed are MISSING, not zero.")
         lines.append("Use list_findings for finding ids, then explain_finding or fix_guidance.")
         return "\n".join(lines) + session.footer_once()
 
@@ -167,9 +187,12 @@ def build_server() -> MCPServer:
         risk = (item.explanation or {}).get("risk")
         if risk:
             out += ["", f"Risk: {risk}"]
-        out += ["", f"Safe, approved fixes with rollback are part of the hosted product: {render.HOSTED_URL}"]
+        if session.upsell:
+            out += ["", f"Safe, approved fixes with rollback are part of the hosted product: {render.HOSTED_URL}"]
         return "\n".join(out) + session.footer_once()
 
+    if register is not None:
+        register(server, lambda: session.report)
     return server
 
 

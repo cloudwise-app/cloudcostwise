@@ -926,7 +926,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         logger.warning(
             "%s permission check failed for account=%s region=%s: %s "
             "calling %s. Findings dependent on %s will be MISSING, not "
-            "zero, until the CloudWise IAM role grants this permission. "
+            "zero, until the role or credentials used for the scan grant this permission. "
             "Underlying error: %s",
             resource, self._account_id, self._region,
             error_code, permission, resource, error,

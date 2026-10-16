@@ -41,7 +41,8 @@ def _text(result) -> str:
 async def _session(calls):
     server = mcp_server.build_server()
 
-    async def fake_scan(creds, regions, include_cost_explorer=True, on_region=None):
+    async def fake_scan(creds, regions, include_cost_explorer=True, on_region=None, full=False):
+        assert full is False  # the free server never asks for the partner engine
         return REPORT
 
     with patch.object(mcp_server, "resolve_credentials", return_value=CREDS), \

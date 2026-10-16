@@ -125,6 +125,15 @@ def test_no_cost_explorer_drops_only_the_cost_explorer_entrypoint():
     assert len(full.DETECTOR_METHODS) == 20
 
 
+def test_full_engine_runs_all_46_service_checks_where_the_partner_build_is_installed():
+    # The public repo has only the 20 open checks: there this is skipped.
+    pytest.importorskip("cloudwise_scan_core.hosted_service")
+    full, no_ce = service_class(True, full=True), service_class(False, full=True)
+    assert len(full.DETECTOR_METHODS) == 46
+    assert set(full.DETECTOR_METHODS) - set(no_ce.DETECTOR_METHODS) == set(COST_EXPLORER_DETECTORS)
+    assert set(service_class(True).DETECTOR_METHODS) < set(full.DETECTOR_METHODS)
+
+
 def test_local_runtime_savings_cache_never_touches_dynamodb():
     import asyncio
     from cloudwise_scan_core import savings_cache_service
@@ -185,7 +194,7 @@ def test_regions_aggregate_in_requested_order_with_summed_calls():
 
     fake = {"us-east-1": _region_result("us-east-1", 2, {"ec2": 3, "ce": 13}), "eu-west-1": _region_result("eu-west-1", 1)}
     seen = []
-    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce: fake[r]):
+    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce, *rest: fake[r]):
         report = scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], on_region=lambda res: seen.append(res.region),
                                    parallel=1)
     assert [i.resource_id for i in report.findings] == ["us-east-1-0", "us-east-1-1", "eu-west-1-0"]
@@ -198,9 +207,46 @@ def test_a_refused_write_in_any_region_fails_the_whole_scan():
     from cloudcostwise import scan as scan_mod
 
     fake = {"us-east-1": _region_result("us-east-1", 1), "eu-west-1": _region_result("eu-west-1", 0, violations=["ec2:DeleteVolume"])}
-    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce: fake[r]):
+    with patch.object(scan_mod, "scan_region", side_effect=lambda creds, r, ce, *rest: fake[r]):
         with pytest.raises(ReadOnlyViolation, match="ec2:DeleteVolume"):
             scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], parallel=1)
+
+
+def test_the_full_flag_reaches_every_region_worker():
+    from cloudcostwise import scan as scan_mod
+
+    seen = []
+    # The public repo has no partner engine to count: stub the class lookup.
+    with patch.object(scan_mod, "service_class", return_value=SimpleNamespace(DETECTOR_METHODS={})), \
+         patch.object(scan_mod, "scan_region",
+                      side_effect=lambda creds, r, ce, level=None, full=False: seen.append(full) or _region_result(r, 0)):
+        scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], parallel=1, full=True)
+        scan_mod.run_scan(CREDS, ["us-east-1"], parallel=1)
+    assert seen == [True, True, False]
+
+
+def test_denied_reads_and_coverage_notes_reach_the_report():
+    """The engine reports AccessDenied in permission_errors and unenabled AWS
+    inputs in coverage_notes, not in warnings: both must survive the region
+    worker, or a report would claim checks ran that were denied."""
+    import asyncio
+    from cloudcostwise import scan as scan_mod
+
+    engine_result = SimpleNamespace(
+        waste_items=[], warnings=[], errors=[],
+        permission_errors=["fsx: FSx file systems needs fsx:DescribeFileSystems (AccessDenied)"],
+        coverage_notes=[{"source": "compute_optimizer", "state": "not_enrolled"}])
+
+    async def fake_scan(cls, creds, region):
+        return engine_result
+
+    with patch.object(scan_mod, "_scan_region", side_effect=fake_scan):
+        res = scan_mod.scan_region(CREDS, "us-east-1", True)
+    assert res.permission_errors == ["us-east-1: fsx: FSx file systems needs fsx:DescribeFileSystems (AccessDenied)"]
+    assert res.coverage_notes == ["us-east-1: compute_optimizer not_enrolled"]
+    with patch.object(scan_mod, "scan_region", side_effect=lambda *a, **k: res):
+        report = scan_mod.run_scan(CREDS, ["us-east-1"], parallel=1)
+    assert report.permission_errors == res.permission_errors and report.coverage_notes == res.coverage_notes
 
 
 def test_scan_region_result_pickles_for_worker_processes():

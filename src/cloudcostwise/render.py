@@ -153,6 +153,8 @@ def as_json(report: ScanReport) -> str:
         ],
         "warnings": report.warnings,
         "errors": report.errors,
+        "permission_errors": report.permission_errors,
+        "coverage_notes": report.coverage_notes,
         "aws_api_calls": report.api_calls,
         "checks_run": report.entrypoints,
         "checks_open": OPEN_ENTRYPOINTS,
