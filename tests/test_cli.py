@@ -249,6 +249,54 @@ def test_denied_reads_and_coverage_notes_reach_the_report():
     assert report.permission_errors == res.permission_errors and report.coverage_notes == res.coverage_notes
 
 
+def test_a_deliberate_cost_explorer_skip_is_not_reported_as_a_fault():
+    """--no-cost-explorer: the engine sees our own AccessDenied. That must not
+    read as a missing IAM permission, a failed check or a red ERROR line."""
+    import asyncio
+    import logging
+    from cloudcostwise import scan as scan_mod
+    from cloudcostwise.runtime import COST_EXPLORER_SKIP_MARK, quiet_deliberate_skips
+
+    engine_result = SimpleNamespace(
+        waste_items=[], coverage_notes=[],
+        warnings=[f"ce {COST_EXPLORER_SKIP_MARK} (--no-cost-explorer)", "elasticache-cpu: withheld"],
+        errors=[f"savings_opportunities detector error: AccessDenied ce {COST_EXPLORER_SKIP_MARK}", "glue boom"],
+        permission_errors=["RDS: Extended Support Cost Breakdown needs ce:GetCostAndUsage (AccessDeniedException)",
+                           "WORKSPACES: WorkSpaces Pools needs workspaces:DescribeWorkspacesPools (AccessDeniedException)",
+                           "MARKETPLACE: needs aws-marketplace:ViewSubscriptions (AccessDeniedException)",
+                           "EMR: EMR Auto-Termination Policy needs elasticmapreduce:GetAutoTerminationPolicy (AccessDenied)"])
+
+    async def fake_scan(cls, creds, region):
+        return engine_result
+
+    with patch.object(scan_mod, "_scan_region", side_effect=fake_scan):
+        skipped = scan_mod.scan_region(CREDS, "us-east-1", False)
+        kept = scan_mod.scan_region(CREDS, "us-east-1", True)
+    assert skipped.permission_errors == [
+        "us-east-1: WORKSPACES: WorkSpaces Pools needs workspaces:DescribeWorkspacesPools (AccessDeniedException)",
+        "us-east-1: MARKETPLACE: needs aws-marketplace:ViewSubscriptions (AccessDeniedException)",
+        "us-east-1: EMR: EMR Auto-Termination Policy needs elasticmapreduce:GetAutoTerminationPolicy (AccessDenied)"]
+    assert skipped.warnings == ["us-east-1: elasticache-cpu: withheld"]
+    assert skipped.errors == ["us-east-1: glue boom"]
+    assert len(kept.permission_errors) == 4  # with Cost Explorer on, a ce: denial is real
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        quiet_deliberate_skips()
+        quiet_deliberate_skips()  # idempotent
+        assert len([f for f in handler.filters if type(f).__name__ == "_QuietDeliberateSkips"]) == 1
+        logging.getLogger("cloudwise_scan_core.detectors.compute").error(
+            "Error in EKS extended support detection: AccessDenied %s", COST_EXPLORER_SKIP_MARK)
+        logging.getLogger("cloudwise_scan_core.detectors.compute").error("a real failure")
+    finally:
+        root.removeHandler(handler)
+    assert [r.getMessage() for r in records] == ["a real failure"]
+
+
 def test_scan_region_result_pickles_for_worker_processes():
     import pickle
     res = _region_result("us-east-1", 1)

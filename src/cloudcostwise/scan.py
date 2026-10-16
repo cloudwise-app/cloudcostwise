@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Type
@@ -10,11 +11,14 @@ from typing import Callable, Dict, List, Optional, Type
 from cloudwise_scan_core.models import WasteItem
 from cloudwise_scan_core.open_service import OpenWasteDetectionService
 
-from cloudcostwise.runtime import COST_EXPLORER_SERVICE, Credentials, ReadOnlyViolation, read_only_guard
+from cloudcostwise.runtime import COST_EXPLORER_SERVICE, COST_EXPLORER_SKIP_MARK, Credentials, ReadOnlyViolation, read_only_guard
 
 # The one open entrypoint that calls Cost Explorer's billed APIs (RI and
 # Savings Plans recommendations). --no-cost-explorer drops it.
 COST_EXPLORER_DETECTORS = frozenset({"savings_opportunities"})
+# A Cost Explorer IAM action ("ce:GetCostAndUsage"), not a longer prefix that
+# merely ends in "ce" ("aws-marketplace:...").
+_COST_EXPLORER_ACTION = re.compile(r"(?<![\w-])ce:")
 
 
 @dataclass
@@ -123,11 +127,15 @@ def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
             item.region = region
     return RegionResult(
         region=region, findings=list(result.waste_items),
-        warnings=[f"{region}: {w}" for w in result.warnings],
-        errors=[f"{region}: {e}" for e in result.errors],
+        warnings=[f"{region}: {w}" for w in result.warnings if COST_EXPLORER_SKIP_MARK not in w],
+        errors=[f"{region}: {e}" for e in result.errors if COST_EXPLORER_SKIP_MARK not in e],
         calls=dict(guard.calls), blocked=dict(guard.blocked), violations=list(guard.violations),
         seconds=round(time.monotonic() - started, 1),
-        permission_errors=[f"{region}: {p}" for p in result.permission_errors],
+        # With Cost Explorer skipped, its "denials" are our own refusals, already
+        # reported once as a scope note: listing them as missing permissions
+        # would send the user to fix IAM for nothing.
+        permission_errors=[f"{region}: {p}" for p in result.permission_errors
+                           if include_cost_explorer or not _COST_EXPLORER_ACTION.search(p)],
         coverage_notes=[f"{region}: {n.get('source', '?')} {n.get('state', '?')}" for n in result.coverage_notes],
     )
 

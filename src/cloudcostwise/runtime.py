@@ -7,6 +7,7 @@ calls on the user's own credentials and nothing else.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections import Counter
 from contextlib import contextmanager
@@ -58,10 +59,36 @@ def configure_local_runtime() -> None:
     configure_providers(env_detector_provider=lambda: _LocalEnvironment(),
                         metrics_emitter_provider=lambda: null_metrics)
     use_in_memory_savings_cache()
+    quiet_deliberate_skips()
     # No API Gateway 29 s budget here: give slow detectors room instead of
     # reporting their findings as MISSING. A value the user set wins.
     os.environ.setdefault("DETECTOR_TIMEOUT_DEFAULT_SECONDS", "120")
     os.environ.setdefault("DETECTOR_TIMEOUT_HEAVY_SECONDS", "300")
+
+
+COST_EXPLORER_SKIP_MARK = "skipped locally by cloudcostwise"
+
+
+class _QuietDeliberateSkips(logging.Filter):
+    """Drop engine log lines about Cost Explorer calls the user chose to skip.
+
+    The engine logs a denied read at ERROR, and with --no-cost-explorer every
+    such line is our own refusal, not a fault: shown in red, it reads as
+    something broken. The skip is reported once, as a scope note.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return COST_EXPLORER_SKIP_MARK not in record.getMessage()
+        except Exception:  # never lose a record because it failed to format
+            return True
+
+
+def quiet_deliberate_skips() -> None:
+    """Attach the filter to the root handlers (idempotent). Call after logging is configured."""
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, _QuietDeliberateSkips) for f in handler.filters):
+            handler.addFilter(_QuietDeliberateSkips())
 
 
 class _LocalEnvironment:
@@ -164,7 +191,7 @@ def read_only_guard(blocked_services: FrozenSet[str] = frozenset()) -> Iterator[
             log.blocked[service] += 1
             raise ClientError(
                 {"Error": {"Code": "AccessDeniedException",
-                           "Message": f"{service} skipped locally by cloudcostwise (--no-cost-explorer)"}},
+                           "Message": f"{service} {COST_EXPLORER_SKIP_MARK} (--no-cost-explorer)"}},
                 operation_name,
             )
         if not operation_name.startswith(READ_ONLY_PREFIXES):
