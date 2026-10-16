@@ -112,9 +112,47 @@ def _drop_placeholder_profile() -> None:
         os.environ["AWS_PROFILE"] = value  # a real [default] exists: keep the user's setting
 
 
+# An AWS_PROFILE set aside because it was unusable while an explicit profile
+# was passed. Kept so that a later scan WITHOUT a profile (an MCP session can
+# mix both) still fails on it, instead of quietly scanning the default chain.
+_set_aside_env_profile: Optional[str] = None
+
+
+def _set_aside_unusable_env_profile() -> None:
+    """With an explicit profile, drop an empty or missing AWS_PROFILE (CLO-621).
+
+    The scan reads every account with the explicit keys of the profile given,
+    but boto3 still builds its default session from AWS_PROFILE when the
+    engine creates a client: an empty value or a profile that doesn't exist
+    makes every client creation fail, and the scan comes back nearly empty.
+    A valid AWS_PROFILE is left alone: the explicit keys win over it.
+    """
+    global _set_aside_env_profile
+    value = os.environ.pop("AWS_PROFILE", None)  # boto3 reads it while listing profiles
+    if value is None:
+        return
+    name = value.strip()
+    try:
+        available = boto3.Session().available_profiles if name else []
+    except BotoCoreError as e:  # e.g. a malformed ~/.aws/config
+        os.environ["AWS_PROFILE"] = value
+        raise CredentialsError(f"Could not use AWS credentials: {e}") from e
+    if name in available:
+        os.environ["AWS_PROFILE"] = name
+    elif name not in ("", "default"):
+        _set_aside_env_profile = name
+
+
 def resolve_credentials(profile: Optional[str]) -> Credentials:
     """Standard boto3 chain (env vars, profile, SSO, instance role), frozen."""
-    if not profile:
+    if profile:
+        _set_aside_unusable_env_profile()
+    else:
+        if _set_aside_env_profile and "AWS_PROFILE" not in os.environ:
+            raise CredentialsError(
+                f"Could not use AWS credentials: The config profile ({_set_aside_env_profile}) set in "
+                "AWS_PROFILE could not be found. Pass --profile, or fix AWS_PROFILE."
+            )
         _drop_placeholder_profile()
     try:
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()

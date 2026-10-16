@@ -316,6 +316,65 @@ def test_placeholder_default_profile_falls_back_to_the_standard_chain(tmp_path, 
         assert "AWS_PROFILE" not in __import__("os").environ, repr(value)
 
 
+@pytest.mark.parametrize("env_profile", ["", "  ", "no-such-profile"])
+def test_an_unusable_aws_profile_cannot_break_a_scan_given_an_explicit_profile(tmp_path, monkeypatch,
+                                                                              env_profile):
+    """CLO-621: the engine creates clients with explicit keys, but boto3 still
+    builds its default session from AWS_PROFILE: an empty or missing one made
+    every client creation fail and the scan came back nearly empty."""
+    import os
+    import boto3
+    import botocore.exceptions
+    from cloudcostwise import runtime
+
+    cfg = tmp_path / "config"
+    cfg.write_text("[profile client-a]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "none"))
+    monkeypatch.setattr(runtime, "_set_aside_env_profile", None)
+    monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
+    monkeypatch.setenv("AWS_PROFILE", env_profile)
+
+    def engine_client():  # what online.py _get_client does
+        return boto3.client("ec2", aws_access_key_id="AKIATEST", aws_secret_access_key="secret",
+                            region_name="us-east-1")
+
+    with pytest.raises(botocore.exceptions.ProfileNotFound):
+        engine_client()  # the bug, reproduced
+    monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
+    runtime._set_aside_unusable_env_profile()
+    assert "AWS_PROFILE" not in os.environ
+    engine_client()  # now builds fine
+
+    # A later scan with no profile still fails on the bad AWS_PROFILE, never
+    # quietly falling back to the default chain.
+    if env_profile.strip():
+        with pytest.raises(runtime.CredentialsError, match="no-such-profile"):
+            runtime.resolve_credentials(None)
+
+
+def test_a_valid_aws_profile_is_kept_next_to_an_explicit_profile(tmp_path, monkeypatch):
+    import os
+    from cloudcostwise import runtime
+
+    cfg = tmp_path / "config"
+    cfg.write_text("[profile client-a]\nregion = us-east-1\n[profile mine]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(runtime, "_set_aside_env_profile", None)
+    monkeypatch.setenv("AWS_PROFILE", "mine")
+    runtime._set_aside_unusable_env_profile()
+    assert os.environ["AWS_PROFILE"] == "mine" and runtime._set_aside_env_profile is None
+    monkeypatch.setenv("AWS_PROFILE", " mine ")  # kept, and usable
+    runtime._set_aside_unusable_env_profile()
+    assert os.environ["AWS_PROFILE"] == "mine"
+
+    cfg.write_text("[profile broken\nregion = us-east-1\n")  # malformed config: a clear error, env restored
+    monkeypatch.setenv("AWS_PROFILE", "mine")
+    with pytest.raises(runtime.CredentialsError, match="Could not use AWS credentials"):
+        runtime._set_aside_unusable_env_profile()
+    assert os.environ["AWS_PROFILE"] == "mine"
+
+
 def test_existing_default_or_named_profile_is_kept(tmp_path, monkeypatch):
     import os
     from cloudcostwise import runtime
