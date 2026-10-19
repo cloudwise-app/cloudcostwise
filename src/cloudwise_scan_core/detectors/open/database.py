@@ -59,6 +59,81 @@ ELASTICACHE_NODE_MEMORY_GIB = {
 ELASTICACHE_MEMORY_HEADROOM_MAX_PCT = 75.0
 
 
+# CLO-579: Memcached max_cache_memory per node type, in MiB -- the "Memcached
+# node-type-specific parameters" table (default, not modifiable) for every
+# node type that appears in ``downsize_map`` AND in that table. cache.r7g.* and
+# cache.m7g.* are not in the AWS table, so they are MISSING (never borrowed from
+# the r6g/m6g rows). The table's column header says "megabytes"; cache.t3.micro
+# lists 512 for its 0.5 GiB of RAM, so the figures are read as MiB.
+# Source: AWS ElastiCache User Guide, Memcached parameter groups,
+# https://github.com/awsdocs/amazon-elasticache-docs/blob/master/doc_source/memcache/ParameterGroups.Memcached.md
+# (read 2026-10-17).
+ELASTICACHE_MEMCACHED_MAX_CACHE_MEMORY_MIB = {
+    'cache.r6g.2xlarge': 54084, 'cache.r6g.xlarge': 26953, 'cache.r6g.large': 13387,
+    'cache.r5.2xlarge': 54084, 'cache.r5.xlarge': 26953, 'cache.r5.large': 13387,
+    'cache.m6g.2xlarge': 26671, 'cache.m6g.xlarge': 13248, 'cache.m6g.large': 6537,
+    'cache.m5.xlarge': 13248, 'cache.m5.large': 6537,
+    'cache.t4g.medium': 3164, 'cache.t4g.small': 1402, 'cache.t4g.micro': 512,
+    'cache.t3.medium': 3364, 'cache.t3.small': 1402, 'cache.t3.micro': 512,
+}
+
+# CLO-579: AWS holds memcached_connections_overhead (default 100 MB, modifiable)
+# out of max_cache_memory, leaving the rest for items. A cluster on a custom
+# parameter group with a larger overhead has LESS usable memory than this gate
+# assumes, and the gate cannot see it (the parameter group is not read). For
+# the small targets (t3/t4g) a large custom overhead can erase the 25%
+# headroom entirely -- a known limit, not something the cap absorbs. The gate
+# reads the window PEAK (CLO-623): online, the max of the busiest node's daily
+# Maximums (per CacheNodeId); offline, the max of the export's one cluster-level
+# series (its Maximum, else its hourly Average).
+MEMCACHED_DEFAULT_CONNECTIONS_OVERHEAD_MIB = 100
+
+
+def _memcached_item_memory_ok(metrics, node_type, target_type, period_seconds, data_provider, cluster_id):
+    """CLO-579: the Memcached counterpart of the CLO-572 memory gate, for
+    ``(ok, pct_of_current_node)``. Redis/Valkey publish
+    DatabaseMemoryUsagePercentage; Memcached publishes only
+    BytesUsedForCacheItems, so the PEAK item bytes over the window (CLO-623:
+    not the mean, which let a refilling cache read as fitting) are compared
+    against the target node's usable memory (max_cache_memory minus the default connection
+    overhead). Same rules as CLO-572: withheld above
+    ``ELASTICACHE_MEMORY_HEADROOM_MAX_PCT`` of the TARGET, 75% datapoint
+    coverage, and an unknown node type or sparse data is MISSING (noted under
+    the 'elasticache-memory' key), never read as fitting."""
+    datapoints = metrics.item_bytes_datapoints
+    window_days = metrics.item_bytes_window_days or metrics.period_days
+    note = getattr(data_provider, '_note_idle_verdict_missing', None)
+
+    def _missing(reason):
+        if callable(note):
+            note(
+                'elasticache-memory', cluster_id, reason,
+                verdict='oversized', evidence='memory metrics',
+            )
+        return False, None
+
+    if not datapoints:
+        return _missing(
+            getattr(metrics, 'item_bytes_missing_reason', None) or "no BytesUsedForCacheItems datapoints"
+        )
+    if not has_min_coverage(datapoints, window_days, period_seconds):
+        return _missing("BytesUsedForCacheItems under 75% coverage")
+
+    current_max = ELASTICACHE_MEMCACHED_MAX_CACHE_MEMORY_MIB.get(node_type)
+    target_max = ELASTICACHE_MEMCACHED_MAX_CACHE_MEMORY_MIB.get(target_type)
+    if not current_max or not target_max:
+        return _missing(f"no Memcached max_cache_memory on file for {node_type} or {target_type}")
+    current_usable = current_max - MEMCACHED_DEFAULT_CONNECTIONS_OVERHEAD_MIB
+    target_usable = target_max - MEMCACHED_DEFAULT_CONNECTIONS_OVERHEAD_MIB
+    if current_usable <= 0 or target_usable <= 0:
+        return _missing(f"no usable Memcached memory for {node_type} or {target_type}")
+
+    used_mib = metrics.item_bytes_peak / (1024 * 1024)
+    current_pct = used_mib / current_usable * 100.0
+    projected_pct = used_mib / target_usable * 100.0
+    return projected_pct <= ELASTICACHE_MEMORY_HEADROOM_MAX_PCT, current_pct
+
+
 def _elasticache_oversized_memory_ok(metrics, node_type, target_type, period_seconds, data_provider, cluster_id, engine=None):
     """CLO-572: whether the measured memory comfortably fits ``target_type``
     after oversized_elasticache's one-tier downsize. Returns ``(ok, avg_pct)``.
@@ -71,11 +146,13 @@ def _elasticache_oversized_memory_ok(metrics, node_type, target_type, period_sec
     node type absent from ``ELASTICACHE_NODE_MEMORY_GIB``. The same 75%
     coverage rule CLO-559 set for CPU applies here.
 
-    ``engine`` names the no-datapoints case precisely for Memcached, which
-    AWS never publishes DatabaseMemoryUsagePercentage for (Redis OSS/Valkey
-    only) -- every Memcached cluster withholds here, by design, not by
-    accident; see CLO-572's Memcached follow-up ticket for a
-    BytesUsedForCache-based path."""
+    Memcached (``engine``) never has DatabaseMemoryUsagePercentage (Redis
+    OSS/Valkey only), so it takes ``_memcached_item_memory_ok`` instead
+    (CLO-579)."""
+    if (engine or '').strip().lower() == 'memcached':
+        return _memcached_item_memory_ok(
+            metrics, node_type, target_type, period_seconds, data_provider, cluster_id,
+        )
     mem_datapoints = metrics.memory_datapoints
     mem_window_days = metrics.memory_window_days or metrics.period_days
     note = getattr(data_provider, '_note_idle_verdict_missing', None)
@@ -89,8 +166,6 @@ def _elasticache_oversized_memory_ok(metrics, node_type, target_type, period_sec
         return False, None
 
     if mem_datapoints is None or not has_min_coverage(mem_datapoints, mem_window_days, period_seconds):
-        if not mem_datapoints and (engine or '').strip().lower() == 'memcached':
-            return _missing("Memcached publishes no DatabaseMemoryUsagePercentage")
         return _missing(
             "no DatabaseMemoryUsagePercentage datapoints" if not mem_datapoints
             else "DatabaseMemoryUsagePercentage under 75% coverage"
@@ -1117,6 +1192,9 @@ class OpenDatabaseDetectorsMixin:
                         # deleted namesake's.
                         create_times={cluster.cluster_id: getattr(cluster, 'created_time', None)},
                         idle_window_days=ELASTICACHE_IDLE_WINDOW_DAYS,  # CLO-485
+                        # CLO-579: the Memcached item-bytes read is opt-in.
+                        **({'memcached_node_counts': {cluster.cluster_id: cluster.num_nodes}}
+                           if (cluster.engine or '').strip().lower() == 'memcached' else {}),
                     )
                     
                     metrics = metrics_map.get(cluster.cluster_id)
@@ -1258,6 +1336,15 @@ class OpenDatabaseDetectorsMixin:
                                         engine=cluster.engine,
                                     )
 
+                                is_memcached = (cluster.engine or '').strip().lower() == 'memcached'
+                                memory_metric = (
+                                    'BytesUsedForCacheItems' if is_memcached
+                                    else 'DatabaseMemoryUsagePercentage'
+                                )
+                                # CLO-623: Memcached gates on the window peak,
+                                # Redis/Valkey on the average; the text and
+                                # metadata say which.
+                                mem_basis = 'peak' if is_memcached else 'average'
                                 if savings >= settings.min_waste_threshold_usd and mem_ok:
                                     waste_items.append(WasteItem(
                                         id=str(uuid.uuid4()),
@@ -1267,7 +1354,7 @@ class OpenDatabaseDetectorsMixin:
                                         title="Oversized ElastiCache Cluster",
                                         description=(
                                             f"Cluster '{cluster.cluster_id}' ({cluster.node_type}, {cluster.num_nodes} node(s)) "
-                                            f"has {cpu_avg:.1f}% average CPU and {mem_avg:.1f}% average memory. "
+                                            f"has {cpu_avg:.1f}% average CPU and {mem_avg:.1f}% {mem_basis} memory. "
                                             f"Consider downsizing to {recommended_type}."
                                         ),
                                         monthly_savings=savings,
@@ -1277,7 +1364,7 @@ class OpenDatabaseDetectorsMixin:
                                             'detection': (
                                                 f'Average CPU utilization is {cpu_avg:.1f}% over 7 days with '
                                                 f'{metrics.current_connections_avg:.0f} avg connections. '
-                                                f'Average memory utilization is {mem_avg:.1f}% of the current node. '
+                                                f'{mem_basis.capitalize()} memory utilization is {mem_avg:.1f}% of the current node. '
                                                 f'Current type: {cluster.node_type}.'
                                             ),
                                             'threshold': (
@@ -1297,8 +1384,12 @@ class OpenDatabaseDetectorsMixin:
                                             ),
                                             'risk': (
                                                 'Downsizing requires a maintenance window (brief failover for Redis cluster mode). '
-                                                'Re-check DatabaseMemoryUsagePercentage after the change; the gate above is an '
-                                                'average over the window and cannot see a traffic spike.'
+                                                f'Re-check {memory_metric} after the change; ' + (
+                                                    'the gate above is the peak over the window, and '
+                                                    'cannot see growth beyond it.' if is_memcached else
+                                                    'the gate above is an average over the window and '
+                                                    'cannot see a traffic spike.'
+                                                )
                                             ),
                                         },
                                         metadata={
@@ -1306,7 +1397,13 @@ class OpenDatabaseDetectorsMixin:
                                             'current_type': cluster.node_type,
                                             'recommended_type': recommended_type,
                                             'cpu_avg': round(cpu_avg, 1),
+                                            # Kept under its old key; for Memcached it
+                                            # is the PEAK % of usable item memory
+                                            # (``memory_pct_basis``), for Redis/Valkey
+                                            # the average % of node RAM.
                                             'memory_pct_avg': round(mem_avg, 1),
+                                            'memory_pct_basis': mem_basis,
+                                            'memory_metric': memory_metric,
                                             'connections_avg': round(metrics.current_connections_avg, 0),
                                             'engine': cluster.engine,
                                             'detection_mode': data_provider.provider_type,

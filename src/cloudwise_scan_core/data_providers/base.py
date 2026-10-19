@@ -523,6 +523,7 @@ class WasteDataProvider(ABC):
         days: int = 14,
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
+        memcached_node_counts: Optional[Dict[str, int]] = None,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """
         Get CloudWatch metrics for ElastiCache clusters.
@@ -641,6 +642,13 @@ class WasteDataProvider(ABC):
         """
         pass
     
+    @abstractmethod
+    async def get_opensearch_cross_cluster_connections(self, domain_name: str) -> Optional[bool]:
+        """CLO-611: whether ``domain_name`` is on either end of a
+        cross-cluster connection. True = yes, False = verified no, None =
+        unknown (which withholds the idle verdict)."""
+        pass
+
     # =========================================================================
     # CloudWatch Logs
     # =========================================================================

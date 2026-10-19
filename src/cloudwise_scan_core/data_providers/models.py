@@ -639,6 +639,23 @@ class ElastiCacheMetricsData:
     # shorter window).
     memory_datapoints: Optional[int] = None
     memory_window_days: Optional[int] = None
+    # CLO-579: Memcached's memory signal. AWS publishes no
+    # DatabaseMemoryUsagePercentage (nor BytesUsedForCache) for Memcached; its
+    # item-memory gauge is BytesUsedForCacheItems. ``item_bytes_used`` is that
+    # series' average (bytes); ``item_bytes_datapoints`` / ``_window_days``
+    # follow the memory_datapoints convention: None = not reported, 0 = no
+    # data (MISSING, never read as 0 bytes used).
+    item_bytes_used: float = 0.0
+    item_bytes_datapoints: Optional[int] = None
+    item_bytes_window_days: Optional[int] = None
+    # CLO-623: what the oversized gate reads -- the window PEAK of
+    # BytesUsedForCacheItems (online: max of each node's daily Maximums, on
+    # the busiest node), so a refilling cache is judged on its working set,
+    # not its mean. ``item_bytes_missing_reason`` names why the series is
+    # MISSING when the provider knows (e.g. ListMetrics denied); None means
+    # the plain "no datapoints" note.
+    item_bytes_peak: float = 0.0
+    item_bytes_missing_reason: Optional[str] = None
 
 
 @dataclass
@@ -739,6 +756,14 @@ class OpenSearchDomainData:
     # domain. Providers never set status 'Deleted' (status is only
     # available/processing), so detectors must read this flag.
     deleted: bool = False
+    # CLO-611: UltraWarm / cold data is NOT counted by SearchableDocuments
+    # ("across all data nodes"; warm has its own WarmSearchableDocuments), so
+    # the no-documents idle rule needs to know these are off. None = unknown
+    # (MISSING): the rule is withheld, never read as "off".
+    # (The no-documents rule was replaced by the client-traffic rule; the
+    # warm/cold veto stays.)
+    warm_enabled: Optional[bool] = None
+    cold_storage_enabled: Optional[bool] = None
 
 
 @dataclass
@@ -768,6 +793,34 @@ class OpenSearchMetricsData:
     # IndexingRate datapoints. None = not reported.
     search_datapoints: Optional[int] = None
     indexing_datapoints: Optional[int] = None
+    # CLO-611: AWS/ES SearchableDocuments, daily Maximum, window maximum. A
+    # measured 0 means the hot data nodes hold no searchable documents at all
+    # (system indices included, whichever way AWS counts them). None = not
+    # measured (MISSING, never zero).
+    searchable_documents_max: Optional[float] = None
+    searchable_documents_datapoints: Optional[int] = None
+    # CLO-611 rework: client traffic = AWS/ES OpenSearchRequests minus
+    # InvalidHostHeaderRequests, per day (daily Sums). On an unused fixture
+    # domain every OpenSearchRequests request was an invalid-host-header
+    # request (internet scanners), so the difference was exactly 0 every day,
+    # while SearchRate (~90/day) and 2xx (~14,000/day) carried internal
+    # traffic. None = indeterminate (MISSING, never zero); the reason says why.
+    client_requests_total: Optional[float] = None
+    client_requests_datapoints: Optional[int] = None
+    client_requests_unknown_reason: Optional[str] = None
+    # A negative daily Sum (a counter reset, seen on a live fixture's
+    # SearchRate and IndexingRate) can hide traffic: any one withholds idle.
+    negative_datapoints_seen: bool = False
+    # AWS/ES ClusterStatus.red, daily Maximum: window maximum and coverage.
+    cluster_red_max: Optional[float] = None
+    cluster_red_datapoints: Optional[int] = None
+    # AWS/ES ClusterUsedSpace (MiB), daily Maximum: window maximum, coverage.
+    cluster_used_space_mib_max: Optional[float] = None
+    cluster_used_space_datapoints: Optional[int] = None
+    # AWS/ES FreeStorageSpace (MiB), daily Minimum (the node with the least
+    # free space): window minimum and coverage.
+    free_storage_min_mib: Optional[float] = None
+    free_storage_min_datapoints: Optional[int] = None
 
 
 @dataclass
@@ -1864,6 +1917,12 @@ class BeanstalkMetricsData:
     missing_reason: str = ''            # why a measurement is MISSING, when it is
 
 
+# CLO-592 follow-up: AWS publishes no AWS/GlobalAccelerator series for an
+# accelerator with no traffic, and ListMetrics covers the past two weeks.
+GA_IDLE_SIGNAL_NO_SERIES = 'list_metrics_no_series'
+GA_IDLE_MIN_AGE_DAYS = 14
+
+
 @dataclass
 class GlobalAcceleratorData:
     """Normalized Global Accelerator data for waste detection."""
@@ -1884,6 +1943,11 @@ class GlobalAcceleratorData:
     processed_bytes_in_sum: Optional[float] = 0.0
     processed_bytes_out_sum: Optional[float] = 0.0
     metrics_period_days: int = 30
+    # CLO-592 follow-up: how the zero sums were established. None: summed
+    # from published datapoints. GA_IDLE_SIGNAL_NO_SERIES: no datapoints,
+    # and a successful ListMetrics answer listed no series for an
+    # accelerator at least GA_IDLE_MIN_AGE_DAYS old.
+    idle_signal: Optional[str] = None
 
 
 @dataclass(frozen=True)

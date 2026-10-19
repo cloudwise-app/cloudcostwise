@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 37 at L1, 37 at L2, 17 at L3.
+Summary for the checks in this repository: 35 at L1, 37 at L2, 19 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -31,12 +31,12 @@ proven checks only.
 | `dynamodb_no_deletion_protection` | L3 |  | covered |
 | `ecr_no_lifecycle_policy` | L3 |  | covered |
 | `eip_on_stopped_instance` | L2 |  | covered |
-| `elasticache_data_tiering_opportunity` | L1 |  |  |
+| `elasticache_data_tiering_opportunity` | L2 |  | none |
 | `elasticache_engine_migration` | L2 |  | none |
 | `elasticache_extended_support_cost` | L2 |  | none |
 | `elasticache_replication_waste` | L2 |  |  |
 | `elasticache_serverless_optimization` | L1 |  |  |
-| `empty_log_group` | L2 |  | none |
+| `empty_log_group` | L3 |  | none |
 | `excessive_retention_log_group` | L2 |  | partial |
 | `gp2_migration` | L3 |  |  |
 | `high_lcu_cost_alb` | L1 | yes |  |
@@ -84,7 +84,7 @@ proven checks only.
 | `oversized_sagemaker_endpoint` | L2 |  | partial |
 | `oversized_workspace` | L1 |  |  |
 | `previous_gen_sagemaker_instance` | L2 |  | none |
-| `rds_extended_support_cost` | L1 |  |  |
+| `rds_extended_support_cost` | L2 |  | covered |
 | `rds_no_deletion_protection` | L3 |  | covered |
 | `rds_publicly_accessible` | L3 |  | covered |
 | `resource_without_backup_coverage` | L3 |  | covered |
@@ -93,7 +93,7 @@ proven checks only.
 | `ri_opportunity_opensearch` | L1 | yes |  |
 | `ri_opportunity_rds` | L1 | yes |  |
 | `ri_opportunity_redshift` | L1 | yes |  |
-| `s3_empty_bucket` | L2 |  | none |
+| `s3_empty_bucket` | L3 |  | none |
 | `s3_high_request_and_transfer_cost` | L1 | yes |  |
 | `s3_no_default_encryption` | L1 | yes |  |
 | `s3_rapid_growth` | L1 |  |  |

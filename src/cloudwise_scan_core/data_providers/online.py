@@ -43,6 +43,7 @@ from cloudwise_scan_core.cpu_sizing import (
     has_min_coverage,
     is_as_old_as_window,
     nearest_rank_percentile,
+    resource_age_days,
     summarize_ecs_utilization,
     summarize_hourly_cpu,
 )
@@ -140,6 +141,8 @@ from cloudwise_scan_core.data_providers.models import (
     BeanstalkMetricsData,
     ApiGatewayRestApiData,
     beanstalk_rds_marks,
+    GA_IDLE_MIN_AGE_DAYS,
+    GA_IDLE_SIGNAL_NO_SERIES,
     GlobalAcceleratorData,
 )
 
@@ -4243,14 +4246,103 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         
         return clusters
     
+    # CLO-623: ListMetrics page cap for the Memcached per-node listing (one
+    # page holds 500 metrics; a cluster has at most 60 nodes).
+    _MEMCACHED_LIST_METRICS_MAX_PAGES = 10
+    _MEMCACHED_LIST_METRICS_DENIED_REASON = (
+        "cloudwatch:ListMetrics denied (granted from monitoring template 1.29.0; an older role or an SCP blocks it)"
+    )
+
+    def _read_memcached_item_bytes(self, cloudwatch, cluster_id, expected_nodes, start_time, end_time, own):
+        """CLO-579/CLO-623: a Memcached cluster's per-node BytesUsedForCacheItems,
+        for ``(busiest node's mean of daily Averages, busiest node's window peak
+        of daily Maximums, sparsest node's datapoint count, missing reason)``.
+
+        AWS calculates the Memcached engine metrics "at the cache node level"
+        (CacheMetrics.Memcached in the ElastiCache User Guide) and its own
+        GetMetricStatistics example for a node passes CacheClusterId AND
+        CacheNodeId (CloudWatchMetrics in the same guide), so the node ids come
+        from ListMetrics filtered on the cluster.
+
+        Never raises: any failure is a zero count (MISSING) with a reason. An
+        AccessDenied is recorded once per provider through
+        ``_record_permission_error`` (CLO-368), the Kinesis/GA pattern, so a
+        region full of Memcached clusters yields one permission error, not one
+        per cluster."""
+        try:
+            node_ids = set()
+            list_kwargs: Dict[str, Any] = {
+                'Namespace': 'AWS/ElastiCache',
+                'MetricName': 'BytesUsedForCacheItems',
+                'Dimensions': [{'Name': 'CacheClusterId', 'Value': cluster_id}],
+            }
+            for _ in range(self._MEMCACHED_LIST_METRICS_MAX_PAGES):
+                listed = cloudwatch.list_metrics(**list_kwargs)
+                for m in listed.get('Metrics', []):
+                    for dim in m.get('Dimensions', []):
+                        if dim.get('Name') == 'CacheNodeId' and dim.get('Value'):
+                            node_ids.add(dim['Value'])
+                token = listed.get('NextToken')
+                if not token:
+                    break
+                list_kwargs = {**list_kwargs, 'NextToken': token}
+            else:
+                return 0.0, 0.0, 0, "BytesUsedForCacheItems ListMetrics answer truncated"
+            if not node_ids:
+                return 0.0, 0.0, 0, None
+            if len(node_ids) < expected_nodes:
+                return 0.0, 0.0, 0, (
+                    f"BytesUsedForCacheItems listed for {len(node_ids)} of {expected_nodes} nodes"
+                )
+            node_avgs, node_peaks, node_counts = [], [], []
+            for node_id in sorted(node_ids):
+                node_resp = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/ElastiCache',
+                    MetricName='BytesUsedForCacheItems',
+                    Dimensions=[
+                        {'Name': 'CacheClusterId', 'Value': cluster_id},
+                        {'Name': 'CacheNodeId', 'Value': node_id},
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,
+                    Statistics=['Average', 'Maximum'],
+                )
+                # A datapoint without a Maximum says nothing about the peak:
+                # it is not counted toward coverage (never read as 0 bytes).
+                node_dps = [dp for dp in own(node_resp) if dp.get('Maximum') is not None]
+                node_counts.append(len(node_dps))
+                node_peaks.append(max((dp['Maximum'] for dp in node_dps), default=0.0))
+                avgs = [dp['Average'] for dp in node_dps if dp.get('Average') is not None]
+                node_avgs.append(sum(avgs) / len(avgs) if avgs else 0.0)
+            return max(node_avgs), max(node_peaks), min(node_counts), None
+        except Exception as e:
+            operation = getattr(e, 'operation_name', '') or 'ListMetrics'
+            permission = f"cloudwatch:{operation}"
+            if self._is_access_denied(e):
+                if not getattr(self, '_memcached_item_bytes_denial_recorded', False):
+                    self._memcached_item_bytes_denial_recorded = True
+                    self._record_permission_error(
+                        resource="ElastiCache Memcached item memory", permission=permission, error=e,
+                    )
+                if operation == 'ListMetrics':
+                    return 0.0, 0.0, 0, self._MEMCACHED_LIST_METRICS_DENIED_REASON
+                return 0.0, 0.0, 0, f"{permission} denied"
+            self._warn_swallowed("ElastiCache Memcached item memory", permission, e)
+            return 0.0, 0.0, 0, f"BytesUsedForCacheItems read failed ({self._error_label(e)})"
+
     async def get_elasticache_metrics(
         self,
         cluster_ids: List[str],
         days: int = 14,
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
+        memcached_node_counts: Optional[Dict[str, int]] = None,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """Get CloudWatch metrics for ElastiCache clusters.
+
+        CLO-579: ``memcached_node_counts`` ({cluster id: NumCacheNodes}) names
+        the Memcached clusters whose per-node BytesUsedForCacheItems is read.
 
         CLO-485: ``is_idle`` needs the daily CurrConnections series to cover
         75% of ``idle_window_days`` (``days`` when not given), and never zero
@@ -4354,6 +4446,32 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     bytes_dps = _own(bytes_resp)
                     bytes_used = sum(dp['Average'] for dp in bytes_dps) / len(bytes_dps) if bytes_dps else 0
 
+                    # CLO-579: Memcached's item-memory gauge, BytesUsedForCacheItems,
+                    # published per node (CacheClusterId + CacheNodeId). Read only
+                    # for the Memcached clusters the caller names in
+                    # ``memcached_node_counts`` (Redis/Valkey publish none).
+                    # CLO-623: the gate reads the PEAK -- the window maximum of
+                    # each node's daily Maximums, on the busiest node -- not the
+                    # mean of daily Averages, which let a cache still refilling
+                    # after a flush/reboot (low early days, high late days) read
+                    # as fitting a node half its size. Coverage is the SPARSEST
+                    # node's count of datapoints that carry a Maximum.
+                    # Everything here is MISSING on any doubt -- ListMetrics
+                    # denied (recorded as a permission error), a node missing
+                    # from the listing (ListMetrics only lists metrics with
+                    # recent data), a truncated listing, a sparse node, or any
+                    # other failure (timeout, connection) -- and its failure
+                    # never touches the other metrics or the other clusters.
+                    item_bytes = 0.0
+                    item_peak = 0.0
+                    item_count = 0
+                    item_reason = None
+                    expected_nodes = (memcached_node_counts or {}).get(cluster_id)
+                    if expected_nodes:
+                        item_bytes, item_peak, item_count, item_reason = self._read_memcached_item_bytes(
+                            cloudwatch, cluster_id, expected_nodes, start_time, end_time, _own,
+                        )
+
                     # CLO-485: "0 connections" must be measured, not
                     # defaulted. An empty or sparse CurrConnections series
                     # (a new region, a metrics outage) averages to 0 above;
@@ -4400,6 +4518,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         cpu_datapoints=len(cpu_dps),
                         # CLO-572: the oversized memory gate's coverage count.
                         memory_datapoints=len(mem_dps),
+                        item_bytes_used=round(item_bytes, 2),
+                        item_bytes_peak=round(item_peak, 2),
+                        item_bytes_datapoints=item_count,
+                        item_bytes_missing_reason=item_reason,
                     )
                 except ClientError as e:
                     # CLO-485: a failed read is MISSING, not zero. It used to
@@ -4982,6 +5104,19 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         ebs_volume_type=ebs_options.get('VolumeType', ''),
                         ebs_volume_size_gb=ebs_options.get('VolumeSize', 0),
                         deleted=bool(domain.get('Deleted', False)),
+                        # CLO-611: DescribeDomain omits WarmEnabled and
+                        # ColdStorageOptions when the feature was never
+                        # requested; a non-empty ClusterConfig makes the
+                        # absence an answer, an empty one is unknown.
+                        warm_enabled=(
+                            bool(cluster_config.get('WarmEnabled') or cluster_config.get('WarmCount')
+                                 or cluster_config.get('WarmType'))
+                            if cluster_config else None
+                        ),
+                        cold_storage_enabled=(
+                            bool((cluster_config.get('ColdStorageOptions') or {}).get('Enabled', False))
+                            if cluster_config else None
+                        ),
                     ))
                 except ClientError as e:
                     logger.warning(f"Error describing OpenSearch domain {domain_name}: {e}")
@@ -5069,6 +5204,72 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     if idx_dps:
                         idx_avg = sum(dp.get('Average', 0) for dp in idx_dps) / len(idx_dps)
                     
+                    # CLO-611 idle signals, each its own read so one failure
+                    # leaves only that signal MISSING (None), never zero, and
+                    # keeps the domain's other metrics.
+                    def _daily(metric_name: str, stat: str) -> Optional[List[Dict[str, Any]]]:
+                        try:
+                            resp = cloudwatch.get_metric_statistics(
+                                Namespace='AWS/ES', MetricName=metric_name,
+                                Dimensions=dims, StartTime=start_time, EndTime=end_time,
+                                Period=period, Statistics=[stat],
+                            )
+                            return resp.get('Datapoints', []) or []
+                        except ClientError as read_err:
+                            if self._is_access_denied(read_err):
+                                self._record_permission_error(
+                                    resource="OpenSearch Metrics (per-resource)",
+                                    permission="cloudwatch:GetMetricStatistics", error=read_err,
+                                )
+                            logger.warning(
+                                f"Error fetching OpenSearch {metric_name} for {domain_name}: {read_err}"
+                            )
+                            return None
+
+                    def _window(points, stat, pick):
+                        if points is None:
+                            return None, None
+                        if not points:
+                            return None, 0
+                        return pick(dp.get(stat, 0) for dp in points), len(points)
+
+                    # SearchableDocuments, cluster-level, daily Maximum. Kept
+                    # for the finding's evidence; no longer a gate (system
+                    # indices count: 2 on the unused fixture, every day).
+                    docs_max, docs_dps = _window(
+                        _daily('SearchableDocuments', 'Maximum'), 'Maximum', max)
+
+                    # Client traffic: OpenSearchRequests ("the number of
+                    # requests made to the OpenSearch cluster") minus
+                    # InvalidHostHeaderRequests (requests with an invalid or
+                    # missing host header), day by day. AWS rejects those only on
+                    # public domains without a restrictive access policy; on VPC or
+                    # restricted domains a client addressing the domain by IP (or a
+                    # proxy rewriting Host) is served yet still counted here, so the
+                    # subtraction can hide that traffic. Backstops: no indexing,
+                    # ClusterUsedSpace <= 10 MiB, SearchRate guard. Unverified at L2.
+                    osr_points = _daily('OpenSearchRequests', 'Sum')
+                    ihh_points = _daily('InvalidHostHeaderRequests', 'Sum')
+                    client_total, client_dps, client_reason = self._opensearch_client_requests(
+                        osr_points, ihh_points,
+                    )
+
+                    red_max, red_dps = _window(
+                        _daily('ClusterStatus.red', 'Maximum'), 'Maximum', max)
+                    used_max, used_dps = _window(
+                        _daily('ClusterUsedSpace', 'Maximum'), 'Maximum', max)
+                    free_min, free_min_dps = _window(
+                        _daily('FreeStorageSpace', 'Minimum'), 'Minimum', min)
+
+                    negative_seen = any(
+                        (dp.get(stat) or 0) < 0
+                        for points, stat in (
+                            (search_dps, 'Sum'), (idx_dps, 'Average'),
+                            (osr_points or [], 'Sum'), (ihh_points or [], 'Sum'),
+                        )
+                        for dp in points
+                    )
+
                     # CPUUtilization (avg + max), HOURLY since CLO-480. It was
                     # daily (Period=86400) and the gate was the window max of
                     # the daily Maximums, so one spike vetoed the whole window.
@@ -5133,6 +5334,18 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         is_idle=search_covered and search_total == 0,
                         search_datapoints=len(search_dps),
                         indexing_datapoints=len(idx_dps),
+                        searchable_documents_max=docs_max,
+                        searchable_documents_datapoints=docs_dps,
+                        client_requests_total=client_total,
+                        client_requests_datapoints=client_dps,
+                        client_requests_unknown_reason=client_reason,
+                        negative_datapoints_seen=negative_seen,
+                        cluster_red_max=red_max,
+                        cluster_red_datapoints=red_dps,
+                        cluster_used_space_mib_max=used_max,
+                        cluster_used_space_datapoints=used_dps,
+                        free_storage_min_mib=free_min,
+                        free_storage_min_datapoints=free_min_dps,
                     )
                 except ClientError as e:
                     if self._is_access_denied(e):
@@ -5154,7 +5367,179 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             logger.error(f"Error fetching OpenSearch metrics: {e}")
         
         return metrics
-    
+
+    @staticmethod
+    def _opensearch_client_requests(
+        osr_points: Optional[List[Dict[str, Any]]],
+        ihh_points: Optional[List[Dict[str, Any]]],
+    ) -> Tuple[Optional[float], Optional[int], Optional[str]]:
+        """CLO-611: (client request total, OpenSearchRequests days, reason).
+
+        Client requests on a day = OpenSearchRequests Sum minus
+        InvalidHostHeaderRequests Sum. A day with OpenSearchRequests 0 has no
+        client traffic whatever the other series says (VPC or restricted
+        domains may never publish InvalidHostHeaderRequests). Otherwise the
+        day needs its InvalidHostHeaderRequests datapoint, both values
+        non-negative and the difference non-negative; anything else makes
+        the total indeterminate (None, with a reason): MISSING, never zero."""
+        if osr_points is None:
+            return None, None, "OpenSearchRequests read failed"
+        if not osr_points:
+            return None, 0, "no OpenSearchRequests datapoints"
+        invalid_by_day = {
+            dp.get('Timestamp'): dp.get('Sum')
+            for dp in (ihh_points or [])
+        }
+        total = 0.0
+        for dp in osr_points:
+            requests = dp.get('Sum')
+            if requests is None or requests < 0:
+                return None, len(osr_points), "negative or empty OpenSearchRequests datapoint"
+            if requests == 0:
+                continue
+            invalid = invalid_by_day.get(dp.get('Timestamp'))
+            if invalid is None:
+                return None, len(osr_points), (
+                    "InvalidHostHeaderRequests read failed" if ihh_points is None
+                    else "no InvalidHostHeaderRequests datapoint for a day with requests"
+                )
+            if invalid < 0 or invalid > requests:
+                return None, len(osr_points), "inconsistent InvalidHostHeaderRequests datapoint"
+            total += requests - invalid
+        return total, len(osr_points), None
+
+    # CLO-611: a connection in these states no longer links two domains.
+    _OPENSEARCH_DEAD_CONNECTION_STATES = frozenset({'REJECTED', 'DELETED'})
+    # Bounded pagination for the connection listings and ListMetrics.
+    _OPENSEARCH_CCS_MAX_PAGES = 20
+    # AWS/ES cross-cluster search metrics (dimension ConnectionId, per the
+    # CloudWatch metrics page): source-domain and destination-domain series.
+    _OPENSEARCH_CCS_METRICS = (
+        'CrossClusterOutboundConnections',
+        'CrossClusterOutboundRequests',
+        'CrossClusterInboundRequests',
+        # Cross-cluster replication: follower and leader series.
+        'CrossClusterOutboundReplicationRequests',
+        'CrossClusterInboundReplicationRequests',
+    )
+
+    def _opensearch_connected_domains(self) -> Optional[set]:
+        """Domain names on either end of a live cross-cluster connection in
+        this region, from DescribeOutboundConnections and
+        DescribeInboundConnections (unfiltered, paginated, matched here so no
+        filter-name wire value is guessed). None = unknown: a denied or
+        failed call. Cached for the provider's life (one pair of calls per
+        region scan). A denial sets ``_os_ccs_denied`` and is NOT recorded as
+        a permission error: the shipped role template does not grant these
+        actions, so the notice could not be cleared by a stack update; the
+        caller falls back to the ListMetrics evidence instead."""
+        if '_os_ccs_domains' in self.__dict__:
+            return self.__dict__['_os_ccs_domains']
+        self.__dict__['_os_ccs_denied'] = False
+        result: Optional[set] = set()
+        try:
+            client = self._get_client('opensearch')
+            for op, permission in (
+                ('describe_outbound_connections', 'es:DescribeOutboundConnections'),
+                ('describe_inbound_connections', 'es:DescribeInboundConnections'),
+            ):
+                kwargs: Dict[str, Any] = {'MaxResults': 100}
+                try:
+                    for _ in range(self._OPENSEARCH_CCS_MAX_PAGES):
+                        page = getattr(client, op)(**kwargs)
+                        for conn in page.get('Connections', []) or []:
+                            status = ((conn.get('ConnectionStatus') or {}).get('StatusCode') or '').upper()
+                            if status in self._OPENSEARCH_DEAD_CONNECTION_STATES:
+                                continue
+                            for side in ('LocalDomainInfo', 'RemoteDomainInfo'):
+                                info = ((conn.get(side) or {}).get('AWSDomainInformation') or {})
+                                if info.get('DomainName'):
+                                    result.add(info['DomainName'])
+                        token = page.get('NextToken')
+                        if not token:
+                            break
+                        kwargs = {**kwargs, 'NextToken': token}
+                    else:
+                        result = None  # more pages than the bound: unknown
+                        break
+                except ClientError as e:
+                    if self._is_access_denied(e):
+                        self.__dict__['_os_ccs_denied'] = True
+                        logger.info(
+                            "opensearch: %s denied in %s; cross-cluster state falls back "
+                            "to the ListMetrics series check", permission, self._region,
+                        )
+                    else:
+                        logger.warning(f"Error listing OpenSearch connections ({op}): {e}")
+                    result = None
+                    break
+        except (ClientError, BotoCoreError) as e:
+            logger.warning(f"Error listing OpenSearch connections: {e}")
+            result = None
+        self.__dict__['_os_ccs_domains'] = result
+        return result
+
+    def _opensearch_ccs_metric_domains(self) -> Optional[set]:
+        """Domain names carrying an AWS/ES cross-cluster search series in
+        the last two weeks (cloudwatch:ListMetrics). A series without a
+        DomainName dimension cannot be attributed, so it is returned as the
+        wildcard ``'*'`` (every domain in the region is vetoed). None = the
+        listing failed. Cached for the provider's life."""
+        if '_os_ccs_metric_domains' in self.__dict__:
+            return self.__dict__['_os_ccs_metric_domains']
+        result: Optional[set] = set()
+        try:
+            cloudwatch = self._get_client('cloudwatch')
+            for metric_name in self._OPENSEARCH_CCS_METRICS:
+                kwargs: Dict[str, Any] = {'Namespace': 'AWS/ES', 'MetricName': metric_name}
+                for _ in range(self._OPENSEARCH_CCS_MAX_PAGES):
+                    page = cloudwatch.list_metrics(**kwargs)
+                    for metric in page.get('Metrics', []) or []:
+                        dims = {d.get('Name'): d.get('Value') for d in metric.get('Dimensions', []) or []}
+                        result.add(dims.get('DomainName') or '*')
+                    token = page.get('NextToken')
+                    if not token:
+                        break
+                    kwargs = {**kwargs, 'NextToken': token}
+                else:
+                    result = None
+                    break
+        except (ClientError, BotoCoreError) as e:
+            if self._is_access_denied(e):
+                self._record_permission_error(
+                    resource="OpenSearch cross-cluster search series check",
+                    permission="cloudwatch:ListMetrics", error=e,
+                )
+            logger.warning(f"Error listing OpenSearch cross-cluster metrics: {e}")
+            result = None
+        self.__dict__['_os_ccs_metric_domains'] = result
+        return result
+
+    async def get_opensearch_cross_cluster_connections(self, domain_name: str) -> Optional[bool]:
+        """CLO-611: does ``domain_name`` take part in cross-cluster search or
+        replication? True = yes (veto), False = verified no, None = unknown
+        (veto). False needs the ListMetrics series check to say no AND the
+        connection APIs (es:Describe*Connections) to say no or be denied
+        (not in the shipped role template as of 2026-10-18; CLO-626). Called
+        only for domains every other idle gate has passed.
+
+        When the connection APIs are DENIED (the shipped template does not
+        grant them), the ListMetrics series check alone decides: a domain on
+        either end of a live connection publishes a CrossCluster* series,
+        and every domain reaching this call has already passed the
+        ClusterUsedSpace veto (<= 10 MiB), so a replication leader or a
+        searched destination holding real data never gets here. A failed
+        (not denied) connection call stays unknown."""
+        metric_domains = self._opensearch_ccs_metric_domains()
+        if metric_domains and (domain_name in metric_domains or '*' in metric_domains):
+            return True
+        connected = self._opensearch_connected_domains()
+        if metric_domains is None:
+            return None
+        if connected is None:
+            return False if self.__dict__.get('_os_ccs_denied') else None
+        return domain_name in connected
+
     # =========================================================================
     # CloudWatch Logs
     # =========================================================================
@@ -10076,6 +10461,66 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     # Global Accelerator / Network
     # =========================================================================
 
+    # CLO-592 follow-up: ListMetrics pages read per accelerator (500 metrics
+    # per page; one accelerator has a few dozen). Running out is MISSING.
+    _GA_LIST_METRICS_MAX_PAGES = 10
+
+    def _global_accelerator_lists_no_series(self, cw, accelerator_id: str, acc: Dict[str, Any]) -> bool:
+        """CLO-592 follow-up: True only when the accelerator is provably idle.
+
+        Called once both 30-day ProcessedBytesIn/Out reads came back with no
+        datapoints. AWS publishes no AWS/GlobalAccelerator series at all for
+        an accelerator with no traffic, and ListMetrics (no RecentlyActive
+        filter) reports the series that had data in the past two weeks. So:
+        the accelerator is at least GA_IDLE_MIN_AGE_DAYS old (measured from
+        the later of CreatedTime and LastModifiedTime, so a just re-enabled
+        or updated accelerator is too young; adding listeners or endpoints
+        is not believed to move LastModifiedTime, which is why the finding
+        is MEDIUM confidence), and a complete, successful
+        ListMetrics answer filtered on Accelerator=<id> holds no series of any
+        metric name (the conservative superset of "no ProcessedBytesIn/Out").
+        Anything else is False, noted MISSING: unknown or short age, a listed
+        series (the empty datapoints are then unexplained), a truncated,
+        failed or denied read. A denial is also recorded once per provider as
+        a permission error (CLO-534 notice), as the Kinesis check does."""
+        name = acc.get('Name') or acc.get('AcceleratorArn') or accelerator_id
+        stamps = [t for t in (acc.get('CreatedTime'), acc.get('LastModifiedTime')) if isinstance(t, datetime)]
+        if not isinstance(acc.get('CreatedTime'), datetime):
+            reason = 'no ProcessedBytes datapoints; accelerator age unknown'
+        elif resource_age_days(max(stamps)) < GA_IDLE_MIN_AGE_DAYS:
+            reason = f'no ProcessedBytes datapoints; accelerator under {GA_IDLE_MIN_AGE_DAYS} days old'
+        else:
+            try:
+                kwargs: Dict[str, Any] = {
+                    'Namespace': 'AWS/GlobalAccelerator',
+                    'Dimensions': [{'Name': 'Accelerator', 'Value': accelerator_id}],
+                }
+                for _ in range(self._GA_LIST_METRICS_MAX_PAGES):
+                    page = cw.list_metrics(**kwargs)
+                    if page.get('Metrics'):
+                        reason = 'no ProcessedBytes datapoints but ListMetrics lists a series'
+                        break
+                    token = page.get('NextToken')
+                    if not token:
+                        return True
+                    kwargs = {**kwargs, 'NextToken': token}
+                else:
+                    reason = 'ListMetrics answer truncated'
+            except Exception as e:
+                if self._is_access_denied(e):
+                    reason = 'cloudwatch:ListMetrics denied'
+                    if not getattr(self, '_ga_list_metrics_denial_recorded', False):
+                        self._ga_list_metrics_denial_recorded = True
+                        self._record_permission_error(
+                            resource="Global Accelerator traffic check",
+                            permission="cloudwatch:ListMetrics", error=e,
+                        )
+                else:
+                    self._warn_swallowed("Global Accelerator traffic check", "cloudwatch:ListMetrics", e)
+                    reason = f"ListMetrics read failed ({self._error_label(e)})"
+        self._note_idle_verdict_missing('globalaccelerator', name, reason)
+        return False
+
     async def get_global_accelerator_resources(self) -> List[GlobalAcceleratorData]:
         """Fetch Global Accelerator data from live AWS APIs."""
         results = []
@@ -10102,6 +10547,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # CloudWatch metrics for idle detection
                 processed_in = 0.0
                 processed_out = 0.0
+                idle_signal = None
                 try:
                     cw = self._get_client('cloudwatch', region='us-west-2')
                     end_time = datetime.now(timezone.utc)
@@ -10126,20 +10572,28 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         datapoints = response.get('Datapoints', [])
                         if not datapoints:
                             empty_series.append(metric_name)
-                        total = sum(dp['Sum'] for dp in datapoints)
+                        # An empty direction is never a measured 0 (PR #1828
+                        # review): only the ListMetrics signal below can
+                        # turn both into zeros.
+                        total = sum(dp['Sum'] for dp in datapoints) if datapoints else None
                         if metric_name == 'ProcessedBytesIn':
                             processed_in = total
                         else:
                             processed_out = total
                     if len(empty_series) == 2:
-                        # No series at all is MISSING (CLO-592), never a
-                        # measured zero: idle is withheld and noted.
+                        # No datapoints is not by itself a measured zero
+                        # (CLO-592). CLO-592 follow-up: AWS publishes no
+                        # series for an accelerator with no traffic, so a
+                        # successful ListMetrics answer with none, on an
+                        # accelerator old enough for its two-week window, is
+                        # the idle signal. Anything less stays MISSING (the
+                        # helper notes why).
                         processed_in = None
                         processed_out = None
-                        self._note_idle_verdict_missing(
-                            'globalaccelerator', acc.get('Name') or arn,
-                            "no ProcessedBytes datapoints in 30 days",
-                        )
+                        if self._global_accelerator_lists_no_series(cw, accelerator_id, acc):
+                            processed_in = 0.0
+                            processed_out = 0.0
+                            idle_signal = GA_IDLE_SIGNAL_NO_SERIES
                 except Exception as e:
                     self._warn_swallowed(
                         "Global Accelerator processed bytes", "cloudwatch:GetMetricStatistics", e,
@@ -10180,10 +10634,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     endpoint_groups=[{
                         'EndpointGroupArn': eg['EndpointGroupArn'],
                         'EndpointDescriptions': eg.get('EndpointDescriptions', []),
+                        'TrafficDialPercentage': eg.get('TrafficDialPercentage'),
                     } for eg in all_endpoint_groups],
                     has_endpoints=has_endpoints,
                     processed_bytes_in_sum=processed_in,
                     processed_bytes_out_sum=processed_out,
+                    idle_signal=idle_signal,
                 ))
 
         except Exception as e:

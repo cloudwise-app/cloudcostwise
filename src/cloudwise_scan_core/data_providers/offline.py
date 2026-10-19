@@ -2432,6 +2432,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         days: int = 14,
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
+        memcached_node_counts: Optional[Dict[str, int]] = None,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """Get CloudWatch metrics for ElastiCache clusters from per-cluster export files.
 
@@ -2456,6 +2457,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         def _stat_max(points: List[dict], stat: str = 'Maximum') -> float:
             vals = [p.get(stat, p.get(stat.lower(), 0)) for p in points]
             return max(vals) if vals else 0.0
+
+        def _point_peak(point: Any) -> Optional[float]:
+            if not isinstance(point, dict):
+                return None
+            for key in ('Maximum', 'maximum', 'Average', 'average'):
+                val = point.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    return float(val)
+            return None
 
         def _stat_std(points: List[dict], stat: str = 'Average') -> float:
             vals = [p.get(stat, p.get(stat.lower(), 0)) for p in points]
@@ -2482,6 +2492,11 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             cpu_data = _extract_points(self._export_data.get(f'elasticache_cpu_{cluster_id}'), created)
             mem_data = _extract_points(self._export_data.get(f'elasticache_memory_{cluster_id}'), created)
             bytes_data = _extract_points(self._export_data.get(f'elasticache_bytes_{cluster_id}'), created)
+            # CLO-579: Memcached's BytesUsedForCacheItems (own prefix: the
+            # 'elasticache_bytes_' stem would collide with a cluster id that
+            # starts "items_"). Not written by the export script yet, so an
+            # absent file is MISSING (zero datapoints), never 0 bytes.
+            item_bytes_data = _extract_points(self._export_data.get(f'elasticache_itembytes_{cluster_id}'), created)
 
             # CLO-485/CLO-559: the window coverage gates are measured against
             # what the export actually collected, clamped to the detector's
@@ -2513,6 +2528,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # trimmed and is used as exported.
             conn_data = trim_to_recent_window(conn_data, metric_window_days, 3600, anchor=export_anchor)
             bytes_data = trim_to_recent_window(bytes_data, metric_window_days, 3600, anchor=export_anchor)
+            item_bytes_data = trim_to_recent_window(item_bytes_data, metric_window_days, 3600, anchor=export_anchor)
 
             conn_avg = _stat_avg(conn_data, 'Sum') if conn_data else 0.0
             conn_max_val = _stat_max(conn_data, 'Maximum') if conn_data else 0.0
@@ -2521,6 +2537,17 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             cpu_max_val = _stat_max(cpu_data) if cpu_data else 0.0
             mem_pct = _stat_avg(mem_data) if mem_data else 0.0
             bytes_used = _stat_avg(bytes_data) if bytes_data else 0.0
+            item_bytes_used = _stat_avg(item_bytes_data) if item_bytes_data else 0.0
+            # CLO-623: the gate reads the peak. Each point's own Maximum, or its
+            # Average when the export carried only Averages (the max of hourly
+            # Averages: a lower bound on the true peak, far closer to it than
+            # the mean). A point with neither is dropped from the series and
+            # its coverage -- never read as 0 bytes, which would look like a
+            # perfect fit.
+            item_peak_vals = [
+                v for v in (_point_peak(p) for p in item_bytes_data) if v is not None
+            ]
+            item_bytes_peak = max(item_peak_vals) if item_peak_vals else 0.0
 
             # CLO-485: idle needs the connection series itself, covering 75%
             # of the hours the export collected (#1452's coverage rule). Any
@@ -2574,6 +2601,10 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # CLO-572: same clamp, for the memory gate's coverage check.
                 memory_datapoints=len(mem_data),
                 memory_window_days=metric_window_days,
+                item_bytes_used=round(item_bytes_used, 2),
+                item_bytes_peak=round(item_bytes_peak, 2),
+                item_bytes_datapoints=len(item_peak_vals),
+                item_bytes_window_days=metric_window_days,
             )
 
         return metrics
@@ -5721,18 +5752,20 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
     def _ga_bytes_sum(self, key: str) -> Optional[float]:
         """Sum of an exported Global Accelerator ProcessedBytes series, or
-        None when it is MISSING (CLO-550): not exported, or an older
-        export's ``{"Datapoints": []}`` failure fallback, told apart from a
-        real get-metric-statistics response by its ``Label`` (always
-        present in the real output)."""
+        None when it is MISSING: not exported, or an older export's
+        ``{"Datapoints": []}`` failure fallback (CLO-550), or (CLO-592
+        follow-up) a real response with no datapoints. AWS publishes no
+        series for an accelerator with no traffic, so an empty answer is
+        only an idle signal next to a ListMetrics answer, which
+        cloudwise-export.sh does not carry; online reads it."""
         raw = self._export_data.get(key)
         if isinstance(raw, list):
             datapoints = raw
         elif isinstance(raw, dict) and isinstance(raw.get('Datapoints'), list):
             datapoints = raw['Datapoints']
-            if not datapoints and 'Label' not in raw:
-                return None
         else:
+            return None
+        if not datapoints:
             return None
         return float(sum(
             dp.get('Sum', dp.get('sum', 0.0)) for dp in datapoints if isinstance(dp, dict)
@@ -5750,9 +5783,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # CloudWatch ProcessedBytes sums. CLO-550: None (MISSING) when
             # the series was not exported (1.19.0+ leaves a 0-byte file on a
             # failed read) or is an older export's failure fallback; only a
-            # real (possibly empty) response counts as a measured sum.
+            # real response with datapoints counts as a measured sum (CLO-592
+            # follow-up: an empty one needs ListMetrics, not in the export).
             processed_in = self._ga_bytes_sum(f'global_accelerator_bytes_in_{acc_id}')
             processed_out = self._ga_bytes_sum(f'global_accelerator_bytes_out_{acc_id}')
+            if processed_in is None or processed_out is None:
+                self._note_idle_verdict_missing(
+                    'globalaccelerator', acc.get('Name') or arn,
+                    "no ProcessedBytes datapoints in export (no ListMetrics answer)",
+                )
 
             # Determine endpoint status from enriched export data.
             # CLO-550: None (MISSING) unless the export merged the listener
@@ -5802,3 +5841,8 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             ))
 
         return results
+
+    async def get_opensearch_cross_cluster_connections(self, domain_name: str) -> Optional[bool]:
+        """CLO-611: the export carries no cross-cluster connection data, so
+        the answer is unknown and idle_opensearch is withheld offline."""
+        return None
