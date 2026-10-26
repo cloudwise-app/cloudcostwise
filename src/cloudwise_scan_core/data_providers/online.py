@@ -663,6 +663,14 @@ def parse_lambda_timestamp(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+# CLO-630: the most connections an idle Redis OSS / Valkey node shows on its
+# own. Measured on cache.t4g.micro Valkey, 2026-10-12..22: hourly
+# CurrConnections Maximum 5-6 with no client, 5-7 with one. A node peaking
+# above this is not read for client activity (it keeps its pre-CLO-630
+# verdict: not idle unless CurrConnections averages 0).
+ELASTICACHE_INTERNAL_CONNECTIONS_CEILING = 8
+
+
 class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     """
     Online data provider using live AWS API calls.
@@ -4208,6 +4216,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # fired. Read it off the replication group, the same lookup
                 # already used for shard/replica/Multi-AZ topology.
                 data_tiering_enabled = False
+                # CLO-630: a node whose replication group was not read has
+                # default topology, not a known standalone one.
+                topology_known = not rg_id or rg_id in replication_groups
+                global_datastore = False
                 if rg_id and rg_id in replication_groups:
                     rg = replication_groups[rg_id]
                     node_groups = rg.get('NodeGroups', [])
@@ -4217,6 +4229,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     multi_az = rg.get('MultiAZ', 'disabled') == 'enabled'
                     auto_failover = rg.get('AutomaticFailover', 'disabled')
                     data_tiering_enabled = rg.get('DataTiering', 'disabled') == 'enabled'
+                    global_datastore = bool(
+                        (rg.get('GlobalReplicationGroupInfo') or {}).get('GlobalReplicationGroupId')
+                    )
 
                 clusters.append(ElastiCacheClusterData(
                     cluster_id=cluster_id,
@@ -4234,6 +4249,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     multi_az_enabled=multi_az,
                     automatic_failover=auto_failover,
                     data_tiering_enabled=data_tiering_enabled,
+                    topology_known=topology_known,
+                    global_datastore=global_datastore,
                 ))
         except ClientError as e:
             if self._is_access_denied(e):
@@ -4338,6 +4355,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
         memcached_node_counts: Optional[Dict[str, int]] = None,
+        command_activity: bool = False,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """Get CloudWatch metrics for ElastiCache clusters.
 
@@ -4491,6 +4509,26 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             else "CurrConnections under 75% coverage",
                         )
 
+                    # CLO-630: a Redis OSS / Valkey node holds ~5 internal
+                    # connections, so ``conn_avg == 0`` never holds on one.
+                    # Judge it by client activity instead, read only when it
+                    # can change the verdict: asked for, covered, not already
+                    # idle by connections, peaking within the internal
+                    # baseline (a busier node is not read, so it costs no
+                    # calls and no MISSING note), and old enough for the
+                    # window (the detector's age guard would drop a younger
+                    # one anyway).
+                    command_idle = processed_total = new_conn_total = None
+                    if (command_activity and idle_window_days
+                            and conn_covered and conn_avg > 0
+                            and conn_max <= ELASTICACHE_INTERNAL_CONNECTIONS_CEILING
+                            and is_as_old_as_window(created, claim_days)):
+                        command_idle, processed_total, new_conn_total = (
+                            self._read_elasticache_command_activity(
+                                cloudwatch, cluster_id, start_time, end_time, _own, claim_days,
+                            )
+                        )
+
                     metrics[cluster_id] = ElastiCacheMetricsData(
                         cluster_id=cluster_id,
                         cache_hits_avg=round(cache_hits_avg, 2),
@@ -4522,6 +4560,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         item_bytes_peak=round(item_peak, 2),
                         item_bytes_datapoints=item_count,
                         item_bytes_missing_reason=item_reason,
+                        command_idle=command_idle,
+                        processed_commands_total=processed_total,
+                        new_connections_total=new_conn_total,
                     )
                 except ClientError as e:
                     # CLO-485: a failed read is MISSING, not zero. It used to
@@ -4544,6 +4585,61 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             logger.error(f"Error fetching ElastiCache metrics: {e}")
 
         return metrics
+
+    def _read_elasticache_command_activity(
+        self, cloudwatch, cluster_id: str, start_time, end_time, own, window_days: int,
+    ):
+        """CLO-630: ``(command_idle, processed_total, new_connections_total)``.
+
+        Daily Sums of ProcessedCommands (every client command, PING
+        included; the node's own agent traffic is counted in NonKeyTypeCmds,
+        not here) and NewConnections (the internal connections are
+        long-lived, so an idle node reads 0). Measured on the 2026-10-12..22
+        Valkey pair: 0 and 0 in all 250 hours on the idle node, 27-29 and 1
+        every hour on the one client.
+
+        ``command_idle`` is True only when both series cover 75% of the
+        window and both sum to 0; False when either is nonzero; None when
+        either is sparse or a read fails (MISSING, never idle). A failure
+        here never touches the cluster's other metrics.
+        """
+        totals = {}
+        try:
+            for metric in ('ProcessedCommands', 'NewConnections'):
+                resp = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/ElastiCache',
+                    MetricName=metric,
+                    Dimensions=[{'Name': 'CacheClusterId', 'Value': cluster_id}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,
+                    Statistics=['Sum'],
+                )
+                dps = own(resp)
+                totals[metric] = (sum(dp.get('Sum', 0) for dp in dps), len(dps))
+        except Exception as e:
+            self._warn_swallowed(
+                "ElastiCache client activity", "cloudwatch:GetMetricStatistics", e,
+            )
+            self._note_idle_verdict_missing(
+                'elasticache', cluster_id,
+                f"client-activity read failed ({self._error_label(e)})",
+            )
+            return None, None, None
+        processed, processed_n = totals['ProcessedCommands']
+        new_conns, new_conns_n = totals['NewConnections']
+        if processed > 0 or new_conns > 0:
+            return False, processed, new_conns
+        if not (has_min_coverage(processed_n, window_days, 86400)
+                and has_min_coverage(new_conns_n, window_days, 86400)):
+            self._note_idle_verdict_missing(
+                'elasticache', cluster_id,
+                "no ProcessedCommands/NewConnections datapoints"
+                if not (processed_n and new_conns_n)
+                else "ProcessedCommands/NewConnections under 75% coverage",
+            )
+            return None, processed, new_conns
+        return True, processed, new_conns
 
     # CLO-508: ElastiCache request-volume metrics, (query suffix, MetricName).
     _EC_VOLUME_METRICS = (
@@ -5429,24 +5525,27 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         DescribeInboundConnections (unfiltered, paginated, matched here so no
         filter-name wire value is guessed). None = unknown: a denied or
         failed call. Cached for the provider's life (one pair of calls per
-        region scan). A denial sets ``_os_ccs_denied`` and is NOT recorded as
-        a permission error: the shipped role template does not grant these
-        actions, so the notice could not be cleared by a stack update; the
-        caller falls back to the ListMetrics evidence instead."""
+        region scan). A denial sets ``_os_ccs_denied`` and is recorded as a
+        permission error (template 1.31.0 grants both actions, CLO-626, so a
+        stack update clears it); the caller falls back to the ListMetrics
+        evidence."""
         if '_os_ccs_domains' in self.__dict__:
             return self.__dict__['_os_ccs_domains']
         self.__dict__['_os_ccs_denied'] = False
         result: Optional[set] = set()
         try:
             client = self._get_client('opensearch')
-            for op, permission in (
-                ('describe_outbound_connections', 'es:DescribeOutboundConnections'),
-                ('describe_inbound_connections', 'es:DescribeInboundConnections'),
-            ):
+            for outbound in (True, False):
+                permission = (
+                    'es:DescribeOutboundConnections' if outbound else 'es:DescribeInboundConnections'
+                )
                 kwargs: Dict[str, Any] = {'MaxResults': 100}
                 try:
                     for _ in range(self._OPENSEARCH_CCS_MAX_PAGES):
-                        page = getattr(client, op)(**kwargs)
+                        page = (
+                            client.describe_outbound_connections(**kwargs) if outbound
+                            else client.describe_inbound_connections(**kwargs)
+                        )
                         for conn in page.get('Connections', []) or []:
                             status = ((conn.get('ConnectionStatus') or {}).get('StatusCode') or '').upper()
                             if status in self._OPENSEARCH_DEAD_CONNECTION_STATES:
@@ -5465,12 +5564,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 except ClientError as e:
                     if self._is_access_denied(e):
                         self.__dict__['_os_ccs_denied'] = True
-                        logger.info(
-                            "opensearch: %s denied in %s; cross-cluster state falls back "
-                            "to the ListMetrics series check", permission, self._region,
+                        self._record_permission_error(
+                            resource='opensearch cross-cluster connections',
+                            permission=permission, error=e,
                         )
                     else:
-                        logger.warning(f"Error listing OpenSearch connections ({op}): {e}")
+                        logger.warning(f"Error listing OpenSearch connections ({permission}): {e}")
                     result = None
                     break
         except (ClientError, BotoCoreError) as e:
@@ -5520,11 +5619,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         replication? True = yes (veto), False = verified no, None = unknown
         (veto). False needs the ListMetrics series check to say no AND the
         connection APIs (es:Describe*Connections) to say no or be denied
-        (not in the shipped role template as of 2026-10-18; CLO-626). Called
-        only for domains every other idle gate has passed.
+        (template 1.31.0 grants them, CLO-626; a stack on an older template
+        is denied, and the denial is recorded). Called only for domains every
+        other idle gate has passed.
 
-        When the connection APIs are DENIED (the shipped template does not
-        grant them), the ListMetrics series check alone decides: a domain on
+        When the connection APIs are DENIED (a stack below template 1.31.0),
+        the ListMetrics series check alone decides: a domain on
         either end of a live connection publishes a CrossCluster* series,
         and every domain reaching this call has already passed the
         ClusterUsedSpace veto (<= 10 MiB), so a replication leader or a

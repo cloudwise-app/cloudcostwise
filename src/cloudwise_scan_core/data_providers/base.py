@@ -524,6 +524,7 @@ class WasteDataProvider(ABC):
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
         memcached_node_counts: Optional[Dict[str, int]] = None,
+        command_activity: bool = False,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """
         Get CloudWatch metrics for ElastiCache clusters.
@@ -539,6 +540,11 @@ class WasteDataProvider(ABC):
                 its claim is about. ``is_idle`` needs 75% of it observed
                 (``days`` when not given), and a verdict withheld for missing
                 data is reported as a scan warning.
+            command_activity: CLO-630. Set by the idle detector for Redis
+                OSS / Valkey clusters: also judge idleness by client
+                activity (``command_idle``), because those engines hold
+                about 5 internal connections of their own, so
+                CurrConnections never reads 0 on an idle node.
             
         Returns:
             Dict mapping cluster_id to ElastiCacheMetricsData

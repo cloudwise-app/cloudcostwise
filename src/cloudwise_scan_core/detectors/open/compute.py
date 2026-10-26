@@ -296,8 +296,17 @@ class OpenComputeDetectorsMixin:
                             description=f"Instance '{instance_name}' ({instance.instance_type}) is stopped but has {volume_count} EBS volume(s) incurring storage charges.",
                             monthly_savings=estimated_cost,
                             confidence=ConfidenceLevel.MEDIUM,
-                            action="Delete instance and its volumes if no longer needed, or create an AMI and terminate.",
-                            action_command=f"aws ec2 terminate-instances --instance-ids {instance.instance_id}",
+                            # CLO-676: the AMI first, never a bare terminate.
+                            # Termination can't be undone; the AMI is what a
+                            # restore launches from.
+                            action=(
+                                "Create an AMI of the instance first, then terminate it only if it is no longer needed. "
+                                "Termination can't be undone: restoring means launching a new instance from the AMI."
+                            ),
+                            action_command=(
+                                f"aws ec2 create-image --instance-id {instance.instance_id} "
+                                f"--name {instance.instance_id}-before-terminate"
+                            ),
                             explanation={
                                 'detection': f'Instance state is "stopped" with {volume_count} EBS volume(s) still attached',
                                 'threshold': 'Any stopped instance with attached EBS volumes',

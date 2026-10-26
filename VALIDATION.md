@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 35 at L1, 37 at L2, 19 at L3.
+Summary for the checks in this repository: 32 at L1, 37 at L2, 22 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -30,7 +30,7 @@ proven checks only.
 | `dynamodb_no_autoscaling` | L2 |  |  |
 | `dynamodb_no_deletion_protection` | L3 |  | covered |
 | `ecr_no_lifecycle_policy` | L3 |  | covered |
-| `eip_on_stopped_instance` | L2 |  | covered |
+| `eip_on_stopped_instance` | L3 |  | covered |
 | `elasticache_data_tiering_opportunity` | L2 |  | none |
 | `elasticache_engine_migration` | L2 |  | none |
 | `elasticache_extended_support_cost` | L2 |  | none |
@@ -41,7 +41,7 @@ proven checks only.
 | `gp2_migration` | L3 |  |  |
 | `high_lcu_cost_alb` | L1 | yes |  |
 | `idle_dynamodb` | L2 |  | covered |
-| `idle_ec2` | L1 |  |  |
+| `idle_ec2` | L2 |  |  |
 | `idle_efs` | L3 |  | partial |
 | `idle_elasticache` | L1 |  |  |
 | `idle_lightsail` | L2 |  | none |
@@ -62,7 +62,7 @@ proven checks only.
 | `lightsail_unattached_disk` | L2 |  | none |
 | `lightsail_unattached_static_ip` | L2 |  | none |
 | `low_traffic_alb` | L2 |  | none |
-| `multiple_eips_per_instance` | L2 |  | none |
+| `multiple_eips_per_instance` | L3 |  | none |
 | `no_lifecycle_efs` | L2 |  | none |
 | `no_lifecycle_policy` | L2 |  | covered |
 | `no_retention_log_group` | L2 |  | partial |
@@ -74,9 +74,9 @@ proven checks only.
 | `orphaned_dns_record` | L3 |  |  |
 | `orphaned_ebs_snapshot` | L2 |  | none |
 | `over_provisioned_dynamodb` | L2 |  |  |
-| `over_provisioned_iops` | L1 |  |  |
+| `over_provisioned_iops` | L2 |  | covered |
 | `over_provisioned_lambda` | L2 |  | covered |
-| `oversized_ebs_optimizer` | L1 |  |  |
+| `oversized_ebs_optimizer` | L2 |  | covered |
 | `oversized_ec2_optimizer` | L1 |  |  |
 | `oversized_elasticache` | L1 |  |  |
 | `oversized_lambda_optimizer` | L1 |  |  |
@@ -101,7 +101,7 @@ proven checks only.
 | `sp_opportunity_compute` | L1 | yes |  |
 | `sp_opportunity_ec2` | L1 | yes |  |
 | `sp_opportunity_sagemaker` | L1 | yes |  |
-| `stopped_ec2_with_ebs` | L2 |  | covered |
+| `stopped_ec2_with_ebs` | L3 |  | covered |
 | `stopped_sagemaker_notebook_storage` | L3 |  | none |
 | `unattached_ebs` | L3 |  | covered |
 | `unattached_eip` | L3 |  | covered |

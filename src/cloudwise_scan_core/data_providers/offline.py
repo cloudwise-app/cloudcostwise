@@ -2433,12 +2433,17 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         create_times: Optional[Dict[str, Optional[datetime]]] = None,
         idle_window_days: Optional[int] = None,
         memcached_node_counts: Optional[Dict[str, int]] = None,
+        command_activity: bool = False,
     ) -> Dict[str, ElastiCacheMetricsData]:
         """Get CloudWatch metrics for ElastiCache clusters from per-cluster export files.
 
         CLO-457: the export reads hourly datapoints (cloudwise-export.sh);
         hours from before a cluster's creation time in ``create_times`` are
-        dropped, since a reused CacheClusterId inherits its predecessor's."""
+        dropped, since a reused CacheClusterId inherits its predecessor's.
+
+        CLO-630: ``command_activity`` is ignored. The export collects no
+        ProcessedCommands or NewConnections, so ``command_idle`` stays None
+        and only a zero CurrConnections Maximum reads idle here."""
         metrics = {}
 
         def _extract_points(data: Any, created: Any = None) -> List[dict]:

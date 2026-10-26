@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 DYNAMODB_METRIC_WINDOW_DAYS = 14
 
 
+def _standalone_redis_node(cluster, is_memcached: bool) -> bool:
+    """CLO-630: the client-activity idle rule applies only to a Redis OSS /
+    Valkey node whose topology is known to be standalone: one shard, no
+    replicas, not a Global Datastore member. A replica (reads may all go to
+    the primary), a shard holding no keys, or a node whose replication group
+    could not be read is never judged by it (fail closed)."""
+    return (
+        not is_memcached
+        and getattr(cluster, 'topology_known', False) is True
+        and not getattr(cluster, 'global_datastore', False)
+        and (getattr(cluster, 'replicas_per_shard', 0) or 0) == 0
+        and (getattr(cluster, 'num_shards', 1) or 1) <= 1
+    )
+
+
 # idle_elasticache's lookback, and therefore the minimum age a cluster must
 # reach before it may be called idle (CLO-233's rule, applied in CLO-457).
 ELASTICACHE_IDLE_WINDOW_DAYS = 7
@@ -1185,6 +1200,7 @@ class OpenDatabaseDetectorsMixin:
                 monthly_cost = hourly_price * 730 * cluster.num_nodes
                 
                 if settings.cloudwatch_enabled and data_provider.supports_cloudwatch and monthly_cost >= settings.min_waste_threshold_usd:
+                    is_memcached = (cluster.engine or '').strip().lower() == 'memcached'
                     metrics_map = await data_provider.get_elasticache_metrics(
                         cluster_ids=[cluster.cluster_id],
                         days=ELASTICACHE_IDLE_WINDOW_DAYS,
@@ -1194,7 +1210,13 @@ class OpenDatabaseDetectorsMixin:
                         idle_window_days=ELASTICACHE_IDLE_WINDOW_DAYS,  # CLO-485
                         # CLO-579: the Memcached item-bytes read is opt-in.
                         **({'memcached_node_counts': {cluster.cluster_id: cluster.num_nodes}}
-                           if (cluster.engine or '').strip().lower() == 'memcached' else {}),
+                           if is_memcached else {}),
+                        # CLO-630: Redis OSS / Valkey are also judged by
+                        # client activity (see ElastiCacheMetricsData.command_idle),
+                        # but only a known standalone node: the rule was
+                        # measured on one, and a replica or a shard can show
+                        # no commands of its own while its cache is in use.
+                        command_activity=_standalone_redis_node(cluster, is_memcached),
                     )
                     
                     metrics = metrics_map.get(cluster.cluster_id)
@@ -1202,7 +1224,13 @@ class OpenDatabaseDetectorsMixin:
                     # empty or sparse CurrConnections series (or a failed
                     # read) also averages to 0; ``is_idle`` additionally
                     # needs 75% of the window observed (#1452's rule).
-                    if metrics and metrics.is_idle:
+                    # CLO-630: or no client activity at all (Redis OSS /
+                    # Valkey, whose own ~5 connections keep is_idle False).
+                    idle_by_commands = bool(
+                        metrics and not metrics.is_idle
+                        and getattr(metrics, 'command_idle', None) is True
+                    )
+                    if metrics and (metrics.is_idle or idle_by_commands):
                         # CLO-233's minimum-age rule (CLO-457): "0 connections
                         # in 7 days" needs a cluster that existed for all 7.
                         # A younger one (including one recreated under a
@@ -1219,20 +1247,39 @@ class OpenDatabaseDetectorsMixin:
                             resource_type=ResourceType.ELASTICACHE_CLUSTER,
                             waste_type=WasteType.IDLE_ELASTICACHE,
                             title=f"Idle ElastiCache Cluster",
-                            description=f"Cluster '{cluster.cluster_id}' ({cluster.node_type}, {cluster.num_nodes} nodes) has had 0 connections in 7 days.",
+                            description=(
+                                f"Cluster '{cluster.cluster_id}' ({cluster.node_type}, {cluster.num_nodes} nodes) "
+                                + ("has run no client commands and opened no new connections in 7 days."
+                                   if idle_by_commands else "has had 0 connections in 7 days.")
+                            ),
                             monthly_savings=monthly_cost,
                             confidence=ConfidenceLevel.HIGH,
                             action="Delete this cluster.",
                             explanation={
-                                'detection': f'Average CurrConnections = 0 over 7 days ({cluster.node_type}, {cluster.num_nodes} node(s))',
+                                'detection': (
+                                    f'ProcessedCommands = 0 and NewConnections = 0 over 7 days '
+                                    f'({cluster.node_type}, {cluster.num_nodes} node(s)); its average '
+                                    f'{metrics.current_connections_avg:.1f} open connections are consistent with '
+                                    f'ElastiCache\'s own 4-6 monitoring connections'
+                                    if idle_by_commands else
+                                    f'Average CurrConnections = 0 over 7 days ({cluster.node_type}, {cluster.num_nodes} node(s))'
+                                ),
                                 'threshold': (
+                                    '0 client commands and 0 new connections over the 7-day monitoring period, '
+                                    'each with at least 75% of it observed'
+                                    if idle_by_commands else
                                     '0 connections over 7-day monitoring period, with at least 75% of it '
                                     f'observed ({metrics.connection_datapoints} CurrConnections datapoints)'
                                     if metrics.connection_datapoints is not None
                                     else '0 connections over 7-day monitoring period'
                                 ),
                                 'pricing': f'{cluster.node_type} × {cluster.num_nodes} node(s) = ${monthly_cost:.2f}/month',
-                                'why_waste': f'ElastiCache charges per node-hour regardless of usage. This {cluster.engine} cluster has had zero client connections for a week.',
+                                'why_waste': (
+                                    f'ElastiCache charges per node-hour regardless of usage. This {cluster.engine} cluster '
+                                    + ('has run no client commands and opened no new connections for a week.'
+                                       if idle_by_commands
+                                       else 'has had zero client connections for a week.')
+                                ),
                                 'risk': 'Create a final snapshot before deleting. Verify no applications have hardcoded this cluster endpoint.',
                             },
                             metadata={

@@ -596,6 +596,12 @@ class ElastiCacheClusterData:
     automatic_failover: str = 'disabled'
     cache_parameter_group: Optional[str] = None
     data_tiering_enabled: bool = False
+    # CLO-630: False when the node names a replication group whose topology
+    # could not be read (DescribeReplicationGroups failed or omitted it), so
+    # num_shards / replicas_per_shard above are defaults, not facts.
+    topology_known: bool = True
+    # CLO-630: the replication group is a Global Datastore member.
+    global_datastore: bool = False
 
 
 @dataclass
@@ -656,6 +662,16 @@ class ElastiCacheMetricsData:
     # the plain "no datapoints" note.
     item_bytes_peak: float = 0.0
     item_bytes_missing_reason: Optional[str] = None
+    # CLO-630: idleness by client activity, for Redis OSS / Valkey, whose
+    # nodes hold about 5 internal connections of their own (CurrConnections
+    # never reads 0 on an idle node, so ``is_idle`` cannot hold there).
+    # True: ProcessedCommands and NewConnections both summed to 0 over the
+    # idle window, each with 75% daily coverage. False: either was nonzero.
+    # None: not read (offline, Memcached, a cluster younger than the window,
+    # one already idle by connections) or not judgeable (sparse or failed).
+    command_idle: Optional[bool] = None
+    processed_commands_total: Optional[float] = None
+    new_connections_total: Optional[float] = None
 
 
 @dataclass
