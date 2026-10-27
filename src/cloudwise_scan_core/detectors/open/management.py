@@ -28,6 +28,22 @@ OLD_LOG_GROUP_MIN_DAYS = 90
 
 OLD_LOG_GROUP_MIN_GB = 0.5
 
+# CLO-700: thresholds lifted from inline literals so the docs can state them
+# from code (detectors/open/thresholds.py). Values unchanged.
+# no_retention_log_group: above this many GiB stored it is MEDIUM, else LOW.
+NO_RETENTION_LARGE_GB = 1
+# excessive_retention_log_group: retention of at least this many days with
+# more than EXCESSIVE_RETENTION_MIN_GB stored; HIGH above the last value.
+EXCESSIVE_RETENTION_MIN_DAYS = 365
+EXCESSIVE_RETENTION_MIN_GB = 0.1
+EXCESSIVE_RETENTION_HIGH_CONFIDENCE_GB = 10
+# The retention the excessive_retention_log_group saving is priced against.
+EXCESSIVE_RETENTION_RECOMMENDED_DAYS = 30
+# unused_dashboard: the first dashboards are free; a paid one not modified
+# for more than UNUSED_DASHBOARD_MIN_DAYS is flagged.
+FREE_DASHBOARDS = 3
+UNUSED_DASHBOARD_MIN_DAYS = 90
+
 
 # Share of the detector's timeout the per-group DescribeLogStreams lookups may
 # use, counted from the detector's START (listing thousands of groups already
@@ -235,7 +251,7 @@ class OpenManagementDetectorsMixin:
                 
                 # ── Detector 1: No retention policy ──────────────────────
                 if log_group.retention_days is None:
-                    if stored_gb > 1:
+                    if stored_gb > NO_RETENTION_LARGE_GB:
                         # Large log group without retention - high concern
                         waste_items.append(WasteItem(
                             id=str(uuid.uuid4()),
@@ -330,13 +346,13 @@ class OpenManagementDetectorsMixin:
                 # ── Detector 3: Excessive retention (≥365 days) ──────────
                 # Only fires when retention IS set (None handled by detector 1)
                 if (log_group.retention_days is not None
-                        and log_group.retention_days >= 365
-                        and stored_gb > 0.1):
-                    recommended_retention = 30
+                        and log_group.retention_days >= EXCESSIVE_RETENTION_MIN_DAYS
+                        and stored_gb > EXCESSIVE_RETENTION_MIN_GB):
+                    recommended_retention = EXCESSIVE_RETENTION_RECOMMENDED_DAYS
                     reduction_factor = 1 - (recommended_retention / log_group.retention_days)
                     estimated_savings = storage_cost * reduction_factor
 
-                    confidence = ConfidenceLevel.HIGH if stored_gb > 10 else ConfidenceLevel.MEDIUM
+                    confidence = ConfidenceLevel.HIGH if stored_gb > EXCESSIVE_RETENTION_HIGH_CONFIDENCE_GB else ConfidenceLevel.MEDIUM
 
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
@@ -467,7 +483,7 @@ class OpenManagementDetectorsMixin:
         try:
             dashboards = await data_provider.get_cloudwatch_dashboards()
 
-            if len(dashboards) <= 3:
+            if len(dashboards) <= FREE_DASHBOARDS:
                 # First 3 are free — no savings possible
                 return waste_items
 
@@ -479,7 +495,7 @@ class OpenManagementDetectorsMixin:
 
             # The 3 most recently modified dashboards are free
             # Flag the rest that haven't been modified in 90+ days
-            paid_dashboards = sorted_dashboards[:-3] if len(sorted_dashboards) > 3 else []
+            paid_dashboards = sorted_dashboards[:-FREE_DASHBOARDS] if len(sorted_dashboards) > FREE_DASHBOARDS else []
 
             for dash in paid_dashboards:
                 days_since_modified = None
@@ -489,7 +505,7 @@ class OpenManagementDetectorsMixin:
                         last_mod = last_mod.replace(tzinfo=timezone.utc)
                     days_since_modified = (datetime.now(timezone.utc) - last_mod).days
 
-                if days_since_modified is not None and days_since_modified > 90:
+                if days_since_modified is not None and days_since_modified > UNUSED_DASHBOARD_MIN_DAYS:
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
                         resource_id=dash.dashboard_name,

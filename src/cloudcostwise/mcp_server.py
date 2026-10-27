@@ -18,6 +18,7 @@ from mcp.types import ToolAnnotations
 
 from cloudcostwise import __version__, render
 from cloudcostwise.runtime import (
+    COST_EXPLORER_PRICE_PER_REQUEST,
     CredentialsError,
     ReadOnlyViolation,
     configure_local_runtime,
@@ -35,8 +36,9 @@ INSTRUCTIONS = (
     "cloudcostwise finds AWS waste in the user's own account with their own read-only credentials. "
     "Call `scan` first (it takes 30-60 seconds per region), then `list_findings`, `explain_finding` "
     "and `fix_guidance` on its results. Nothing can modify AWS. Before the first `scan`, tell the user "
-    "that the RI/Savings Plans checks call Cost Explorer, which AWS bills at $0.01 per request "
-    "(about $0.13 a scan), and that include_cost_explorer=false skips them."
+    "that the RI/Savings Plans and extended-support checks call Cost Explorer, which AWS bills at "
+    f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and that "
+    "include_cost_explorer=false skips them."
 )
 
 
@@ -81,7 +83,7 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
                  description="Scan the user's AWS account for waste with their local credentials (read-only; "
                              "any non-read AWS call is refused). Takes 30-60 s per region; up to 4 regions run "
                              "at once. COST: the RI/Savings Plans checks call Cost Explorer, billed by AWS at "
-                             "$0.01 per request (about $0.13 a scan); tell the user before running, and pass "
+                             f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan); tell the user before running, and pass "
                              "include_cost_explorer=false to skip them. regions: comma-separated, or 'all'; "
                              "default us-east-1 plus the profile's region.")
     async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,

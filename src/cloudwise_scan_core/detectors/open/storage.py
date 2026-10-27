@@ -5,9 +5,11 @@ The service entrypoints in ``FREE_TIER_DETECTORS`` and every method they call.
 closed detectors. Moved verbatim from ``detectors/storage.py`` (CLO-562).
 """
 
+import json
 import logging
 import math
 import re
+import shlex
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -84,6 +86,65 @@ def gp2_baseline(size_gb: int) -> tuple:
 # CLO-513: an incomplete multipart upload younger than this may still be in
 # progress. AWS's own lifecycle guidance aborts after 7 days.
 INCOMPLETE_MULTIPART_MIN_AGE_DAYS = 7
+
+# CLO-700: thresholds lifted from inline literals so the docs can state them
+# from code (detectors/open/thresholds.py). Values unchanged.
+# s3_empty_bucket: a bucket younger than this may be about to be filled.
+S3_EMPTY_BUCKET_MIN_AGE_DAYS = 30
+# s3_wrong_storage_class: Standard must hold at least this share of the bucket.
+S3_WRONG_CLASS_MIN_STANDARD_PCT = 90.0
+# no_lifecycle_efs: smaller file systems are not flagged.
+EFS_LIFECYCLE_MIN_SIZE_GB = 1.0
+# old_ecr_images: old (see ECR_OLD_IMAGE_AGE_DAYS) plus untagged images must
+# exceed this; untagged_ecr_images fires above ECR_UNTAGGED_MIN_GB only when
+# old_ecr_images did not.
+ECR_OLD_IMAGES_MIN_GB = 0.5
+ECR_UNTAGGED_MIN_GB = 0.1
+
+
+# CLO-691: no_lifecycle_policy is a one-click Fix This type, so its finding
+# must carry a runnable command. The rule is transition-only, matching what
+# the saving estimates (_s3_tiering_savings_estimate: Standard bytes moved to
+# Intelligent-Tiering): current and noncurrent versions move to
+# INTELLIGENT_TIERING after 30 days. No Expiration, NoncurrentVersionExpiration
+# or AbortIncompleteMultipartUpload: none of them is in the estimate, and each
+# deletes data (the planner hint for this type forbids expiration). Objects
+# under 128 KB stay in Standard (the S3 default
+# TransitionDefaultMinimumObjectSize, all_storage_classes_128K), the same
+# floor the estimate excludes. Intelligent-Tiering has no retrieval fee and no
+# minimum storage duration, so a frequently read object costs what it did in
+# Standard plus the monitoring fee the estimate already subtracts. Wire values
+# checked against botocore's s3 model (TransitionStorageClass,
+# LifecycleRule.Transitions / NoncurrentVersionTransitions, Filter.Prefix).
+S3_LIFECYCLE_TRANSITION_DAYS = 30
+S3_LIFECYCLE_RULE_ID = 'CloudWiseTransitionToIntelligentTiering'
+
+
+def s3_lifecycle_tiering_command(bucket_name: str) -> str:
+    """The `aws s3api put-bucket-lifecycle-configuration` command for a
+    no_lifecycle_policy finding. PutBucketLifecycleConfiguration replaces the
+    whole configuration; the finding only fires when the bucket's read
+    returned NoSuchLifecycleConfiguration (a failed read is withheld, CLO-551),
+    so at scan time there is nothing to replace."""
+    configuration = {
+        'Rules': [{
+            'ID': S3_LIFECYCLE_RULE_ID,
+            'Status': 'Enabled',
+            'Filter': {'Prefix': ''},
+            'Transitions': [{
+                'Days': S3_LIFECYCLE_TRANSITION_DAYS,
+                'StorageClass': 'INTELLIGENT_TIERING',
+            }],
+            'NoncurrentVersionTransitions': [{
+                'NoncurrentDays': S3_LIFECYCLE_TRANSITION_DAYS,
+                'StorageClass': 'INTELLIGENT_TIERING',
+            }],
+        }],
+    }
+    return (
+        f"aws s3api put-bucket-lifecycle-configuration --bucket {shlex.quote(bucket_name)} "
+        f"--lifecycle-configuration {shlex.quote(json.dumps(configuration))}"
+    )
 
 
 # CLO-589: AWS Backup's EBS snapshots carry its tag and fixed description.
@@ -954,15 +1015,31 @@ class OpenStorageDetectorsMixin:
             monthly_savings=estimated_savings,
             confidence=ConfidenceLevel.MEDIUM,
             action=(
-                f"Add lifecycle rules to transition old objects to cheaper storage classes "
-                f"or expire them. Current S3 Standard cost: ${monthly_cost:.2f}/month."
+                f"Add a lifecycle rule that moves objects (and noncurrent versions) to "
+                f"S3 Intelligent-Tiering after {S3_LIFECYCLE_TRANSITION_DAYS} days. It expires "
+                f"nothing. Current S3 Standard cost: ${monthly_cost:.2f}/month."
             ),
+            action_command=s3_lifecycle_tiering_command(bucket.bucket_name),
             explanation={
                 'detection': f'Bucket has no S3 Lifecycle Configuration and is {size_gb:.1f} GB ({bucket.object_count:,} objects)',
                 'threshold': f'> {settings.s3_lifecycle_min_size_gb} GB with no lifecycle rules',
                 'pricing': pricing_detail,
                 'why_waste': f'Without lifecycle policies, objects remain in S3 Standard indefinitely. Older objects that are rarely accessed could be automatically transitioned to cheaper tiers.',
-                'risk': 'Adding lifecycle rules is non-destructive. Start with transition rules (Standard → IA after 90 days) before adding expiration rules.',
+                'risk': (
+                    'The rule is transition-only: it moves objects to Intelligent-Tiering, which has no '
+                    'retrieval fee or minimum storage duration, and deletes nothing. The command replaces the '
+                    'bucket\'s whole lifecycle configuration; the bucket had none when scanned, but if one was '
+                    'added since, merge this rule into it instead. Add expiration rules only after deciding '
+                    'how long the data must be kept. Each object the rule moves is also billed a one-time '
+                    'lifecycle transition request charge (priced per 1,000 requests; see the S3 pricing page '
+                    'for the current rate), which the estimate does not subtract.'
+                    + (
+                        '' if estimated_savings > 0 else
+                        ' No saving is expected: Intelligent-Tiering\'s monitoring fee and one-time per-object '
+                        'transition charge may exceed the discount; check object sizes and access before '
+                        'applying.'
+                    )
+                ),
             },
             metadata={
                 'bucket_name': bucket.bucket_name,
@@ -1100,7 +1177,7 @@ class OpenStorageDetectorsMixin:
 
         # Must be primarily Standard (> 90%)
         standard_pct = round((standard_bytes / bucket.total_size_bytes) * 100, 1)
-        if standard_pct < 90.0:
+        if standard_pct < S3_WRONG_CLASS_MIN_STANDARD_PCT:
             return []
 
         # Skip if already using Intelligent-Tiering
@@ -1248,7 +1325,7 @@ class OpenStorageDetectorsMixin:
         if not bucket.creation_date:
             return []
         age_days = (datetime.now(timezone.utc) - bucket.creation_date).days
-        if age_days < 30:
+        if age_days < S3_EMPTY_BUCKET_MIN_AGE_DAYS:
             return []
 
         # Skip infrastructure buckets. CLO-555: an Air-Gapped export made
@@ -1651,7 +1728,7 @@ class OpenStorageDetectorsMixin:
                     for p in lifecycle_policies
                 )
 
-                if not has_ia_transition and size_gb >= 1.0:
+                if not has_ia_transition and size_gb >= EFS_LIFECYCLE_MIN_SIZE_GB:
                     # EFS Standard = $0.30/GB/month, IA = $0.025/GB/month
                     # Typical IA-eligible data: ~80% of files older than 30 days
                     ia_eligible_pct = 0.80
@@ -1755,9 +1832,9 @@ class OpenStorageDetectorsMixin:
                     # finding shows $0 (ECR_NO_LIFECYCLE_POLICY is a
                     # governance type, so it is still reported).
                     claimable_gb = (repo.untagged_images_size_gb or 0) + (repo.old_images_size_gb or 0)
-                    claimed_elsewhere = claimable_gb > 0.5 or (
+                    claimed_elsewhere = claimable_gb > ECR_OLD_IMAGES_MIN_GB or (
                         (repo.untagged_image_count or 0) > 0
-                        and (repo.untagged_images_size_gb or 0) > 0.1
+                        and (repo.untagged_images_size_gb or 0) > ECR_UNTAGGED_MIN_GB
                     )
                     estimated_savings = 0.0 if claimed_elsewhere else claimable_gb * 0.10
                     if claimed_elsewhere:
@@ -1803,7 +1880,7 @@ class OpenStorageDetectorsMixin:
                 # Detector 2: Old/untagged images
                 total_waste_gb = (repo.untagged_images_size_gb or 0) + (repo.old_images_size_gb or 0)
                 
-                if total_waste_gb > 0.5:
+                if total_waste_gb > ECR_OLD_IMAGES_MIN_GB:
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
                         resource_id=repo.repository_name,
@@ -1833,7 +1910,7 @@ class OpenStorageDetectorsMixin:
                 untagged_count = repo.untagged_image_count or 0
                 untagged_size_gb = repo.untagged_images_size_gb or 0
                 
-                if untagged_count > 0 and untagged_size_gb > 0.1 and total_waste_gb <= 0.5:
+                if untagged_count > 0 and untagged_size_gb > ECR_UNTAGGED_MIN_GB and total_waste_gb <= ECR_OLD_IMAGES_MIN_GB:
                     # Only fire when OLD_ECR_IMAGES didn't fire (dedup)
                     monthly_cost = untagged_size_gb * 0.10
                     waste_items.append(WasteItem(

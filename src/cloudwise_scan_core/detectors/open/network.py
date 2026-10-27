@@ -24,6 +24,16 @@ VPC_ENDPOINT_WINDOW_DAYS = 14
 # (ledger aging_d: 7).
 NAT_IDLE_WINDOW_DAYS = 7
 
+# CLO-700: thresholds lifted from inline literals so the docs can state them
+# from code (detectors/open/thresholds.py). Values unchanged.
+# The CloudWatch window read once for every ALB/NLB, shared by
+# idle_load_balancer, low_traffic_alb and high_lcu_cost_alb.
+LB_METRIC_WINDOW_DAYS = 14
+# low_traffic_alb: fewer requests than this over the window.
+LOW_TRAFFIC_ALB_MAX_REQUESTS = 100
+# high_lcu_cost_alb: LCU cost above this multiple of the ALB base fee.
+HIGH_LCU_COST_BASE_MULTIPLE = 2
+
 
 # ELB DNS name shapes, any region: classic ELB and ALB resolve under
 # <name>.<region>.elb.amazonaws.com; NLB resolves under
@@ -267,7 +277,7 @@ class OpenNetworkDetectorsMixin:
             if settings.cloudwatch_enabled and data_provider.supports_cloudwatch and all_lb_arns:
                 all_metrics = await data_provider.get_load_balancer_metrics(
                     load_balancer_arns=all_lb_arns,
-                    days=14,
+                    days=LB_METRIC_WINDOW_DAYS,
                 )
 
             for lb in load_balancers:
@@ -451,7 +461,7 @@ class OpenNetworkDetectorsMixin:
                 continue
 
             # Low traffic threshold: < 100 requests in 14 days
-            if metrics.request_count_total < 100:
+            if metrics.request_count_total < LOW_TRAFFIC_ALB_MAX_REQUESTS:
                 base_cost = ALB_MONTHLY_BASE if lb.type == 'application' else NLB_MONTHLY_BASE
 
                 waste_items.append(WasteItem(
@@ -524,7 +534,7 @@ class OpenNetworkDetectorsMixin:
             monthly_lcu_cost = metrics.consumed_lcus_avg * ALB_LCU_HOURLY * 730
 
             # Only flag if LCU cost > 2x base cost
-            if monthly_lcu_cost > ALB_MONTHLY_BASE * 2:
+            if monthly_lcu_cost > ALB_MONTHLY_BASE * HIGH_LCU_COST_BASE_MULTIPLE:
                 total_monthly = ALB_MONTHLY_BASE + monthly_lcu_cost
 
                 waste_items.append(WasteItem(

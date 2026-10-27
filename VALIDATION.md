@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 32 at L1, 37 at L2, 22 at L3.
+Summary for the checks in this repository: 31 at L1, 38 at L2, 22 at L3.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -46,8 +46,8 @@ proven checks only.
 | `idle_elasticache` | L1 |  |  |
 | `idle_lightsail` | L2 |  | none |
 | `idle_load_balancer` | L2 |  | partial |
-| `idle_nat_gateway` | L2 |  |  |
-| `idle_rds` | L1 |  |  |
+| `idle_nat_gateway` | L2 |  | covered |
+| `idle_rds` | L2 |  | covered |
 | `idle_sagemaker_endpoint` | L2 |  | covered |
 | `idle_sagemaker_notebook` | L1 |  |  |
 | `idle_workspace` | L1 | yes |  |

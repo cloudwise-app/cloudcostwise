@@ -105,6 +105,50 @@ _MIN_COVERAGE = 0.75
 # CLO-528: unused_lambda's window and minimum age (ledger aging_d: 30).
 UNUSED_LAMBDA_MIN_AGE_DAYS = 30
 
+# CLO-700: thresholds lifted from inline literals so the docs can state them
+# from code (detectors/open/thresholds.py). Values unchanged.
+# Lambda: the CloudWatch window every Lambda check reads.
+LAMBDA_METRIC_WINDOW_DAYS = 30
+# over_provisioned_lambda: memory at least this, average duration under this.
+OVER_PROVISIONED_LAMBDA_MIN_MEMORY_MB = 512
+OVER_PROVISIONED_LAMBDA_MAX_AVG_DURATION_MS = 500
+# lambda_excessive_timeout: more invocations than this, a timeout of at least
+# LAMBDA_TIMEOUT_MIN_SECONDS, and at least this many times the average run.
+LAMBDA_TIMEOUT_MIN_INVOCATIONS = 100
+LAMBDA_TIMEOUT_MIN_SECONDS = 60
+LAMBDA_TIMEOUT_MIN_RATIO = 10
+# lambda_provisioned_concurrency_idle: average utilization under this is idle.
+PROVISIONED_CONCURRENCY_IDLE_PCT = 10.0
+# idle_lightsail / lightsail_idle_database: average CPU under this (and, for a
+# database, average connections under LIGHTSAIL_DB_IDLE_MAX_CONNECTIONS).
+LIGHTSAIL_IDLE_CPU_PCT = 5.0
+LIGHTSAIL_DB_IDLE_MAX_CONNECTIONS = 1.0
+# lightsail_old_snapshot: manual snapshots older than this.
+LIGHTSAIL_SNAPSHOT_MAX_AGE_DAYS = 90
+# oversized_sagemaker_endpoint: CPU and memory under these, with at least
+# SAGEMAKER_OVERSIZED_MIN_INVOCATIONS invocations in the window.
+SAGEMAKER_OVERSIZED_CPU_PCT = 20.0
+SAGEMAKER_OVERSIZED_MEM_PCT = 20.0
+SAGEMAKER_OVERSIZED_MIN_INVOCATIONS = 100
+# stopped_sagemaker_notebook_storage: stopped at least this long.
+SAGEMAKER_STOPPED_NOTEBOOK_MIN_DAYS = 7
+# idle_workspace: no user connection for more than this; an AlwaysOn
+# WorkSpace idle more than WORKSPACES_AUTOSTOP_MIN_IDLE_DAYS (and not idle) is
+# an AutoStop candidate.
+WORKSPACES_IDLE_DAYS = 30
+WORKSPACES_AUTOSTOP_MIN_IDLE_DAYS = 7
+# workspaces_pool_overprovisioned_capacity: running/desired at or under this
+# share, with at least WORKSPACES_POOL_MIN_EXCESS idle sessions.
+WORKSPACES_POOL_MAX_UTILIZATION_PCT = 75
+WORKSPACES_POOL_MIN_EXCESS = 2
+# Dollar floors (monthly USD): a finding below the floor (or below
+# settings.min_waste_threshold_usd, if higher) is not reported.
+WORKSPACES_AUTOSTOP_MIN_SAVINGS_USD = 10
+WORKSPACES_DOWNGRADE_MIN_SAVINGS_USD = 15
+WORKSPACES_POOL_MIN_EXCESS_COST_USD = 25
+# workspaces_windows_license_optimization: at least this many desktops.
+WORKSPACES_WINDOWS_LICENSE_MIN_COUNT = 5
+
 
 def lightsail_cpu_covers_window(metrics) -> bool:
     """CLO-506: whether a Lightsail instance's hourly CPU series covers 75%
@@ -504,7 +548,7 @@ class OpenComputeDetectorsMixin:
             if function_names and settings.cloudwatch_enabled and data_provider.supports_cloudwatch:
                 metrics_map = await data_provider.get_lambda_metrics(
                     function_names=function_names,
-                    days=30,
+                    days=LAMBDA_METRIC_WINDOW_DAYS,
                 )
 
             # CLO-481: every function's PC configs up front, in one pruned,
@@ -565,9 +609,9 @@ class OpenComputeDetectorsMixin:
                             ))
                     
                     # Check 2: Over-provisioned memory
-                    elif metrics.duration_avg_ms and memory_mb >= 512:
+                    elif metrics.duration_avg_ms and memory_mb >= OVER_PROVISIONED_LAMBDA_MIN_MEMORY_MB:
                         avg_duration_sec = metrics.duration_avg_ms / 1000
-                        if avg_duration_sec < 0.5:
+                        if avg_duration_sec < OVER_PROVISIONED_LAMBDA_MAX_AVG_DURATION_MS / 1000:
                             current_gb_sec = (memory_mb / 1024) * avg_duration_sec * metrics.invocations_total
                             new_gb_sec = (memory_mb / 2 / 1024) * avg_duration_sec * metrics.invocations_total
                             savings = (current_gb_sec - new_gb_sec) * 0.0000166667
@@ -614,14 +658,14 @@ class OpenComputeDetectorsMixin:
                     if (
                         metrics.duration_avg_ms > 0
                         and max_duration_sec > 0
-                        and metrics.invocations_total > 100
-                        and func.timeout_seconds >= 60
+                        and metrics.invocations_total > LAMBDA_TIMEOUT_MIN_INVOCATIONS
+                        and func.timeout_seconds >= LAMBDA_TIMEOUT_MIN_SECONDS
                         and recommended_timeout < func.timeout_seconds
                     ):
                         avg_duration_sec = metrics.duration_avg_ms / 1000
                         timeout_ratio = func.timeout_seconds / avg_duration_sec
 
-                        if timeout_ratio >= 10:
+                        if timeout_ratio >= LAMBDA_TIMEOUT_MIN_RATIO:
                             # Per-stuck-invocation cost (running at full timeout vs recommended)
                             waste_per_stuck = (
                                 (func.timeout_seconds - recommended_timeout)
@@ -799,13 +843,17 @@ class OpenComputeDetectorsMixin:
                                 # CLO-600: a failed read is noted, never silent.
                                 note = getattr(data_provider, '_note_idle_verdict_missing', None)
                                 if getattr(pc, 'utilization_read_failed', False) and note:
+                                    # CLO-602: say which error, like every other note.
+                                    error_label = getattr(pc, 'utilization_read_error', None)
                                     note(
                                         'lambda provisioned concurrency', f"{func_name}:{pc.function_qualifier}",
-                                        "read failed", evidence="provisioned concurrency utilization",
+                                        f"read failed ({error_label})" if isinstance(error_label, str) and error_label
+                                        else "read failed",
+                                        evidence="provisioned concurrency utilization",
                                     )
                                 continue  # Can't determine — skip
                         
-                        if utilization_pct >= 10.0:
+                        if utilization_pct >= PROVISIONED_CONCURRENCY_IDLE_PCT:
                             continue  # Reasonably utilized
                         
                         wasted_fraction = 1.0 - (utilization_pct / 100.0)
@@ -1014,7 +1062,7 @@ class OpenComputeDetectorsMixin:
                     if nb.last_modified_time:
                         days_stopped = (datetime.now(timezone.utc) - nb.last_modified_time).days
                     
-                    if days_stopped < 7:
+                    if days_stopped < SAGEMAKER_STOPPED_NOTEBOOK_MIN_DAYS:
                         continue  # Recently stopped — skip
                     
                     # CLO-510: notebook volumes bill as SageMaker "Notebook
@@ -1180,15 +1228,11 @@ class OpenComputeDetectorsMixin:
                     ))
                 
                 # ── Oversized Endpoint ──────────────────────────────────
-                OVERSIZED_CPU_THRESHOLD = 20.0
-                OVERSIZED_MEM_THRESHOLD = 20.0
-                MIN_INVOCATIONS = 100
-                
-                if metrics and metrics.invocations_total >= MIN_INVOCATIONS:
+                if metrics and metrics.invocations_total >= SAGEMAKER_OVERSIZED_MIN_INVOCATIONS:
                     if (metrics.cpu_utilization_avg > 0 and
-                        metrics.cpu_utilization_avg < OVERSIZED_CPU_THRESHOLD and
+                        metrics.cpu_utilization_avg < SAGEMAKER_OVERSIZED_CPU_PCT and
                         metrics.memory_utilization_avg > 0 and
-                        metrics.memory_utilization_avg < OVERSIZED_MEM_THRESHOLD):
+                        metrics.memory_utilization_avg < SAGEMAKER_OVERSIZED_MEM_PCT):
                         
                         estimated_savings = monthly_cost * 0.40  # Conservative 40% savings
                         
@@ -1216,7 +1260,7 @@ class OpenComputeDetectorsMixin:
                             ),
                             explanation={
                                 'detection': f'Average CPU {metrics.cpu_utilization_avg:.1f}% and Memory {metrics.memory_utilization_avg:.1f}% over {metrics.period_days} days with {metrics.invocations_total} invocations',
-                                'threshold': f'CPU < {OVERSIZED_CPU_THRESHOLD}% and Memory < {OVERSIZED_MEM_THRESHOLD}% with ≥ {MIN_INVOCATIONS} invocations',
+                                'threshold': f'CPU < {SAGEMAKER_OVERSIZED_CPU_PCT}% and Memory < {SAGEMAKER_OVERSIZED_MEM_PCT}% with ≥ {SAGEMAKER_OVERSIZED_MIN_INVOCATIONS} invocations',
                                 'pricing': f'Current: ${monthly_cost:.2f}/month. Estimated 40% savings: ${estimated_savings:.2f}/month',
                                 'why_waste': f'Both CPU and memory are under-utilized, indicating the endpoint is over-provisioned for its actual inference workload.',
                                 'risk': 'Create a new endpoint configuration with a smaller instance type and test with realistic traffic before switching. Use SageMaker Inference Recommender for data-driven sizing.',
@@ -1367,7 +1411,7 @@ class OpenComputeDetectorsMixin:
                     monthly_cost = price_map.get(compute_type, 35)
 
                     # ── Detector A: Idle WorkSpace (>30 days disconnected) ──
-                    if days_idle > 30:
+                    if days_idle > WORKSPACES_IDLE_DAYS:
                         waste_items.append(WasteItem(
                             id=str(uuid.uuid4()),
                             resource_id=w.workspace_id,
@@ -1394,14 +1438,14 @@ class OpenComputeDetectorsMixin:
                         ))
 
                     # ── Detector B: AutoStop Opportunity (AlwaysOn low-usage) ──
-                    elif days_idle > 7 and w.running_mode == 'ALWAYS_ON':
+                    elif days_idle > WORKSPACES_AUTOSTOP_MIN_IDLE_DAYS and w.running_mode == 'ALWAYS_ON':
                         hourly_rate = autostop_hourly_rates.get(compute_type, 0.40)
                         estimated_usage_hours = 20
                         estimated_autostop_cost = autostop_base + (hourly_rate * estimated_usage_hours)
                         savings = monthly_cost - estimated_autostop_cost
                         break_even_hours = (monthly_cost - autostop_base) / hourly_rate if hourly_rate > 0 else 0
 
-                        if savings >= max(settings.min_waste_threshold_usd, 10):
+                        if savings >= max(settings.min_waste_threshold_usd, WORKSPACES_AUTOSTOP_MIN_SAVINGS_USD):
                             waste_items.append(WasteItem(
                                 id=str(uuid.uuid4()),
                                 resource_id=w.workspace_id,
@@ -1476,7 +1520,7 @@ class OpenComputeDetectorsMixin:
                     target_price = price_map.get(target_type, 35)
                     potential_savings = current_price - target_price
 
-                    if potential_savings < max(settings.min_waste_threshold_usd, 15):
+                    if potential_savings < max(settings.min_waste_threshold_usd, WORKSPACES_DOWNGRADE_MIN_SAVINGS_USD):
                         continue
 
                     # CLO-506: the WorkSpace's own peak load must fit the
@@ -1571,11 +1615,11 @@ class OpenComputeDetectorsMixin:
                     excess = desired - running
                     utilization_pct = (running / desired * 100) if desired > 0 else 0
 
-                    if utilization_pct > 75 or excess < 2:
+                    if utilization_pct > WORKSPACES_POOL_MAX_UTILIZATION_PCT or excess < WORKSPACES_POOL_MIN_EXCESS:
                         continue
 
                     excess_monthly_cost = excess * 35
-                    if excess_monthly_cost < max(settings.min_waste_threshold_usd, 25):
+                    if excess_monthly_cost < max(settings.min_waste_threshold_usd, WORKSPACES_POOL_MIN_EXCESS_COST_USD):
                         continue
 
                     waste_items.append(WasteItem(
@@ -1631,7 +1675,7 @@ class OpenComputeDetectorsMixin:
                 if w.operating_system in ('WINDOWS', '') and 'byol' not in w.bundle_id.lower():
                     windows_included_count += 1
 
-            if windows_included_count >= 5:
+            if windows_included_count >= WORKSPACES_WINDOWS_LICENSE_MIN_COUNT:
                 license_savings_per_desktop = 4
                 total_license_savings = windows_included_count * license_savings_per_desktop
 
@@ -1782,7 +1826,7 @@ class OpenComputeDetectorsMixin:
                             )
                         elif metrics.avg_cpu is None:
                             self._note_missing(data_provider, 'lightsail', name, 'no datapoints')
-                        if covered and metrics.avg_cpu < 5.0:
+                        if covered and metrics.avg_cpu < LIGHTSAIL_IDLE_CPU_PCT:
                             waste_items.append(WasteItem(
                                 id=str(uuid.uuid4()),
                                 resource_id=name,
@@ -1922,7 +1966,7 @@ class OpenComputeDetectorsMixin:
                     created = created.replace(tzinfo=timezone.utc)
                 age_days = (now - created).days
 
-                if age_days > 90:
+                if age_days > LIGHTSAIL_SNAPSHOT_MAX_AGE_DAYS:
                     monthly = snap.size_in_gb * 0.05
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
@@ -2051,8 +2095,9 @@ class OpenComputeDetectorsMixin:
                     # Check metrics for idle running database
                     try:
                         metrics = await data_provider.get_lightsail_metrics(db.name, 'database')
-                        if (metrics.avg_cpu is not None and metrics.avg_cpu < 5.0
-                                and metrics.avg_connections is not None and metrics.avg_connections < 1.0):
+                        if (metrics.avg_cpu is not None and metrics.avg_cpu < LIGHTSAIL_IDLE_CPU_PCT
+                                and metrics.avg_connections is not None
+                                and metrics.avg_connections < LIGHTSAIL_DB_IDLE_MAX_CONNECTIONS):
                             waste_items.append(WasteItem(
                                 id=str(uuid.uuid4()),
                                 resource_id=db.name,

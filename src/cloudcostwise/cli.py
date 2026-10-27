@@ -45,7 +45,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from cloudcostwise import render
     from cloudcostwise.runtime import (
-        CredentialsError, ReadOnlyViolation, configure_local_runtime, resolve_credentials, resolve_regions,
+        COST_EXPLORER_PRICE_PER_REQUEST, CredentialsError, ReadOnlyViolation, configure_local_runtime,
+        resolve_credentials, resolve_regions,
     )
     from cloudcostwise.scan import run_scan
 
@@ -58,8 +59,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if not args.no_cost_explorer and args.format == "table":
-        print("note: the RI/Savings Plans checks call Cost Explorer, which AWS bills at $0.01 per "
-              "request (about $0.13 a scan). Add --no-cost-explorer to skip them.", file=sys.stderr)
+        print("note: the RI/Savings Plans and extended-support checks call Cost Explorer, which AWS bills at "
+              f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan). "
+              "Add --no-cost-explorer to skip them.", file=sys.stderr)
 
     done = 0
     print(f"scanning {len(regions)} region(s), {min(max(args.parallel, 1), len(regions))} at a time ...",

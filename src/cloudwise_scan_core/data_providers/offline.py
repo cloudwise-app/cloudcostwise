@@ -26,7 +26,7 @@ from cloudwise_scan_core.cpu_sizing import (
     summarize_hourly_cpu,
 )
 from cloudwise_scan_core.metric_window import _as_utc, drop_pre_creation_datapoints, trim_to_recent_window
-from cloudwise_scan_core.data_providers.base import WasteDataProvider
+from cloudwise_scan_core.data_providers.base import ECR_OLD_IMAGE_AGE_DAYS, WasteDataProvider
 from cloudwise_scan_core.data_providers.missing_data import (
     KINESIS_EFO_NOTE_EVIDENCE,
     KINESIS_EFO_NOTE_SERVICE,
@@ -1279,10 +1279,10 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     is_unused=int(total_invocations) == 0,
                 )
             else:
-                metrics[func_name] = LambdaMetricsData(
-                    function_name=func_name,
-                    period_days=days,
-                )
+                # CLO-704: absent from the export = MISSING, not zero (left out of the map,
+                # noted as online does, CLO-479). A measured zero is an exported row
+                # and fires above.
+                self._note_idle_verdict_missing('lambda', func_name, "not in export", verdict="unused")
         
         return metrics
     
@@ -2036,7 +2036,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     lifecycle_policies[repo_name] = None
         
         # Define "old" as images older than 90 days
-        old_threshold = datetime.now(timezone.utc) - timedelta(days=90)
+        old_threshold = datetime.now(timezone.utc) - timedelta(days=ECR_OLD_IMAGE_AGE_DAYS)
         
         for repo in raw_repos:
             repo_name = repo.get('repositoryName', repo.get('repository_name', ''))

@@ -261,6 +261,9 @@ class LambdaProvisionedConcurrencyData:
     # CLO-600: True when the utilization read failed (None above is then
     # MISSING, not "no datapoints").
     utilization_read_failed: bool = False
+    # CLO-602: the failed read's ``ClientError:Throttling``-style label, for
+    # the detector's note.
+    utilization_read_error: Optional[str] = None
 
 
 @dataclass

@@ -22,6 +22,25 @@ logger = logging.getLogger(__name__)
 # age a table must reach before a finding may make a claim about that window.
 DYNAMODB_METRIC_WINDOW_DAYS = 14
 
+# CLO-700: thresholds lifted from inline literals so the docs can state them
+# from code (detectors/open/thresholds.py). Values unchanged.
+# dynamodb_no_autoscaling: provisioned capacity costing at least this a month.
+DYNAMODB_NO_AUTOSCALING_MIN_MONTHLY_USD = 5.0
+# over_provisioned_dynamodb: read AND write utilization under this.
+DYNAMODB_OVER_PROVISIONED_UTIL_PCT = 20
+# oversized_elasticache: average CPU under this, with active connections.
+ELASTICACHE_OVERSIZED_CPU_PCT = 10
+# elasticache_serverless_optimization: spiky = average CPU under the first,
+# peak CPU above the second, and a daily-connections coefficient of variation
+# above the third, over ELASTICACHE_SERVERLESS_WINDOW_DAYS.
+ELASTICACHE_SERVERLESS_MAX_AVG_CPU_PCT = 15
+ELASTICACHE_SERVERLESS_MIN_PEAK_CPU_PCT = 60
+ELASTICACHE_SERVERLESS_MIN_CONNECTION_CV = 2.0
+ELASTICACHE_SERVERLESS_WINDOW_DAYS = 30
+# rds/elasticache_extended_support_cost: warn this many days before a
+# version's Extended Support start.
+EXTENDED_SUPPORT_WARNING_WINDOW_DAYS = 90
+
 
 def _standalone_redis_node(cluster, is_memcached: bool) -> bool:
     """CLO-630: the client-activity idle rule applies only to a Redis OSS /
@@ -830,7 +849,7 @@ class OpenDatabaseDetectorsMixin:
         """Detect non-Aurora RDS instances in or near extended support windows."""
         waste_items: List[WasteItem] = []
 
-        WARNING_WINDOW_DAYS = 90
+        WARNING_WINDOW_DAYS = EXTENDED_SUPPORT_WARNING_WINDOW_DAYS
         today = date.today()
 
         try:
@@ -1019,13 +1038,13 @@ class OpenDatabaseDetectorsMixin:
                 # Detector 1: No auto-scaling configured. CLO-551: None means
                 # the scalable-target read is MISSING (failed, or an export
                 # that did not carry it): withhold and note, never "none".
-                if table.has_autoscaling is None and monthly_cost >= 5.0:
+                if table.has_autoscaling is None and monthly_cost >= DYNAMODB_NO_AUTOSCALING_MIN_MONTHLY_USD:
                     note = getattr(data_provider, '_note_idle_verdict_missing', None)
                     if callable(note):
                         note('dynamodb autoscaling', table.table_name, 'scalable targets not read',
                              verdict='no-autoscaling',
                              evidence='Application Auto Scaling target listings')
-                elif not table.has_autoscaling and monthly_cost >= 5.0:
+                elif not table.has_autoscaling and monthly_cost >= DYNAMODB_NO_AUTOSCALING_MIN_MONTHLY_USD:
                     estimated_savings = monthly_cost * 0.15
                     
                     waste_items.append(WasteItem(
@@ -1113,7 +1132,7 @@ class OpenDatabaseDetectorsMixin:
                             read_util = (avg_read / read_capacity * 100) if read_capacity > 0 else 0
                             write_util = (avg_write / write_capacity * 100) if write_capacity > 0 else 0
                             
-                            if read_util < 20 and write_util < 20:
+                            if read_util < DYNAMODB_OVER_PROVISIONED_UTIL_PCT and write_util < DYNAMODB_OVER_PROVISIONED_UTIL_PCT:
                                 # Estimate on-demand cost based on average usage over a month.
                                 # Read and write request units are priced separately
                                 # ($0.125 vs $0.625 per million in us-east-1) — the flat
@@ -1330,7 +1349,7 @@ class OpenDatabaseDetectorsMixin:
                                     verdict='oversized', evidence='CPU metrics',
                                 )
                             cpu_avg = None
-                        if cpu_avg is not None and cpu_avg < 10 and cluster.num_nodes >= 1:
+                        if cpu_avg is not None and cpu_avg < ELASTICACHE_OVERSIZED_CPU_PCT and cluster.num_nodes >= 1:
                             # Estimate downsizing: suggest one tier smaller node type
                             downsize_map = {
                                 'cache.r7g.2xlarge': 'cache.r7g.xlarge',
@@ -1514,7 +1533,7 @@ class OpenDatabaseDetectorsMixin:
     ) -> List[WasteItem]:
         """Detect ElastiCache clusters with legacy engine versions under extended support policies."""
         waste_items: List[WasteItem] = []
-        WARNING_WINDOW_DAYS = 90
+        WARNING_WINDOW_DAYS = EXTENDED_SUPPORT_WARNING_WINDOW_DAYS
         today = date.today()
 
 
@@ -1877,7 +1896,7 @@ class OpenDatabaseDetectorsMixin:
             try:
                 metrics_map = await data_provider.get_elasticache_metrics(
                     cluster_ids=[cluster.cluster_id],
-                    days=30,
+                    days=ELASTICACHE_SERVERLESS_WINDOW_DAYS,
                     create_times={cluster.cluster_id: getattr(cluster, 'created_time', None)},  # CLO-457
                 )
             except Exception as e:
@@ -1895,7 +1914,8 @@ class OpenDatabaseDetectorsMixin:
             # Coefficient of variation for connection spikiness
             cv = (conn_std / conn_avg) if conn_avg > 0 else 0.0
 
-            if avg_cpu >= 15 or peak_cpu <= 60 or cv <= 2.0:
+            if (avg_cpu >= ELASTICACHE_SERVERLESS_MAX_AVG_CPU_PCT or peak_cpu <= ELASTICACHE_SERVERLESS_MIN_PEAK_CPU_PCT
+                    or cv <= ELASTICACHE_SERVERLESS_MIN_CONNECTION_CV):
                 continue
 
             if metrics.bytes_used_for_cache <= 0:
@@ -1918,7 +1938,7 @@ class OpenDatabaseDetectorsMixin:
         try:
             volumes = await volume_getter(
                 cluster_ids=[c.cluster_id for c, *_ in candidates],
-                days=30,
+                days=ELASTICACHE_SERVERLESS_WINDOW_DAYS,
                 create_times={c.cluster_id: getattr(c, 'created_time', None) for c, *_ in candidates},
             ) if callable(volume_getter) else {}
         except Exception as e:

@@ -101,6 +101,21 @@ from cloudwise_scan_core.data_providers.models import (
 )
 
 
+# old_ecr_images: an image pushed longer ago than this counts as old (CLO-700:
+# lifted from the same inline literal in the online and offline providers;
+# detectors/open/thresholds.py declares it for the docs).
+ECR_OLD_IMAGE_AGE_DAYS = 90
+
+# The online CloudWatch window for Provisioned Concurrency utilization
+# (lambda_provisioned_concurrency_idle) and for Lightsail instance and
+# database metrics (idle_lightsail, lightsail_idle_database). An Air-Gapped
+# export carries its own window. Lifted unchanged (CLO-700).
+PROVISIONED_CONCURRENCY_WINDOW_DAYS = 14
+LIGHTSAIL_METRIC_WINDOW_DAYS = 14
+# oversized_workspace: the window get_workspaces_metrics reads by default.
+WORKSPACES_METRIC_WINDOW_DAYS = 14
+
+
 class WasteDataProvider(ABC):
     """
     Abstract base class for waste detection data providers.
@@ -1339,7 +1354,7 @@ class WasteDataProvider(ABC):
     async def get_workspaces_metrics(
         self,
         workspace_ids: List[str],
-        days: int = 14,
+        days: int = WORKSPACES_METRIC_WINDOW_DAYS,
     ) -> Dict[str, WorkspaceMetricsData]:
         """Get CloudWatch metrics for WorkSpaces."""
         pass

@@ -30,7 +30,7 @@ REPORT = ScanReport(
     findings=[_item("f1", "unattached_ebs", "vol-1", 40.0, "aws ec2 delete-volume --volume-id vol-1"),
               _item("f2", "idle_efs", "fs-1", 12.5),
               _item("f3", ADVISORY, "db-1", 300.0)],
-    api_calls={"ce": 13},
+    api_calls={"ce": 7},
 )
 
 
@@ -84,7 +84,7 @@ def test_scan_then_list_explain_fix_with_advisory_excluded_and_footer_once():
     s, listing_text, e, f, m = asyncio.run(_session([scan, listing, explain, fix, missing]))
     assert "estimated savings $52.50/month (advisory findings excluded)" in s
     assert f"{ADVISORY}: 1 resource(s), $300.00/month (advisory, not counted)" in s
-    assert "13 Cost Explorer request(s)" in s and "include_cost_explorer=false to skip" in s
+    assert "7 Cost Explorer request(s)" in s and "include_cost_explorer=false to skip" in s
     assert "--no-cost-explorer" not in s
     assert "service checks run locally" in s                     # footer, first result only
     assert "| f1 | unattached_ebs |" in listing_text and "| f2 | idle_efs |" in listing_text

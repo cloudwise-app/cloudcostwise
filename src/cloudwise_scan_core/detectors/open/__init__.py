@@ -13,6 +13,7 @@ from cloudwise_scan_core.detectors.open.management import OpenManagementDetector
 from cloudwise_scan_core.detectors.open.optimizer import ComputeOptimizerDetectorsMixin
 from cloudwise_scan_core.detectors.open.savings import SavingsOpportunitiesDetectorsMixin
 from cloudwise_scan_core.detectors.open.security import SecurityPostureDetectorsMixin
+from cloudwise_scan_core.detectors.open.thresholds import OPEN_THRESHOLDS, Threshold
 
 __all__ = [
     'OpenComputeDetectorsMixin',
@@ -23,4 +24,6 @@ __all__ = [
     'ComputeOptimizerDetectorsMixin',
     'SavingsOpportunitiesDetectorsMixin',
     'SecurityPostureDetectorsMixin',
+    'OPEN_THRESHOLDS',
+    'Threshold',
 ]

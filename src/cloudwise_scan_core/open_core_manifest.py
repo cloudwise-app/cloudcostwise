@@ -51,6 +51,7 @@ OPEN_CORE_FILES = (
     "detectors/open/savings.py",
     "detectors/open/security.py",
     "detectors/open/storage.py",
+    "detectors/open/thresholds.py",
     "metric_window.py",
     "metrics.py",
     "models.py",

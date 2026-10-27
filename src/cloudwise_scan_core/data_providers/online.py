@@ -18,7 +18,13 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError, BotoCoreError
 
-from cloudwise_scan_core.data_providers.base import WasteDataProvider
+from cloudwise_scan_core.data_providers.base import (
+    ECR_OLD_IMAGE_AGE_DAYS,
+    LIGHTSAIL_METRIC_WINDOW_DAYS,
+    PROVISIONED_CONCURRENCY_WINDOW_DAYS,
+    WORKSPACES_METRIC_WINDOW_DAYS,
+    WasteDataProvider,
+)
 from cloudwise_scan_core.data_providers.missing_data import (
     KINESIS_EFO_NOTE_EVIDENCE,
     KINESIS_EFO_NOTE_SERVICE,
@@ -293,6 +299,11 @@ _MSK_FRESH_HOURS = 3
 # must cover before a verdict is drawn from it (#1535's 75% rule).
 BEANSTALK_MIN_COVERAGE = 0.75
 WORKSPACES_MIN_COVERAGE = 0.75
+# s3_rapid_growth, online: today's size is compared with the newest daily
+# StandardStorage datapoint between these many days back (an inclusive window,
+# not a point), so a single missed day does not lose the comparison.
+S3_GROWTH_BASELINE_MAX_DAYS_AGO = 32
+S3_GROWTH_BASELINE_MIN_DAYS_AGO = 28
 
 # CLO-516: over_provisioned_iops reads each candidate volume's one-minute
 # VolumeReadOps + VolumeWriteOps through one metric-math expression
@@ -995,6 +1006,26 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             context, self._account_id, self._region, error_label,
         )
 
+    def _warn_forbidden_metric_queries(self, context: str, statuses) -> None:
+        """CLO-602: a ``GetMetricData`` query that ends with ``StatusCode``
+        ``Forbidden`` is the account denying that metric read inside an
+        otherwise successful response. Count it and record it as a permission
+        error (so it reaches ``permission_missing``), exactly as a request-level
+        AccessDenied would be. ``statuses`` is the per-query/resource status
+        codes seen; a no-op without a ``Forbidden``."""
+        if 'Forbidden' not in set(statuses):
+            return
+        self._warn_swallowed(
+            context, "cloudwatch:GetMetricData",
+            ClientError(
+                {'Error': {
+                    'Code': 'AccessDenied',
+                    'Message': 'GetMetricData query returned StatusCode Forbidden',
+                }},
+                'GetMetricData',
+            ),
+        )
+
     def _paginate(self, client, method_name: str, result_key: str, **kwargs) -> List[Any]:
         """Helper to paginate boto3 API calls.
 
@@ -1478,12 +1509,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             except Exception as e:  # noqa: BLE001 - every failure is MISSING, never zero
                 if self._is_access_denied(e):
                     denied = True
-                    self._record_permission_error(
-                        resource="EBS IOPS metrics", permission="cloudwatch:GetMetricData", error=e,
-                    )
-                    self._warn_access_denied("EBS IOPS metrics", "cloudwatch:GetMetricData", e)
-                else:
-                    self._warn_swallowed("EBS IOPS metrics", "cloudwatch:GetMetricData", e)
+                # CLO-602: _warn_swallowed records an AccessDenied once; an
+                # explicit record here doubled it.
+                self._warn_swallowed("EBS IOPS metrics", "cloudwatch:GetMetricData", e)
                 code = ''
                 if isinstance(e, ClientError):
                     code = e.response.get('Error', {}).get('Code', '')
@@ -1823,11 +1851,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         entry.cpu_max = round(cpu.max_cpu, 2)
                         entry.cpu_datapoints = cpu.datapoints
                 except ClientError as e:
-                    if self._is_access_denied(e):
-                        self._record_permission_error(
-                            resource="RDS Metrics (per-resource)", permission="cloudwatch:GetMetricStatistics", error=e,
-                        )
-                        self._warn_access_denied("RDS Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
+                    # CLO-602: _warn_swallowed records an AccessDenied once;
+                    # an explicit record here doubled it.
                     # CLO-506: counted (DetectorErrors), one WARNING per
                     # region, not one line per instance.
                     self._warn_swallowed("RDS metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
@@ -2571,6 +2596,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 status=pc.get('Status', 'UNKNOWN'),
                 avg_utilization_pct=avg_util,
                 utilization_read_failed=bool(read_failed),
+                utilization_read_error=self._error_label(read_failed[0]) if read_failed else None,
             ))
         return configs
 
@@ -2594,7 +2620,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             if cloudwatch is None:
                 cloudwatch = self._get_client('cloudwatch')
             end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=14)
+            start_time = end_time - timedelta(days=PROVISIONED_CONCURRENCY_WINDOW_DAYS)
             
             response = cloudwatch.get_metric_statistics(
                 Namespace='AWS/Lambda',
@@ -2702,17 +2728,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         period_days=days,
                         is_idle=bytes_out == 0,
                     )
-                except ClientError as e:
-                    if self._is_access_denied(e):
-                        self._record_permission_error(
-                            resource="NAT Gateway Metrics (per-resource)", permission="cloudwatch:GetMetricStatistics", error=e,
-                        )
-                        self._warn_access_denied("NAT Gateway Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e)
-                    logger.warning(f"Error fetching NAT Gateway metrics for {nat_id}: {e}")
+                except (ClientError, BotoCoreError) as e:
+                    # CLO-602: a failed read is MISSING: the gateway is left
+                    # out of the map (the detector skips one with no
+                    # metrics) instead of storing a default model.
+                    # _warn_swallowed counts it and records an AccessDenied once.
+                    self._warn_swallowed(
+                        "NAT Gateway Metrics (per-resource)", "cloudwatch:GetMetricStatistics", e,
+                    )
                     self._note_idle_verdict_missing(
                         'nat gateway', nat_id, f"read failed ({self._error_label(e)})",
                     )
-                    metrics[nat_id] = NATGatewayMetricsData(nat_gateway_id=nat_id, period_days=days)
         except Exception as e:
             if self._is_access_denied(e):
                 self._record_permission_error(
@@ -3202,8 +3228,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                                     {'Name': 'BucketName', 'Value': bucket_name},
                                     {'Name': 'StorageType', 'Value': 'StandardStorage'},
                                 ],
-                                StartTime=now - timedelta(days=32),
-                                EndTime=now - timedelta(days=28),
+                                StartTime=now - timedelta(days=S3_GROWTH_BASELINE_MAX_DAYS_AGO),
+                                EndTime=now - timedelta(days=S3_GROWTH_BASELINE_MIN_DAYS_AGO),
                                 Period=86400,
                                 Statistics=['Average'],
                             )
@@ -3643,7 +3669,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     image_count = len(images)
                     
                     from datetime import datetime, timezone, timedelta
-                    cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
+                    cutoff_date = datetime.now(timezone.utc) - timedelta(days=ECR_OLD_IMAGE_AGE_DAYS)
                     
                     for image in images:
                         size = image.get('imageSizeInBytes', 0)
@@ -4178,9 +4204,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # Fetch replication groups for topology info
             replication_groups = {}
             try:
-                rg_response = elasticache.describe_replication_groups()
-                for rg in rg_response.get('ReplicationGroups', []):
-                    replication_groups[rg['ReplicationGroupId']] = rg
+                # CLO-633: every page (Marker); one call returns at most 100
+                # groups, and a group on a later page left its nodes with
+                # unknown topology.
+                for rg_page in elasticache.get_paginator('describe_replication_groups').paginate():
+                    for rg in rg_page.get('ReplicationGroups', []):
+                        replication_groups[rg['ReplicationGroupId']] = rg
             except Exception as e:
                 self._warn_swallowed(
                     "ElastiCache replication groups", "elasticache:DescribeReplicationGroups", e,
@@ -4219,6 +4248,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # CLO-630: a node whose replication group was not read has
                 # default topology, not a known standalone one.
                 topology_known = not rg_id or rg_id in replication_groups
+                # CLO-633: a group read with no NodeGroups (one that is not
+                # yet available) has no shard or replica layout to judge; the
+                # default 1 shard / 0 replicas would read as standalone.
+                if rg_id and rg_id in replication_groups and not replication_groups[rg_id].get('NodeGroups'):
+                    topology_known = False
                 global_datastore = False
                 if rg_id and rg_id in replication_groups:
                     rg = replication_groups[rg_id]
@@ -4742,6 +4776,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     )
                 continue
 
+            self._warn_forbidden_metric_queries(
+                "ElastiCache request metrics", failed_nodes.values(),
+            )
             for cluster_id in batch:
                 if cluster_id in failed_nodes:
                     self._note_idle_verdict_missing(
@@ -6058,6 +6095,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     
                     # CPU Utilization (/aws/sagemaker/Endpoints namespace — Container Insights)
                     cpu_avg = 0.0
+                    instance_metrics_seen = False
                     try:
                         cpu_response = cloudwatch.get_metric_statistics(
                             Namespace='/aws/sagemaker/Endpoints',
@@ -6075,6 +6113,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             cpu_response.get('Datapoints', []), created, 86400,
                         )
                         if cpu_datapoints:
+                            instance_metrics_seen = True
                             cpu_avg = sum(dp.get('Average', 0) for dp in cpu_datapoints) / len(cpu_datapoints)
                     except Exception as e:
                         self._warn_swallowed(
@@ -6100,12 +6139,25 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             mem_response.get('Datapoints', []), created, 86400,
                         )
                         if mem_datapoints:
+                            instance_metrics_seen = True
                             mem_avg = sum(dp.get('Average', 0) for dp in mem_datapoints) / len(mem_datapoints)
                     except Exception as e:
                         self._warn_swallowed(
                             "SageMaker endpoint memory utilization", "cloudwatch:GetMetricStatistics", e,
                         )
                     
+                    # CLO-602: an empty Invocations series is not a published
+                    # 0. SageMaker publishes Invocations only while requests
+                    # arrive, so silence is idle only when the instance
+                    # metrics (published while the endpoint runs, traffic or
+                    # not) prove the read path works. With neither series the
+                    # verdict is MISSING, never zero.
+                    if not inv_datapoints and not instance_metrics_seen:
+                        self._note_idle_verdict_missing(
+                            'sagemaker', endpoint_name, "no datapoints",
+                        )
+                        continue
+
                     metrics[endpoint_name] = SageMakerMetricsData(
                         endpoint_name=endpoint_name,
                         invocations_total=int(total_invocations),
@@ -6226,6 +6278,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     datapoints = drop_pre_creation_datapoints(
                         response.get('Datapoints', []), created, 86400 * days,
                     )
+                    # An empty IncomingRecords series is AWS's idle signal: a
+                    # zero-activity stream returns Datapoints: [] (recorded
+                    # 2026-10-20, tests/recordings/kinesis/us-east-1.json), so
+                    # it sums to 0. A failed read is MISSING (CLO-485, below).
                     incoming_records = sum(dp.get('Sum', 0) for dp in datapoints)
 
                     # IncomingBytes (daily breakdown for CV calculation)
@@ -9164,6 +9220,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             cache[(broker_id, days)] = None
             return None
 
+        self._warn_forbidden_metric_queries("MQ Metrics", incomplete.values())
         needed = days * 24 * 0.75
         activity_ok = all(
             len(points[key]) >= needed and key not in incomplete for key in ('msg', 'con', 'pro')
@@ -9385,7 +9442,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         try:
             ls = self._get_client('lightsail')
             end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=14)
+            start_time = end_time - timedelta(days=LIGHTSAIL_METRIC_WINDOW_DAYS)
 
             if resource_type == 'instance':
                 response = ls.get_instance_metric_data(
@@ -9407,7 +9464,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     avg_cpu=avg_cpu,
                     max_cpu=max_cpu,
                     cpu_datapoints=len(cpu_data),
-                    cpu_window_hours=14 * 24,
+                    cpu_window_hours=LIGHTSAIL_METRIC_WINDOW_DAYS * 24,
                 )
             elif resource_type == 'database':
                 cpu_response = ls.get_relational_database_metric_data(
@@ -9841,7 +9898,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
     async def get_workspaces_metrics(
         self,
         workspace_ids: List[str],
-        days: int = 14,
+        days: int = WORKSPACES_METRIC_WINDOW_DAYS,
     ) -> Dict[str, WorkspaceMetricsData]:
         """CloudWatch metrics for WorkSpaces, in batched GetMetricData requests.
 
