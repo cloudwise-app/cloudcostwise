@@ -320,7 +320,7 @@ class S3BucketData:
     has_intelligent_tiering: bool = False      # Has IT configuration
     size_previous_bytes: int = 0              # Total size 30 days ago (for growth)
     size_growth_pct_30d: float = 0.0          # Growth percentage over 30 days
-    default_encryption_enabled: bool = True    # S3 default encryption (SSE-S3 default since Jan 2023)
+    default_encryption_enabled: Optional[bool] = True  # None = not read (CLO-580)
     encryption_algorithm: Optional[str] = None # 'AES256' (SSE-S3) or 'aws:kms'
     # CLO-385: Maximum NumberOfObjects over a lookback window, checked only
     # for a bucket that is currently empty AND has a lifecycle expiration
@@ -1607,6 +1607,9 @@ class LightsailInstanceData:
     ip_address: Optional[str] = None
     is_static_ip: bool = False
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass
@@ -1617,6 +1620,9 @@ class LightsailStaticIpData:
     is_attached: bool
     attached_to: Optional[str] = None  # Instance name if attached
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass
@@ -1629,6 +1635,9 @@ class LightsailDiskData:
     attached_to: Optional[str] = None  # Instance name if attached
     path: Optional[str] = None
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass
@@ -1640,6 +1649,9 @@ class LightsailSnapshotData:
     from_instance_name: Optional[str] = None
     is_from_auto_snapshot: bool = False
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass
@@ -1652,6 +1664,9 @@ class LightsailLoadBalancerData:
     instance_health_summary: List[Dict[str, str]] = field(default_factory=list)
     tls_certificate_summaries: List[Dict[str, str]] = field(default_factory=list)
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass
@@ -1665,6 +1680,9 @@ class LightsailDatabaseData:
     master_database_name: str
     secondary_availability_zone: Optional[str] = None  # Populated if HA
     region: Optional[str] = None
+    # CLO-740: the resource's ARN as the Lightsail API returns it. The CUR
+    # bills Lightsail by this UUID ARN, never by the name.
+    arn: Optional[str] = None
 
 
 @dataclass

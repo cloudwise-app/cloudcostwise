@@ -1069,13 +1069,20 @@ class OpenStorageDetectorsMixin:
           4. Absolute growth > s3_growth_min_absolute_gb (default 10 GB)
           5. No lifecycle policy with expiration rules present
         """
+        # CLO-738: the 30-day baseline is a Standard size, so every size here
+        # is the bucket's Standard bytes. A bucket with no class breakdown
+        # (a bare record) is read as all Standard.
+        breakdown = bucket.storage_class_breakdown or {}
+        standard_bytes = (
+            breakdown.get('StandardStorage', 0) if breakdown else bucket.total_size_bytes
+        )
         # Require size metrics
-        if bucket.total_size_bytes <= 0 or bucket.size_previous_bytes <= 0:
+        if standard_bytes <= 0 or bucket.size_previous_bytes <= 0:
             return []
         
         # Minimum current size
         min_size_bytes = int(settings.s3_growth_min_size_gb * self.GB)
-        if bucket.total_size_bytes < min_size_bytes:
+        if standard_bytes < min_size_bytes:
             return []
         
         # Check growth rate
@@ -1084,7 +1091,7 @@ class OpenStorageDetectorsMixin:
             return []
         
         # Check absolute growth
-        growth_bytes = bucket.total_size_bytes - bucket.size_previous_bytes
+        growth_bytes = standard_bytes - bucket.size_previous_bytes
         min_absolute_bytes = int(settings.s3_growth_min_absolute_gb * self.GB)
         if growth_bytes < min_absolute_bytes:
             return []
@@ -1097,7 +1104,7 @@ class OpenStorageDetectorsMixin:
         if has_expiration:
             return []
         
-        curr_gb = bucket.total_size_bytes / self.GB
+        curr_gb = standard_bytes / self.GB
         prev_gb = bucket.size_previous_bytes / self.GB
         growth_gb = growth_bytes / self.GB
         current_cost = curr_gb * S3_STANDARD_PER_GB

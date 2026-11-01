@@ -22,6 +22,7 @@ from cloudwise_scan_core.billed_cost import (
     DEFAULT_MIN_DAYS_COVERED,
     DISCOUNT_LINE_ITEM_TYPES,
     BilledCostLookup,
+    BilledCostMatch,
     BilledCostPort,
     BilledCostProvider,
     BilledCostRollup,
@@ -111,6 +112,7 @@ __all__ = [
     "ParameterStoreProvider",
     # Billed-cost reconciliation (CLO-234)
     "BilledCostLookup",
+    "BilledCostMatch",
     "BilledCostPort",
     "BilledCostProvider",
     "BilledCostRollup",

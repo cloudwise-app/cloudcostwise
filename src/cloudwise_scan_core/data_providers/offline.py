@@ -1688,19 +1688,32 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # [] for them, so every bucket read 0 bytes and 0 objects.
             storage_breakdown = {}
             total_size = 0
+            # CLO-734: the five Intelligent-Tiering tier dimensions AWS
+            # documents (export script 1.28.0+) sum into the one
+            # 'IntelligentTieringStorage' breakdown key. An older export wrote
+            # ``IntelligentTieringStorage`` itself, an invalid dimension whose
+            # file is always empty; it is still read, harmlessly.
             storage_types = [
-                'StandardStorage', 'IntelligentTieringStorage', 'StandardIAStorage',
-                'OneZoneIAStorage', 'GlacierStorage', 'GlacierInstantRetrievalStorage',
-                'DeepArchiveStorage',
+                'StandardStorage', 'IntelligentTieringStorage',
+                'IntelligentTieringFAStorage', 'IntelligentTieringIAStorage',
+                'IntelligentTieringAIAStorage', 'IntelligentTieringAAStorage',
+                'IntelligentTieringDAAStorage',
+                'StandardIAStorage', 'OneZoneIAStorage', 'GlacierStorage',
+                'GlacierInstantRetrievalStorage', 'DeepArchiveStorage',
+                'ReducedRedundancyStorage',
             ]
             has_intelligent_tiering = False
             
             for storage_type in storage_types:
                 size = self._latest_s3_metric_value(f"s3_size_{bucket_name}_{storage_type}")
                 if size and size > 0:
-                    storage_breakdown[storage_type] = size
+                    key = (
+                        'IntelligentTieringStorage'
+                        if storage_type.startswith('IntelligentTiering') else storage_type
+                    )
+                    storage_breakdown[key] = storage_breakdown.get(key, 0) + size
                     total_size += size
-                    if storage_type == 'IntelligentTieringStorage':
+                    if key == 'IntelligentTieringStorage':
                         has_intelligent_tiering = True
             
             # Object count
@@ -1709,12 +1722,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # Growth data (30 days ago)
             size_previous = 0
             growth_pct = 0.0
-            if total_size > 0:
+            # CLO-738: the baseline is a Standard size, so it is compared with
+            # today's Standard bytes for every bucket (see the online provider).
+            standard_size = storage_breakdown.get('StandardStorage', 0)
+            if standard_size > 0:
                 prev_size = self._latest_s3_metric_value(f"s3_growth_{bucket_name}")
                 if prev_size and prev_size > 0:
                     size_previous = prev_size
                     growth_pct = round(
-                        ((total_size - prev_size) / prev_size) * 100, 1
+                        ((standard_size - prev_size) / prev_size) * 100, 1
                     )
 
             # CLO-488: emptiness needs an observed listing, as online. S3
@@ -1726,10 +1742,29 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             # has no KeyCount: the bucket's contents are MISSING, and
             # s3_empty_bucket must not fire.
             contents_observed = total_size > 0
+            version_read_failed = False
             key_count = self._s3_key_count_sample(bucket)
             if total_size == 0 and key_count is not None:
+                cw_object_count = object_count
                 object_count = key_count
                 contents_observed = True
+                # CLO-734: export script 1.28.0+ adds a ListObjectVersions
+                # sample (``VersionKeyCount``) when the current-object sample
+                # is empty. A noncurrent version or delete marker means the
+                # bucket is not empty; null means the read failed
+                # (s3:ListBucketVersions denied), so the contents are unknown,
+                # but only when CloudWatch counted objects (as online): a
+                # bucket it counts nothing in has no versions to hide, and
+                # the denial must not hide a truly empty one. An export
+                # without the field (older script) reads as before.
+                if key_count == 0 and 'VersionKeyCount' in bucket:
+                    version_count = bucket.get('VersionKeyCount')
+                    if isinstance(version_count, bool) or not isinstance(version_count, (int, float)):
+                        if cw_object_count > 0:
+                            contents_observed = False
+                            version_read_failed = True
+                    elif version_count > 0:
+                        object_count = 1
             
             bucket_region = bucket.get('region') or bucket.get('Location') or 'us-east-1'
             if bucket_region == 'EU':
@@ -1755,6 +1790,8 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     and bucket_region == self._region):
                 self._note_idle_verdict_missing(
                     's3', bucket_name,
+                    "no version listing in export (s3:ListBucketVersions denied)"
+                    if version_read_failed else
                     "no object listing in export (export script older than 1.13.0, "
                     "or s3:ListBucket denied)",
                     verdict="empty-bucket", evidence="object listings",
@@ -5106,6 +5143,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 ip_address=i.get('publicIpAddress'),
                 is_static_ip=i.get('isStaticIp', False),
                 region=self._region,
+                arn=i.get('arn'),
             ))
         return results
 
@@ -5119,6 +5157,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 is_attached=ip.get('isAttached', False),
                 attached_to=ip.get('attachedTo'),
                 region=self._region,
+                arn=ip.get('arn'),
             ))
         return results
 
@@ -5134,6 +5173,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 attached_to=d.get('attachedTo'),
                 path=d.get('path'),
                 region=self._region,
+                arn=d.get('arn'),
             ))
         return results
 
@@ -5157,6 +5197,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 from_instance_name=s.get('fromInstanceName'),
                 is_from_auto_snapshot=s.get('isFromAutoSnapshot', False),
                 region=self._region,
+                arn=s.get('arn'),
             ))
         return results
 
@@ -5172,6 +5213,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 instance_health_summary=lb.get('instanceHealthSummary', []),
                 tls_certificate_summaries=lb.get('tlsCertificateSummaries', []),
                 region=self._region,
+                arn=lb.get('arn'),
             ))
         return results
 
@@ -5188,6 +5230,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 master_database_name=db.get('masterDatabaseName', ''),
                 secondary_availability_zone=db.get('secondaryAvailabilityZone'),
                 region=self._region,
+                arn=db.get('arn'),
             ))
         return results
 

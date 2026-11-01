@@ -1807,6 +1807,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Deleting a Lightsail instance permanently removes it and its data. Create a snapshot first if you need to preserve the data.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': inst.arn,
                             'instance_name': name,
                             'bundle_id': bundle,
                             'detection_mode': data_provider.provider_type,
@@ -1836,16 +1838,22 @@ class OpenComputeDetectorsMixin:
                                 description=f"Lightsail instance '{name}' ({bundle}) has avg CPU {metrics.avg_cpu:.1f}% over 14 days.",
                                 monthly_savings=monthly_cost,
                                 confidence=ConfidenceLevel.HIGH,
-                                action="Stop or delete this instance.",
-                                action_command=f"aws lightsail stop-instance --instance-name {name}",
+                                action="Snapshot, then delete this instance. A stopped Lightsail instance is still billed.",
+                                action_command=f"aws lightsail delete-instance --instance-name {name}",
                                 explanation={
                                     'detection': f'CPU avg {metrics.avg_cpu:.1f}% over 14 days',
                                     'threshold': 'CPU avg < 5% for 14 days',
                                     'pricing': f'Bundle {bundle}: ${monthly_cost:.2f}/month',
                                     'why_waste': 'Instance shows near-zero CPU utilization, suggesting it is not serving any workload.',
-                                    'risk': 'Stopping preserves the instance; deleting is permanent. Create a snapshot first if needed.',
+                                    'risk': (
+                                        'Stopping does not reduce the bill: Lightsail charges a stopped instance '
+                                        'its bundle price (CLO-709). Deleting is permanent; create a snapshot first '
+                                        '($0.05/GB-month) to keep the data.'
+                                    ),
                                 },
                                 metadata={
+                                    # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                                    'cur_resource_id': inst.arn,
                                     'instance_name': name,
                                     'bundle_id': bundle,
                                     'avg_cpu': metrics.avg_cpu,
@@ -1898,6 +1906,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Releasing a static IP deallocates it permanently. The same IP address cannot be recovered.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': ip.arn,
                             'ip_address': ip.ip_address,
                             'detection_mode': data_provider.provider_type,
                         }
@@ -1937,6 +1947,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Deleting a disk permanently removes all data. Create a disk snapshot first if you need to preserve the data.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': disk.arn,
                             'size_in_gb': disk.size_in_gb,
                             'state': disk.state,
                             'detection_mode': data_provider.provider_type,
@@ -1987,6 +1999,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Deleting a snapshot is irreversible. Verify you do not need this snapshot for recovery before deletion.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': snap.arn,
                             'age_days': age_days,
                             'size_in_gb': snap.size_in_gb,
                             'from_instance': snap.from_instance_name,
@@ -2033,6 +2047,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Deleting a load balancer removes its DNS name and TLS certificate bindings. Ensure no DNS records point to this load balancer before deletion.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': lb.arn,
                             'dns_name': lb.dns_name,
                             'instance_port': lb.instance_port,
                             'total_instances': len(health_summary),
@@ -2085,6 +2101,8 @@ class OpenComputeDetectorsMixin:
                             'risk': 'Deleting a database permanently removes all data. Create a final snapshot first.',
                         },
                         metadata={
+                            # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                            'cur_resource_id': db.arn,
                             'engine': db.engine,
                             'bundle_id': bundle,
                             'is_ha': db.secondary_availability_zone is not None,
@@ -2107,16 +2125,22 @@ class OpenComputeDetectorsMixin:
                                 description=f"Database '{db.name}' ({bundle}) has <5% CPU and <1 connection for 14 days.",
                                 monthly_savings=monthly_cost,
                                 confidence=ConfidenceLevel.HIGH,
-                                action="Stop or delete this database.",
+                                action="Snapshot, then delete this database. A stopped Lightsail database is still billed.",
                                 action_command=f"aws lightsail delete-relational-database --relational-database-name {db.name}",
                                 explanation={
                                     'detection': f'CPU avg {metrics.avg_cpu:.1f}% and {metrics.avg_connections:.1f} avg connections over 14 days',
                                     'threshold': 'CPU avg < 5% AND connections avg < 1 for 14 days',
                                     'pricing': f'Bundle {bundle}: ${monthly_cost:.2f}/month',
                                     'why_waste': 'Database shows near-zero utilization, suggesting no application is actively using it.',
-                                    'risk': 'Stopping a database preserves data but pauses it for up to 7 days (auto-restarts after). Deleting is permanent.',
+                                    'risk': (
+                                        'Stopping does not reduce the bill: Lightsail charges a stopped database '
+                                        'its bundle price, and starts it again after 7 days (CLO-709). Deleting is '
+                                        'permanent; create a snapshot first.'
+                                    ),
                                 },
                                 metadata={
+                                    # CLO-740: the CUR bills Lightsail by UUID ARN, not name.
+                                    'cur_resource_id': db.arn,
                                     'engine': db.engine,
                                     'bundle_id': bundle,
                                     'avg_cpu': metrics.avg_cpu,

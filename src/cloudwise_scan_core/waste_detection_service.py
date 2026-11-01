@@ -746,6 +746,7 @@ class WasteDetectionServiceBase:
         force_refresh: bool = False,
         enabled_services: List[str] = None,
         customer_tier: str = None,
+        scan_id: Optional[str] = None,
     ) -> WasteDetectionResult:
         """
         Run comprehensive waste detection for an AWS account.
@@ -767,6 +768,9 @@ class WasteDetectionServiceBase:
                             allowed set are filtered out before execution
                             (Phase 5 §3.7). Unknown / missing tier falls
                             back to the Free tier set as a cost fail-safe.
+            scan_id: Ignored. The scan-engine layer and the region scanner's
+                            zip deploy separately, and a scanner from before this
+                            change still passes it. Remove it one release later.
             
         Returns:
             WasteDetectionResult with all findings
@@ -790,14 +794,6 @@ class WasteDetectionServiceBase:
             logger.warning(f"force_refresh=True, bypassing cache for account {account_id}")
         
         try:
-            # CLO-358: one dict shared by every detector's fresh
-            # OnlineDataProvider for the duration of THIS detect_waste()
-            # call only — created fresh per call, so it never leaks a
-            # cached breakdown into a later scan of a different account or
-            # region. Without it, rds and aurora (and any other pair asking
-            # for the same (service_keys, days)) each pay for their own
-            # identical, customer-billed ce:GetCostAndUsage call.
-            extended_support_cache: Dict[Any, Any] = {}
             creds = {
                 'access_key_id': access_key_id,
                 'secret_access_key': secret_access_key,
@@ -805,7 +801,6 @@ class WasteDetectionServiceBase:
                 'session_token': session_token,
                 'account_id': account_id,  # AWS account ID for caching
                 'customer_tier': customer_tier,  # Phase 5 §3.7 — threaded into EMF
-                'extended_support_cache': extended_support_cache,  # CLO-358
             }
             
             is_global_scan_region = (region == 'us-east-1')
@@ -1538,6 +1533,34 @@ class WasteDetectionServiceBase:
                     estimated_savings=estimate,
                     resource_id=item.resource_id,
                     lookup=lookup,
+                    # CLO-736: secret findings carry the bare name; the CUR
+                    # carries the ARN with Secrets Manager's random suffix.
+                    secretsmanager_secret=(
+                        item.resource_type == ResourceType.SECRETS_MANAGER_SECRET
+                    ),
+                    # CLO-737: ALB/NLB, MSK, SageMaker endpoint and Lambda
+                    # findings carry names the shared aliases cannot (or,
+                    # through a same-named log group, ambiguously) reach.
+                    # CLO-740: a REST API's per-stage CUR rows are summed.
+                    resource_type=item.resource_type,
+                    # CLO-740: ECS service findings keep their estimate; the
+                    # CUR bills tasks and cannot name the service.
+                    waste_type=item.waste_type,
+                    region=item.region,
+                    lb_type=(
+                        item.metadata.get("lb_type")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
+                    # CLO-740: the id the CUR bills the resource under, when
+                    # the detector knows it and the name cannot reach it
+                    # (Lightsail findings carry the name; the CUR keys them
+                    # by a UUID ARN).
+                    cur_resource_id=(
+                        item.metadata.get("cur_resource_id")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
                 )
 
             item.estimated_savings_list_price = estimate
@@ -1669,10 +1692,6 @@ class WasteDetectionServiceBase:
 
         account_id = (creds or {}).get("account_id") or ""
         region = (creds or {}).get("region") or ""
-        # CLO-358: shared dict from detect_waste(), passed through to the
-        # fresh OnlineDataProvider built below so every detector in this
-        # scan reuses the same extended-support CE query cache.
-        extended_support_cache = (creds or {}).get("extended_support_cache")
         environment = os.environ.get("ENVIRONMENT") or os.environ.get(
             "CLOUDWISE_ENVIRONMENT", "unknown"
         )
@@ -1805,7 +1824,6 @@ class WasteDetectionServiceBase:
                     region=creds['region'],
                     session_token=creds.get('session_token'),
                     account_id=creds.get('account_id'),
-                    extended_support_cache=extended_support_cache,  # CLO-358
                 )
             
             async with self._get_api_semaphore():

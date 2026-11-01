@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 31 at L1, 38 at L2, 22 at L3.
+Summary for the checks in this repository: 30 at L1, 37 at L2, 23 at L3, 1 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -36,7 +36,7 @@ proven checks only.
 | `elasticache_extended_support_cost` | L2 |  | none |
 | `elasticache_replication_waste` | L2 |  |  |
 | `elasticache_serverless_optimization` | L1 |  |  |
-| `empty_log_group` | L3 |  | none |
+| `empty_log_group` | L4 |  | none |
 | `excessive_retention_log_group` | L2 |  | partial |
 | `gp2_migration` | L3 |  |  |
 | `high_lcu_cost_alb` | L1 | yes |  |
@@ -64,7 +64,7 @@ proven checks only.
 | `low_traffic_alb` | L2 |  | none |
 | `multiple_eips_per_instance` | L3 |  | none |
 | `no_lifecycle_efs` | L2 |  | none |
-| `no_lifecycle_policy` | L2 |  | covered |
+| `no_lifecycle_policy` | L3 |  | covered |
 | `no_retention_log_group` | L2 |  | partial |
 | `old_ebs_snapshot` | L1 |  |  |
 | `old_ecr_images` | L3 |  | partial |
@@ -97,7 +97,7 @@ proven checks only.
 | `s3_high_request_and_transfer_cost` | L1 | yes |  |
 | `s3_no_default_encryption` | L1 | yes |  |
 | `s3_rapid_growth` | L1 |  |  |
-| `s3_wrong_storage_class` | L2 |  | partial |
+| `s3_wrong_storage_class` | L3 |  | partial |
 | `sp_opportunity_compute` | L1 | yes |  |
 | `sp_opportunity_ec2` | L1 | yes |  |
 | `sp_opportunity_sagemaker` | L1 | yes |  |
@@ -111,7 +111,7 @@ proven checks only.
 | `unencrypted_rds_instance` | L3 |  | covered |
 | `untagged_ecr_images` | L3 |  | partial |
 | `unused_dashboard` | L1 |  |  |
-| `unused_lambda` | L1 |  |  |
+| `unused_lambda` | L2 |  |  |
 | `unused_vpc_endpoint` | L1 |  |  |
 | `workspaces_autostop_opportunity` | L1 |  |  |
 | `workspaces_pool_overprovisioned_capacity` | L1 | yes |  |

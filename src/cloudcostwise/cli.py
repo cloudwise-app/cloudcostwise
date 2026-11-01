@@ -22,8 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--regions", help="comma-separated regions, or 'all' (default: us-east-1 plus your profile's region)")
     s.add_argument("--format", choices=["table", "markdown", "json"], default="table")
     s.add_argument("--no-cost-explorer", action="store_true",
-                   help="make no Cost Explorer call ($0.01 per request): skips the RI/Savings Plans checks; "
-                        "extended-support surcharges fall back to estimates")
+                   help="make no Cost Explorer call ($0.01 per request): skips the RI/Savings Plans checks")
     s.add_argument("--parallel", type=int, default=4, metavar="N",
                    help="regions scanned at once, each in its own process (default 4; 1 = one at a time)")
     s.add_argument("--verbose", "-v", action="store_true", help="show data warnings and engine logs")
@@ -59,7 +58,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if not args.no_cost_explorer and args.format == "table":
-        print("note: the RI/Savings Plans and extended-support checks call Cost Explorer, which AWS bills at "
+        print("note: the RI/Savings Plans checks call Cost Explorer, which AWS bills at "
               f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan). "
               "Add --no-cost-explorer to skip them.", file=sys.stderr)
 

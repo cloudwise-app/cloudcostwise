@@ -807,7 +807,10 @@ class OpenDatabaseDetectorsMixin:
                             description=f"Database '{db.db_instance_id}' ({db.db_instance_class}) has had 0 connections for {metrics.period_days} days.",
                             monthly_savings=monthly_cost,
                             confidence=ConfidenceLevel.HIGH,
-                            action="Stop or delete this database.",
+                            action=(
+                                "Snapshot, then delete this database if it is no longer needed. "
+                                "Stopping saves at most 7 days: RDS starts a stopped instance again after a week."
+                            ),
                             action_command=f"aws rds stop-db-instance --db-instance-identifier {db.db_instance_id}",
                             explanation={
                                 'detection': f'CloudWatch DatabaseConnections = 0 for {metrics.period_days} consecutive days',

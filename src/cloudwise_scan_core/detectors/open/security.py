@@ -306,7 +306,12 @@ class SecurityPostureDetectorsMixin:
         try:
             buckets = await data_provider.get_s3_buckets()
             for bucket in buckets:
-                if not bucket.default_encryption_enabled:
+                # CLO-602: S3 buckets are global but scanned per region; judge a
+                # bucket only in its own region (as the storage detectors do),
+                # so the CLI lists it once, not once per scanned region.
+                if bucket.region and bucket.region != data_provider.region:
+                    continue
+                if bucket.default_encryption_enabled is False:  # None: not read (CLO-580)
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
                         resource_id=bucket.bucket_name,

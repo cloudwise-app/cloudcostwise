@@ -31,6 +31,7 @@ Safety contract — note how this differs from ``credential_cache``:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Mapping, Optional, Protocol, Sequence, runtime_checkable
@@ -125,6 +126,25 @@ class ReconciliationStatus:
     #: mirrors this string because that Lambda has no scan-core layer.
     RECONCILED_HUB_AFTER_DISCOUNTS = "reconciled_hub_after_discounts"
 
+    #: CLO-739: the finding's name matched more than one CUR resource (an
+    #: alias two resources share, e.g. an endpoint and its same-named log
+    #: group), nothing matched it uniquely, and those resources' bills
+    #: disagree. We cannot tell which bill is this resource's, so we cannot
+    #: say AWS bills it $0 either (if every candidate bills $0, it reads as
+    #: ``CONFIRMED_ZERO_BILLED`` as before; see ``BilledCostMatch``). Estimate
+    #: stands, labelled. Before CLO-739 this read as ``CONFIRMED_ZERO_BILLED``
+    #: and the $0.01 floor dropped the finding.
+    UNRECONCILED_AMBIGUOUS = "unreconciled_ambiguous"
+
+    #: CLO-740: AWS bills ECS by task, and the CUR cannot tie a task to its
+    #: service: a task ARN names the cluster and the task only, our ingest
+    #: stores no tags or split-cost columns, and ListTasks returns only
+    #: current tasks. A service-level finding therefore has no billed cost we
+    #: can read, whichever rows the CUR holds. Estimate stands, labelled.
+    #: Before CLO-740 this read as ``CONFIRMED_ZERO_BILLED`` and the $0.01
+    #: floor dropped the finding. See ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
+    UNRECONCILED_NOT_ATTRIBUTABLE = "unreconciled_not_attributable"
+
     #: Every status that leaves ``monthly_savings`` at the list-price estimate.
     UNRECONCILED = frozenset(
         {
@@ -132,8 +152,34 @@ class ReconciliationStatus:
             UNRECONCILED_DISCOUNTED,
             UNRECONCILED_INSUFFICIENT_DATA,
             UNRECONCILED_COMMITMENT,
+            UNRECONCILED_AMBIGUOUS,
+            UNRECONCILED_NOT_ATTRIBUTABLE,
         }
     )
+
+
+#: CLO-740: the ``(resource type, waste type)`` findings no CUR row can be
+#: attributed to, as plain values (see ``_resource_type_key``). Every ECS
+#: finding carries the ``ecs_service`` resource type, so the type alone would
+#: also catch these two, deliberately left out:
+#: - ``idle_ecs_service``: a governance finding with a $0 estimate. A service
+#:   with no running task bills nothing, so its zero is true.
+#: - ``ecs_container_insights_waste``: id is the cluster, and its cost is
+#:   CloudWatch metrics, not ECS tasks, so the reason this status gives
+#:   customers would be false. An empty cluster really does bill $0.
+#: All three types here only produce a saving for Fargate services (the
+#: detectors gate on ``launchType``); the EC2 launch type bills instances. An
+#: account threshold of $0 lets ``ecs_no_autoscaling`` fire at $0 on EC2, so
+#: only a non-zero estimate qualifies: there is nothing to keep at $0, and the
+#: customer note would be false for that service.
+CUR_NOT_ATTRIBUTABLE_RESOURCE_TYPE = "ecs_service"
+CUR_NOT_ATTRIBUTABLE_WASTE_TYPES = frozenset(
+    {
+        "oversized_ecs_task",
+        "oversized_ecs_memory",
+        "ecs_no_autoscaling",
+    }
+)
 
 
 class CostBasis:
@@ -203,6 +249,233 @@ def resource_id_aliases(resource_id: str) -> set:
     return {k for k in keys if k}
 
 
+#: Secrets Manager appends "-" plus six random alphanumerics to every secret
+#: ARN: secret ``cwfx-unused-secret`` is billed in the CUR as
+#: ``arn:aws:secretsmanager:us-east-1:123456789012:secret:cwfx-unused-secret-9kIlqu``.
+_SECRET_ARN_SUFFIX = re.compile(r"^(.+)-[A-Za-z0-9]{6}$")
+
+
+def _secretsmanager_secret_name(arn: str) -> Optional[str]:
+    """The secret's own name from a full Secrets Manager secret ARN (CLO-736).
+
+    Detectors emit the name ``ListSecrets`` returns; the CUR keys the secret
+    by its suffixed ARN. Without this key the two never met, the finding read
+    as ``confirmed_zero_billed`` and the $0.01 floor dropped it.
+
+    Deliberately NOT part of :func:`resource_id_aliases`: a stripped secret
+    name is often the name of the resource the secret belongs to (secret
+    ``prod-db-AbCdEf`` next to RDS ``prod-db``). In the shared alias index it
+    would make that resource's bare-name alias ambiguous, the alias would be
+    dropped, and the RDS finding would be zeroed. It lives in its own index,
+    ``BilledCostLookup.by_secret_name``, read only for Secrets Manager
+    findings.
+
+    - Scoped to ``secretsmanager`` + resource type ``secret``. Any partition.
+    - Strips the *whole* name after ``:secret:``, so ``prod/db/password-AbCdEf``
+      yields ``prod/db/password`` (names may contain ``/``, never ``:``).
+    - Strips exactly once: ``foo-abc123-XyZ9qQ`` yields ``foo-abc123``.
+    - Assumes the full ARN, which is what the CUR carries. A partial ARN
+      (no suffix) whose name happens to end in ``-`` + 6 alphanumerics, e.g.
+      ``...:secret:db-abc123``, would wrongly yield ``db``.
+    """
+    parts = arn.split(":", 6)
+    if len(parts) != 7 or parts[2] != "secretsmanager" or parts[5] != "secret":
+        return None
+    match = _SECRET_ARN_SUFFIX.match(parts[6])
+    return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Per-resource-type name indexes (CLO-737)
+# ---------------------------------------------------------------------------
+#
+# Each deriver takes the ARN split as ``arn.split(":")`` and returns the name
+# the detector for that resource type emits, or ``None`` when the ARN is not
+# that kind of resource. Like ``by_secret_name`` (CLO-736), these names never
+# enter the shared alias index: they are read only by findings of the one
+# resource type they belong to, so they cannot make another resource's alias
+# ambiguous. Every mismatch below was seen in staging CUR for the fixture
+# account (see the CLO-737 PR for the evidence table).
+
+
+def _elb_name(parts: list) -> Optional[str]:
+    """ELB name from ``loadbalancer/app|net|gwy/<name>/<hash>`` or, for a
+    Classic LB, ``loadbalancer/<name>``.
+
+    For ALB/NLB the shared aliases are the hash (slash tail) and the whole
+    ``loadbalancer/app/...`` path (colon tail), never the name the detectors
+    emit (``load_balancer_name``): low_traffic_alb ``cwfx-alb-quiet`` read as
+    confirmed_zero_billed beside its billed ALB ARN.
+
+    Classic LB names are indexed too (they already match through the shared
+    slash tail): ``LOAD_BALANCER`` covers CLB, ALB, NLB and GWLB, and the CLB
+    and ELBv2 name spaces are separate, so a CLB and an ALB may share a name
+    in one region. The finding's ``lb_type`` metadata picks the right one
+    (see :func:`_elb_kind`); without it the two read as ambiguous.
+    """
+    if _elb_kind(parts) is None:
+        return None
+    segs = parts[5].split("/")
+    return (segs[2] if len(segs) == 4 else segs[1]) or None
+
+
+def _elb_kind(parts: list) -> Optional[str]:
+    """``app`` / ``net`` / ``gwy`` / ``classic`` for a load balancer ARN."""
+    if len(parts) != 6 or parts[2] != "elasticloadbalancing":
+        return None
+    segs = parts[5].split("/")
+    if segs[0] != "loadbalancer":
+        return None
+    if len(segs) == 4 and segs[1] in ("app", "net", "gwy"):
+        return segs[1]
+    if len(segs) == 2:
+        return "classic"
+    return None
+
+
+#: The detectors' ``metadata["lb_type"]`` (the ELB API's ``Type``, or
+#: ``classic``) → the ARN's load balancer kind.
+_LB_TYPE_TO_KIND = {
+    "application": "app",
+    "network": "net",
+    "gateway": "gwy",
+    "classic": "classic",
+}
+
+
+def _msk_cluster_name(parts: list) -> Optional[str]:
+    """MSK cluster name from ``cluster/<name>/<uuid>-<n>``.
+
+    The shared aliases are the uuid and the whole path; oversized_msk_cluster
+    ``cwfx-w8b-msk`` read as confirmed_zero_billed beside its billed ARN.
+    """
+    if len(parts) != 6 or parts[2] != "kafka":
+        return None
+    segs = parts[5].split("/")
+    if len(segs) == 3 and segs[0] == "cluster" and segs[1]:
+        return segs[1]
+    return None
+
+
+def _sagemaker_endpoint_name(parts: list) -> Optional[str]:
+    """SageMaker endpoint name from ``endpoint/<name>``, lower-cased.
+
+    The shared slash tail is the name, but every endpoint also writes the log
+    group ``/aws/sagemaker/Endpoints/<name>`` whose slash tail is the same
+    name: the alias was ambiguous, dropped, and idle_sagemaker_endpoint
+    ``cwfx-w8b-ep-idle`` read as confirmed_zero_billed beside a billed
+    endpoint. Keys are lower-cased because SageMaker lower-cases the name in
+    the ARN while ``EndpointName`` keeps its case.
+    """
+    if len(parts) != 6 or parts[2] != "sagemaker":
+        return None
+    segs = parts[5].split("/")
+    if len(segs) == 2 and segs[0] == "endpoint" and segs[1]:
+        return segs[1].lower()
+    return None
+
+
+def _lambda_function_name(parts: list) -> Optional[str]:
+    """Lambda function name from an unqualified ``function:<name>`` ARN.
+
+    Same collision as SageMaker: the function's log group
+    ``/aws/lambda/<name>`` has the function name as its slash tail, so the
+    shared alias of any Lambda that has logged is ambiguous and dropped.
+    Qualified ARNs (``function:<name>:<alias|version>``) are left out: none
+    appear in the evidence, and indexing them would make the function's own
+    unqualified row ambiguous.
+    """
+    if len(parts) != 7 or parts[2] != "lambda" or parts[5] != "function":
+        return None
+    return parts[6] or None
+
+
+#: ``ResourceType`` value → (deriver, normalise the finding's id for lookup).
+_TYPED_NAME_DERIVERS = {
+    "load_balancer": (_elb_name, str),
+    "msk_cluster": (_msk_cluster_name, str),
+    "sagemaker_endpoint": (_sagemaker_endpoint_name, str.lower),
+    "lambda_function": (_lambda_function_name, str),
+}
+
+
+def _api_gateway_rest_api_id(parts: list) -> Optional[str]:
+    """REST API id from ``/restapis/<id>`` or ``/restapis/<id>/stages/<stage>``
+    (CLO-740).
+
+    unused_api_gateway emits ``api_id``. The CUR bills a REST API per stage,
+    ``arn:aws:apigateway:<region>::/restapis/<id>/stages/<stage>``, whose
+    shared slash tail is the stage name (``prod``, shared by every API with a
+    ``prod`` stage) and whose colon tail is the whole path. Neither is the
+    API id, so the finding read as confirmed_zero_billed. HTTP/WebSocket APIs
+    (``/apis/<id>``) are left out: the detector reads REST APIs only.
+    """
+    if len(parts) != 6 or parts[2] != "apigateway":
+        return None
+    segs = parts[5].split("/")
+    # "/restapis/<id>" -> ["", "restapis", "<id>"]
+    if len(segs) < 3 or segs[0] != "" or segs[1] != "restapis" or not segs[2]:
+        return None
+    if len(segs) == 3:
+        return segs[2]
+    if len(segs) == 5 and segs[3] == "stages" and segs[4]:
+        return segs[2]
+    return None
+
+
+#: ``ResourceType`` value -> deriver, for types whose bill is the SUM of
+#: several CUR resources (CLO-740). Unlike ``_TYPED_NAME_DERIVERS``, several
+#: candidates in the finding's region are not ambiguous here: they are the
+#: parts of one bill (a REST API's stages), and
+#: :meth:`BilledCostLookup.match_for` adds them up.
+_TYPED_ROLLUP_DERIVERS = {
+    "api_gateway": _api_gateway_rest_api_id,
+}
+
+
+def _resource_type_key(resource_type) -> Optional[str]:
+    """``ResourceType`` member or plain string → its string value.
+
+    ``ResourceType`` is a ``str`` Enum, whose hash is the member *name*'s, so
+    a dict keyed by values cannot be indexed by the member directly.
+    """
+    if resource_type is None:
+        return None
+    return str(getattr(resource_type, "value", resource_type))
+
+
+def _arn_region(resource_id: str) -> str:
+    """The region field of an ARN, or ``""`` for a non-ARN id or an ARN with
+    no region (S3, IAM)."""
+    if not resource_id.startswith("arn:"):
+        return ""
+    parts = resource_id.split(":")
+    return parts[3] if len(parts) > 3 else ""
+
+
+@dataclass(frozen=True)
+class BilledCostMatch:
+    """What :meth:`BilledCostLookup.match_for` found for one finding (CLO-739).
+
+    ``rollup`` is the one CUR resource the finding matched, or ``None``.
+    ``ambiguous`` is True only when ``rollup`` is ``None`` because the
+    finding's name pointed at more than one CUR resource whose bills
+    disagree: "couldn't tell which" rather than "not in the CUR". Absence is
+    what proves a $0 bill; ambiguity proves nothing. ``candidates`` lists the
+    CUR resource ids behind an ambiguous match, for diagnostics.
+
+    When every candidate bills $0 (``billed_total <= 0``, the same test
+    :func:`reconcile_savings` applies) and none carries discount line items,
+    the bill is $0 whichever one is the finding's, so the match is reported
+    as absent (``ambiguous`` False) and the finding reconciles to
+    ``CONFIRMED_ZERO_BILLED`` exactly as before CLO-739.
+    """
+
+    rollup: Optional[BilledCostRollup] = None
+    ambiguous: bool = False
+    candidates: tuple = ()
+
+
 @dataclass(frozen=True)
 class BilledCostLookup:
     """Batched result of one CUR read for a whole finding set.
@@ -232,6 +505,37 @@ class BilledCostLookup:
     #: Built by :meth:`build`; ambiguous aliases are deliberately omitted.
     by_alias: Mapping[str, str] = field(default_factory=dict)
 
+    #: Alias two or more CUR resources share → those resource ids, left out
+    #: of ``by_alias`` (CLO-739). Kept so a finding that reaches only one of
+    #: them reads as ambiguous (when their bills disagree), not as absent.
+    ambiguous_aliases: Mapping[str, tuple] = field(default_factory=dict)
+
+    #: Secret name with Secrets Manager's ARN suffix stripped → CUR resource
+    #: id (CLO-736). Kept apart from ``by_alias`` so it can never make another
+    #: resource's alias ambiguous; read only by Secrets Manager findings.
+    #: A name two CUR secrets strip to (e.g. two regions) is omitted.
+    by_secret_name: Mapping[str, str] = field(default_factory=dict)
+
+    #: Secret name two or more CUR secrets strip to → those resource ids
+    #: (CLO-739), left out of ``by_secret_name``; see ``ambiguous_aliases``.
+    ambiguous_secret_names: Mapping[str, tuple] = field(default_factory=dict)
+
+    #: ``ResourceType`` value → derived name → every CUR resource id that
+    #: derives it, as ``(region, resource_id)`` pairs (CLO-737). Kept apart
+    #: from ``by_alias`` for the same reason as ``by_secret_name``, read only
+    #: by findings of that resource type. All candidates are kept, so
+    #: :meth:`rollup_for` can narrow a name used in several regions to the
+    #: finding's own region; a name still matching more than one id there is
+    #: ambiguous and not used.
+    by_typed_name: Mapping[str, Mapping[str, tuple]] = field(default_factory=dict)
+
+    #: ``ResourceType`` value -> derived id -> every CUR resource id whose
+    #: bill is part of it, as ``(region, resource_id)`` pairs (CLO-740; see
+    #: ``_TYPED_ROLLUP_DERIVERS``). Kept apart from ``by_alias`` like
+    #: ``by_typed_name``, read only by findings of that type, and summed
+    #: after narrowing to the finding's region.
+    by_typed_rollup: Mapping[str, Mapping[str, tuple]] = field(default_factory=dict)
+
     @classmethod
     def build(
         cls,
@@ -254,31 +558,294 @@ class BilledCostLookup:
         # guessing would attach one resource's bill to another. Drop it —
         # the finding then reports "couldn't reconcile", not a wrong number.
         by_alias = {a: next(iter(v)) for a, v in alias_hits.items() if len(v) == 1}
+        # CLO-739: remember what was dropped, so a finding that reaches only
+        # an ambiguous alias reads as "couldn't tell which", never as "not
+        # billed".
+        ambiguous_aliases = {
+            a: tuple(sorted(v)) for a, v in alias_hits.items() if len(v) > 1
+        }
+
+        secret_hits: dict = {}
+        for rid in by_resource:
+            name = _secretsmanager_secret_name(rid)
+            if name:
+                secret_hits.setdefault(name, set()).add(rid)
+        by_secret_name = {
+            n: next(iter(v)) for n, v in secret_hits.items() if len(v) == 1
+        }
+        ambiguous_secret_names = {
+            n: tuple(sorted(v)) for n, v in secret_hits.items() if len(v) > 1
+        }
+
+        typed_hits: dict = {}
+        for rid in by_resource:
+            if not rid.startswith("arn:"):
+                continue
+            parts = rid.split(":")
+            for rtype, (derive, _) in _TYPED_NAME_DERIVERS.items():
+                name = derive(parts)
+                if name:
+                    typed_hits.setdefault(rtype, {}).setdefault(name, set()).add(
+                        (parts[3], rid)
+                    )
+        by_typed_name = {
+            rtype: {name: tuple(sorted(c)) for name, c in names.items()}
+            for rtype, names in typed_hits.items()
+        }
+
+        rollup_hits: dict = {}
+        for rid in by_resource:
+            if not rid.startswith("arn:"):
+                continue
+            parts = rid.split(":")
+            for rtype, derive in _TYPED_ROLLUP_DERIVERS.items():
+                key = derive(parts)
+                if key:
+                    rollup_hits.setdefault(rtype, {}).setdefault(key, set()).add(
+                        (parts[3], rid)
+                    )
+        by_typed_rollup = {
+            rtype: {key: tuple(sorted(c)) for key, c in keys.items()}
+            for rtype, keys in rollup_hits.items()
+        }
 
         return cls(
             by_resource=by_resource,
             resource_ids_present=resource_ids_present,
             account_days_covered=account_days_covered,
             by_alias=by_alias,
+            ambiguous_aliases=ambiguous_aliases,
+            by_secret_name=by_secret_name,
+            ambiguous_secret_names=ambiguous_secret_names,
+            by_typed_name=by_typed_name,
+            by_typed_rollup=by_typed_rollup,
         )
 
-    def rollup_for(self, resource_id: str) -> Optional[BilledCostRollup]:
-        """Exact match first, then unambiguous alias in either direction."""
+    def _typed_name_match(
+        self,
+        resource_id: str,
+        resource_type,
+        region: Optional[str],
+        lb_type: Optional[str] = None,
+    ) -> Optional[str]:
+        """The resource id half of :meth:`_typed_name_candidates`."""
+        return self._typed_name_candidates(
+            resource_id, resource_type, region, lb_type
+        )[0]
+
+    def _typed_name_candidates(
+        self,
+        resource_id: str,
+        resource_type,
+        region: Optional[str],
+        lb_type: Optional[str] = None,
+    ) -> tuple:
+        """The one CUR id the finding's type-specific name index points at.
+
+        ``None`` when the type has no index, the finding has no real region
+        (empty or ``global``: every indexed type is regional, so such a
+        finding keeps the pre-CLO-737 path), the name is absent, or more than
+        one id remains after narrowing to the finding's region and, for a
+        load balancer whose ``lb_type`` is known, to its kind (ambiguous:
+        never guessed).
+
+        Returns ``(resource_id, ambiguous_ids)``. ``ambiguous_ids`` holds the
+        ids when more than one remains after narrowing (CLO-739), else ``()``.
+        None left after narrowing (the name exists only in another region, or
+        only as another load balancer kind) is absence, not ambiguity.
+        """
+        rtype = _resource_type_key(resource_type)
+        entry = _TYPED_NAME_DERIVERS.get(rtype) if rtype else None
+        if entry is None:
+            return None, ()
+        _, normalise = entry
+        candidates = self.by_typed_name.get(rtype, {}).get(normalise(resource_id))
+        if not candidates:
+            return None, ()
+        if not region or region == "global":
+            return None, ()
+        candidates = tuple(c for c in candidates if c[0] == region)
+        kind = _LB_TYPE_TO_KIND.get(str(lb_type or "").lower())
+        if rtype == "load_balancer" and kind:
+            candidates = tuple(
+                c for c in candidates if _elb_kind(c[1].split(":")) == kind
+            )
+        if len(candidates) != 1:
+            return None, tuple(c[1] for c in candidates)
+        return candidates[0][1], ()
+
+    def _typed_rollup(
+        self, resource_id: str, resource_type, region: Optional[str]
+    ) -> Optional[BilledCostRollup]:
+        """The summed rollup of every CUR resource that bills part of this
+        finding (CLO-740), or ``None``.
+
+        ``None`` when the type has no rollup index, the finding has no real
+        region (empty or ``global``: it keeps the pre-CLO-740 path), or no
+        part is billed in the finding's region. Parts in other regions are
+        never added.
+
+        The sum keeps the ``BilledCostRollup`` contract: ``billed_total`` is
+        the parts' total, ``has_discount_line_items`` is true if any part has
+        them, and ``cost_basis`` is the parts' common basis (``UNKNOWN`` if
+        they differ). ``days_covered`` is the largest part's, because a
+        rollup does not keep the union of the parts' usage dates. The max can
+        only undercount that union, which overstates the monthly figure and
+        so loosens the ``min(estimate, billed)`` cap rather than tightening
+        it.
+        """
+        rtype = _resource_type_key(resource_type)
+        if not rtype or rtype not in _TYPED_ROLLUP_DERIVERS:
+            return None
+        if not region or region == "global":
+            return None
+        parts = [
+            self.by_resource[rid]
+            for reg, rid in self.by_typed_rollup.get(rtype, {}).get(resource_id, ())
+            if reg == region and rid in self.by_resource
+        ]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        bases = {p.cost_basis for p in parts}
+        return BilledCostRollup(
+            resource_id=resource_id,
+            billed_total=sum(p.billed_total for p in parts),
+            days_covered=max(p.days_covered for p in parts),
+            cost_basis=bases.pop() if len(bases) == 1 else CostBasis.UNKNOWN,
+            has_discount_line_items=any(p.has_discount_line_items for p in parts),
+        )
+
+    def rollup_for(
+        self,
+        resource_id: str,
+        *,
+        secretsmanager_secret: bool = False,
+        resource_type=None,
+        region: Optional[str] = None,
+        lb_type: Optional[str] = None,
+        cur_resource_id: Optional[str] = None,
+    ) -> Optional[BilledCostRollup]:
+        """The one CUR rollup this finding matches, or ``None``.
+
+        ``None`` covers both "absent" and "ambiguous"; :meth:`match_for`
+        tells them apart (CLO-739) and documents the matching order.
+        """
+        return self.match_for(
+            resource_id,
+            secretsmanager_secret=secretsmanager_secret,
+            resource_type=resource_type,
+            region=region,
+            lb_type=lb_type,
+            cur_resource_id=cur_resource_id,
+        ).rollup
+
+    def match_for(
+        self,
+        resource_id: str,
+        *,
+        secretsmanager_secret: bool = False,
+        resource_type=None,
+        region: Optional[str] = None,
+        lb_type: Optional[str] = None,
+        cur_resource_id: Optional[str] = None,
+    ) -> BilledCostMatch:
+        """Exact match first, then unambiguous alias in either direction.
+
+        ``secretsmanager_secret`` (CLO-736): the finding is a Secrets Manager
+        secret named the way ``ListSecrets`` names it, so the secret-name
+        index is consulted before the shared aliases. Every other finding
+        never sees that index.
+
+        ``resource_type`` / ``region`` (CLO-737): for a resource type with a
+        name index (``_TYPED_NAME_DERIVERS``), that index is consulted before
+        the shared aliases, narrowed to the finding's region. Findings of any
+        other type never see it. When it has no single answer the shared
+        aliases are tried exactly as before. ``lb_type`` (the load balancer
+        detectors' ``metadata["lb_type"]``) narrows a load balancer name to
+        the right kind, since a CLB and an ALB may share a name.
+
+        CLO-739: an index that has the name under more than one resource
+        falls through to the next, exactly as before. Only when no stage
+        finds a unique match and at least one stage found several, whose
+        bills disagree, is the result ``ambiguous``. A later unique match
+        still wins. See :class:`BilledCostMatch` for the all-$0 case.
+
+        ``cur_resource_id`` (CLO-740): the id the CUR bills this resource
+        under, when the detector knows it and it cannot be derived from
+        ``resource_id`` (Lightsail: the finding carries the name, the CUR a
+        ``...:Instance/<uuid>`` ARN). It is authoritative: when it is given
+        and has no CUR rows, the resource is absent, and no name alias is
+        tried, since an alias hit could only be some other resource's bill.
+
+        Rollup types (CLO-740, ``_TYPED_ROLLUP_DERIVERS``): a REST API's
+        stages in the finding's region are summed into one rollup. With no
+        stage there, the remaining stages run exactly as before.
+        """
+        if cur_resource_id:
+            return BilledCostMatch(rollup=self.by_resource.get(cur_resource_id))
+
         direct = self.by_resource.get(resource_id)
         if direct is not None:
-            return direct
+            return BilledCostMatch(rollup=direct)
+
+        summed = self._typed_rollup(resource_id, resource_type, region)
+        if summed is not None:
+            return BilledCostMatch(rollup=summed)
+
+        candidates: set = set()
+
+        if secretsmanager_secret:
+            secret_rid = self.by_secret_name.get(resource_id)
+            if secret_rid is not None:
+                return BilledCostMatch(rollup=self.by_resource.get(secret_rid))
+            candidates.update(self.ambiguous_secret_names.get(resource_id, ()))
+
+        typed_rid, typed_candidates = self._typed_name_candidates(
+            resource_id, resource_type, region, lb_type
+        )
+        if typed_rid is not None:
+            return BilledCostMatch(rollup=self.by_resource.get(typed_rid))
+        candidates.update(typed_candidates)
 
         # Finding holds a bare name, CUR holds the ARN.
         aliased = self.by_alias.get(resource_id)
         if aliased is not None:
-            return self.by_resource.get(aliased)
+            return BilledCostMatch(rollup=self.by_resource.get(aliased))
+        candidates.update(self.ambiguous_aliases.get(resource_id, ()))
 
         # Finding holds an ARN, CUR holds the bare name.
         for alias in resource_id_aliases(resource_id):
             hit = self.by_resource.get(alias)
             if hit is not None:
-                return hit
-        return None
+                return BilledCostMatch(rollup=hit)
+
+        # The CUR query spans the whole account, so a name may collide only
+        # in other regions. Those resources cannot be this finding's: drop
+        # them, or a correct "not billed" verdict would turn ambiguous. Ids
+        # with no ARN region (bare ids, S3, IAM) are kept.
+        if region and region != "global":
+            candidates = {
+                rid for rid in candidates if _arn_region(rid) in ("", region)
+            }
+        if not candidates:
+            return BilledCostMatch()
+        rollups = [self.by_resource[rid] for rid in candidates if rid in self.by_resource]
+        if rollups and all(
+            r.billed_total <= 0 and not r.has_discount_line_items for r in rollups
+        ):
+            # Every candidate bills $0: whichever is the finding's, AWS is
+            # not charging for it. Same verdict as an absent resource.
+            return BilledCostMatch()
+        ordered = tuple(sorted(candidates))
+        logger.debug(
+            "Ambiguous CUR match for %s (region %s): candidates %s",
+            resource_id,
+            region,
+            ordered,
+        )
+        return BilledCostMatch(ambiguous=True, candidates=ordered)
 
 
 @dataclass(frozen=True)
@@ -309,8 +876,18 @@ def reconcile_savings(
     resource_id: str,
     lookup: Optional[BilledCostLookup],
     min_days_covered: int = DEFAULT_MIN_DAYS_COVERED,
+    secretsmanager_secret: bool = False,
+    resource_type=None,
+    region: Optional[str] = None,
+    lb_type: Optional[str] = None,
+    cur_resource_id: Optional[str] = None,
+    waste_type=None,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
+
+    ``secretsmanager_secret``, ``resource_type``, ``region``, ``lb_type``,
+    ``cur_resource_id``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
+    with ``resource_type``: see ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
 
     Order matters, and each branch is a deliberate safety choice:
 
@@ -318,12 +895,18 @@ def reconcile_savings(
        guess.
     2. The account's own window is too thin → labelled, *not* zeroed. Stops a
        barely-populated CUR from deleting every finding.
-    3. Discount line items → labelled. We have no amortized column, so we
+    3. A finding the CUR cannot attribute (an ECS service, billed by task) →
+       labelled, *not* zeroed (CLO-740). Decided before any match: a row that
+       happens to share its name is not its bill.
+    4. The finding's name matched several CUR resources and none uniquely →
+       labelled, *not* zeroed (CLO-739). We cannot tell which bill is its,
+       so we cannot claim it has none.
+    5. Discount line items → labelled. We have no amortized column, so we
        cannot say by how much the bill disagrees, only that it does.
-    4. No rows, or rows summing to $0, on an account that demonstrably *has*
+    6. No rows, or rows summing to $0, on an account that demonstrably *has*
        resource-level CUR → genuinely not billed. This is the free-tier fix.
-    5. Too few days on this specific resource → labelled, not zeroed.
-    6. Otherwise cap: ``min(estimate, monthly-equivalent billed)``.
+    7. Too few days on this specific resource → labelled, not zeroed.
+    8. Otherwise cap: ``min(estimate, monthly-equivalent billed)``.
     """
     if lookup is None or not lookup.resource_ids_present:
         return ReconciliationOutcome(
@@ -339,7 +922,39 @@ def reconcile_savings(
             ),
         )
 
-    rollup = lookup.rollup_for(resource_id)
+    # CLO-740: the CUR bills this finding's tasks, not its service, so a miss
+    # here is not "not billed" and a same-named row is not its bill.
+    if (
+        _resource_type_key(resource_type) == CUR_NOT_ATTRIBUTABLE_RESOURCE_TYPE
+        and _resource_type_key(waste_type) in CUR_NOT_ATTRIBUTABLE_WASTE_TYPES
+        and estimated_savings > 0
+    ):
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=(
+                ReconciliationStatus.UNRECONCILED_NOT_ATTRIBUTABLE
+            ),
+        )
+
+    match = lookup.match_for(
+        resource_id,
+        secretsmanager_secret=secretsmanager_secret,
+        resource_type=resource_type,
+        region=region,
+        lb_type=lb_type,
+        cur_resource_id=cur_resource_id,
+    )
+
+    # CLO-739: "couldn't tell which resource" is not "not billed". Keep the
+    # estimate; zeroing here is what dropped a $33.87 idle SageMaker endpoint
+    # whose name its own log group shared.
+    if match.ambiguous:
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_AMBIGUOUS,
+        )
+
+    rollup = match.rollup
 
     if rollup is not None and rollup.has_discount_line_items:
         return ReconciliationOutcome(

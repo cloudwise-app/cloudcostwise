@@ -167,6 +167,7 @@ TRUSTED_WASTE_TYPES: frozenset[str] = frozenset({
     "unused_distribution",
     "unused_hosted_zone",
     "unused_kms_key",
+    "unused_lambda",
 })
 
 # L0/L1 with a path to L2.
@@ -216,7 +217,6 @@ UNVALIDATED_WASTE_TYPES: frozenset[str] = frozenset({
     "s3_rapid_growth",
     "unused_api_gateway",
     "unused_dashboard",
-    "unused_lambda",
     "unused_secret",
     "unused_vpc_endpoint",
     "workspaces_autostop_opportunity",

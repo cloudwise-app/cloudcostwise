@@ -23,6 +23,8 @@ TRUSTED = "backup_no_lifecycle_tiering"      # trusted (L2)
 CREDS = Credentials("AKIATEST", "secret", None, "123456789012", "eu-west-1")
 
 
+from cloudcostwise import scan as _scan_mod  # noqa: E402
+
 def _item(waste_type, resource_id, monthly, region="us-east-1"):
     return SimpleNamespace(waste_type=waste_type, resource_id=resource_id, monthly_savings=monthly,
                            region=region, title=f"{waste_type} on {resource_id}", confidence="high",
@@ -176,8 +178,8 @@ def test_no_cost_explorer_says_what_was_skipped_and_footer_still_counts_20_open_
     report.cost_explorer_skipped = True
     report.entrypoints = 19
     table = render.as_table(report)
-    assert "RI/Savings Plans checks skipped (--no-cost-explorer)" in table
-    assert "extended-support surcharges are estimates" in table
+    assert "RI/Savings Plans checks skipped (--no-cost-explorer)." in table
+    assert "extended-support" not in table
     assert "20 of 46 service checks run locally. The other 26," in table
     assert json.loads(render.as_json(report))["cost_explorer_skipped"] is True
 
@@ -219,7 +221,8 @@ def test_the_full_flag_reaches_every_region_worker():
     # The public repo has no partner engine to count: stub the class lookup.
     with patch.object(scan_mod, "service_class", return_value=SimpleNamespace(DETECTOR_METHODS={})), \
          patch.object(scan_mod, "scan_region",
-                      side_effect=lambda creds, r, ce, level=None, full=False: seen.append(full) or _region_result(r, 0)):
+                      side_effect=lambda creds, r, ce, level=None, full=False, seed=None:
+                      seen.append(full) or _region_result(r, 0)):
         scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], parallel=1, full=True)
         scan_mod.run_scan(CREDS, ["us-east-1"], parallel=1)
     assert seen == [True, True, False]
@@ -237,7 +240,7 @@ def test_denied_reads_and_coverage_notes_reach_the_report():
         permission_errors=["fsx: FSx file systems needs fsx:DescribeFileSystems (AccessDenied)"],
         coverage_notes=[{"source": "compute_optimizer", "state": "not_enrolled"}])
 
-    async def fake_scan(cls, creds, region):
+    async def fake_scan(cls, creds, region, *rest):
         return engine_result
 
     with patch.object(scan_mod, "_scan_region", side_effect=fake_scan):
@@ -266,7 +269,7 @@ def test_a_deliberate_cost_explorer_skip_is_not_reported_as_a_fault():
                            "MARKETPLACE: needs aws-marketplace:ViewSubscriptions (AccessDeniedException)",
                            "EMR: EMR Auto-Termination Policy needs elasticmapreduce:GetAutoTerminationPolicy (AccessDenied)"])
 
-    async def fake_scan(cls, creds, region):
+    async def fake_scan(cls, creds, region, *rest):
         return engine_result
 
     with patch.object(scan_mod, "_scan_region", side_effect=fake_scan):
@@ -388,3 +391,48 @@ def test_existing_default_or_named_profile_is_kept(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_PROFILE", "typo-profile")   # a real typo must still fail loudly later
     runtime._drop_placeholder_profile()
     assert os.environ["AWS_PROFILE"] == "typo-profile"
+
+
+# --- CLO-745: a scan sends no extended-support Cost Explorer request ---
+
+
+def test_a_scan_sends_no_extended_support_request_and_reports_estimates(monkeypatch):
+    """The real scan path, with one RDS and one ElastiCache resource per region. The guard counts every
+    AWS call it sees, and any that got past it would stop at the transport: nothing reaches AWS."""
+    from botocore.httpsession import URLLib3Session
+    from cloudwise_scan_core.data_providers.models import ElastiCacheClusterData, RDSInstanceData
+    from cloudwise_scan_core.data_providers.online import OnlineDataProvider
+    from cloudwise_scan_core.open_service import OpenWasteDetectionService
+
+    class ExtendedSupportOnly(OpenWasteDetectionService):
+        DETECTOR_METHODS = {"rds_ext": "_detect_rds_extended_support",
+                            "elasticache_ext": "_detect_elasticache_extended_support"}
+        ALWAYS_RUN_DETECTORS = frozenset()
+        GLOBAL_SERVICE_DETECTORS = frozenset()
+
+    async def rds(self):
+        return [RDSInstanceData(db_instance_id=f"pg13-{self._region}", db_instance_class="db.t4g.micro",
+                                engine="postgres", engine_version="13.15", status="available", region=self._region)]
+
+    async def cache(self):
+        return [ElastiCacheClusterData(cluster_id=f"redis5-{self._region}", engine="redis", engine_version="5.0.6",
+                                       node_type="cache.t4g.micro", num_nodes=1, status="available",
+                                       region=self._region)]
+
+    def no_network(self, request):
+        raise AssertionError(f"a request reached the transport: {request.url}")
+
+    monkeypatch.setattr(URLLib3Session, "send", no_network)
+    monkeypatch.setattr(OnlineDataProvider, "get_rds_instances", rds)
+    monkeypatch.setattr(OnlineDataProvider, "get_elasticache_clusters", cache)
+    monkeypatch.setattr(_scan_mod, "service_class", lambda *a, **k: ExtendedSupportOnly)
+
+    report = _scan_mod.run_scan(CREDS, ["us-east-1", "eu-west-1"], parallel=1)
+
+    assert "ce" not in report.api_calls
+    assert report.permission_errors == []
+    rds_findings = [f for f in report.findings if str(f.waste_type.value) == "rds_extended_support_cost"]
+    assert [f.resource_id for f in rds_findings] == ["pg13-us-east-1", "pg13-eu-west-1"]
+    assert all(f.metadata["billing_verified"] is False for f in report.findings)
+    assert all(round(f.monthly_savings, 2) == 146.0 for f in rds_findings)   # the estimate, in each region
+

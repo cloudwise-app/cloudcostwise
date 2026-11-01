@@ -36,7 +36,7 @@ INSTRUCTIONS = (
     "cloudcostwise finds AWS waste in the user's own account with their own read-only credentials. "
     "Call `scan` first (it takes 30-60 seconds per region), then `list_findings`, `explain_finding` "
     "and `fix_guidance` on its results. Nothing can modify AWS. Before the first `scan`, tell the user "
-    "that the RI/Savings Plans and extended-support checks call Cost Explorer, which AWS bills at "
+    "that the RI/Savings Plans checks call Cost Explorer, which AWS bills at "
     f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and that "
     "include_cost_explorer=false skips them."
 )

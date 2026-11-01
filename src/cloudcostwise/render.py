@@ -23,8 +23,7 @@ OPEN_ENTRYPOINTS = 20
 FEEDBACK_URL = "https://github.com/cloudwise-app/cloudcostwise/issues/1"
 FEEDBACK_NOTE = (f"Wrong, or missed something? Tell us at {FEEDBACK_URL} or cloudwise@cloudcostwise.io. "
                  "Waste types and counts are enough; leave out account IDs and resource names.")
-CE_SKIPPED_NOTE = ("RI/Savings Plans checks skipped (--no-cost-explorer); "
-                   "extended-support surcharges are estimates, not billed amounts.")
+CE_SKIPPED_NOTE = "RI/Savings Plans checks skipped (--no-cost-explorer)."
 
 
 def waste_type_name(item) -> str:

@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import ClientError, BotoCoreError, ParamValidationError
 
 from cloudwise_scan_core.data_providers.base import (
     ECR_OLD_IMAGE_AGE_DAYS,
@@ -389,6 +389,11 @@ _LOG_ACTIVITY_LOOKUP_MAX_RPS = 10.0
 _APPSYNC_CACHE_METRICS_NOT_PUBLISHED = frozenset({'CacheHitCount', 'CacheMissCount'})
 
 
+class _RedshiftWlmMissing(Exception):
+    """CLO-602: the cluster's per-queue WLM series are absent (not listed, or
+    without datapoints), so the WLM verdict is MISSING."""
+
+
 class _RateLimiter:
     """Spaces calls at least ``1 / rate`` seconds apart across threads."""
 
@@ -697,9 +702,6 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         region: str,
         session_token: Optional[str] = None,
         account_id: Optional[str] = None,
-        extended_support_cache: Optional[
-            Dict[Tuple[str, Tuple[str, ...], int], Dict[str, ExtendedSupportCostData]]
-        ] = None,
     ):
         """
         Initialize the online data provider.
@@ -710,24 +712,12 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             region: AWS region to query
             session_token: Optional session token for assumed roles
             account_id: Optional AWS account ID for logging
-            extended_support_cache: Optional dict shared across every
-                ``OnlineDataProvider`` instance created during one scan
-                (CLO-358). ``waste_detection_service._run_detector_with_timeout``
-                builds a fresh provider per detector, so without a caller-supplied,
-                shared dict here each detector would get its own private cache and
-                the rds/aurora extended-support query would still run twice. Pass
-                the same dict into every provider built for one scan; leave it
-                None for a standalone provider (a private, per-instance cache
-                still avoids repeat calls made by the same detector).
         """
         self._access_key_id = access_key_id
         self._secret_access_key = secret_access_key
         self._region = region
         self._session_token = session_token
         self._account_id = account_id or "unknown"
-        self._extended_support_cache: Dict[
-            Tuple[str, Tuple[str, ...], int], Dict[str, ExtendedSupportCostData]
-        ] = extended_support_cache if extended_support_cache is not None else {}
 
         # Client cache for reuse
         self._clients: Dict[str, Any] = {}
@@ -3065,32 +3055,55 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         buckets = []
         try:
             s3 = self._get_client('s3')
-            response = s3.list_buckets()
-            
+            listed_buckets = self._list_s3_buckets(s3)
+
             now = datetime.now(timezone.utc)
-            
-            # Storage types to query for size breakdown
+
+            # Storage types to query for size breakdown. CLO-734: these are the
+            # StorageType dimension values AWS documents for BucketSizeBytes
+            # (S3 userguide, metrics-dimensions). 'IntelligentTieringStorage',
+            # used here before, is not one of them, so an Intelligent-Tiering
+            # bucket never had a CloudWatch size. Intelligent-Tiering is five
+            # tier dimensions, summed into one 'IntelligentTieringStorage'
+            # breakdown key (a key of ours, not a dimension) so every consumer
+            # and the offline reader keep the same shape. The per-object
+            # overhead types (e.g. GlacierObjectOverhead) are not queried: they
+            # ride along with a Glacier object that is already counted, and
+            # BucketSizeBytes of a bucket holding only them still has the
+            # listing fallback below.
             _STORAGE_TYPES = [
-                'StandardStorage', 'IntelligentTieringStorage', 'StandardIAStorage',
-                'OneZoneIAStorage', 'GlacierStorage', 'GlacierInstantRetrievalStorage',
-                'DeepArchiveStorage',
+                'StandardStorage',
+                'IntelligentTieringFAStorage', 'IntelligentTieringIAStorage',
+                'IntelligentTieringAIAStorage', 'IntelligentTieringAAStorage',
+                'IntelligentTieringDAAStorage',
+                'StandardIAStorage', 'OneZoneIAStorage', 'GlacierStorage',
+                'GlacierInstantRetrievalStorage', 'DeepArchiveStorage',
+                'ReducedRedundancyStorage',
             ]
+            _IT_TIER_TYPES = frozenset({
+                'IntelligentTieringFAStorage', 'IntelligentTieringIAStorage',
+                'IntelligentTieringAIAStorage', 'IntelligentTieringAAStorage',
+                'IntelligentTieringDAAStorage',
+            })
             
-            for bucket in response.get('Buckets', []):
+            for bucket in listed_buckets:
                 bucket_name = bucket.get('Name', '')
-                
-                # Get bucket region
-                bucket_region = None
-                try:
-                    location = s3.get_bucket_location(Bucket=bucket_name)
-                    bucket_region = location.get('LocationConstraint') or 'us-east-1'
-                    # CLO-600: a bucket created with the legacy 'EU' location
-                    # constraint lives in eu-west-1. Unmapped, it matched no
-                    # region, so no scan ever judged its storage.
-                    if bucket_region == 'EU':
-                        bucket_region = 'eu-west-1'
-                except ClientError as e:
-                    self._warn_swallowed("S3 bucket location", "s3:GetBucketLocation", e)
+
+                # Get bucket region. CLO-580: the paginated ListBuckets above
+                # already names it (BucketRegion); GetBucketLocation is asked
+                # only when the listing did not.
+                bucket_region = bucket.get('BucketRegion') or None
+                if bucket_region is None:
+                    try:
+                        location = s3.get_bucket_location(Bucket=bucket_name)
+                        bucket_region = location.get('LocationConstraint') or 'us-east-1'
+                    except ClientError as e:
+                        self._warn_swallowed("S3 bucket location", "s3:GetBucketLocation", e)
+                # CLO-600: a bucket created with the legacy 'EU' location
+                # constraint lives in eu-west-1. Unmapped, it matched no
+                # region, so no scan ever judged its storage.
+                if bucket_region == 'EU':
+                    bucket_region = 'eu-west-1'
 
                 # CLO-580: every region's scan lists every bucket, but only the
                 # bucket's own region judges its storage (storage.py skips a
@@ -3101,17 +3114,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # check reads; the unread fields stay unknown (None /
                 # contents_observed=False), never "no policy" or "empty". A
                 # bucket whose location read failed is still read everywhere.
+                # CLO-580 part 2: nor is its encryption. Since #2000 the
+                # only reader judges own-region buckets only, and this
+                # cross-region read cost ~20 s per near-empty region.
                 if bucket_region is not None and bucket_region != self._region:
-                    default_encryption_enabled, encryption_algorithm = (
-                        self._s3_default_encryption(s3, bucket_name)
-                    )
                     buckets.append(S3BucketData(
                         bucket_name=bucket_name,
                         region=bucket_region,
                         creation_date=bucket.get('CreationDate'),
                         has_lifecycle_policy=None,
-                        default_encryption_enabled=default_encryption_enabled,
-                        encryption_algorithm=encryption_algorithm,
+                        default_encryption_enabled=None,  # unread, unknown
+                        encryption_algorithm=None,
                     ))
                     continue
 
@@ -3186,9 +3199,13 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                                 latest = max(datapoints, key=lambda dp: dp.get('Timestamp', now))
                                 size = int(latest.get('Average', 0))
                                 if size > 0:
-                                    storage_breakdown[storage_type] = size
+                                    key = (
+                                        'IntelligentTieringStorage'
+                                        if storage_type in _IT_TIER_TYPES else storage_type
+                                    )
+                                    storage_breakdown[key] = storage_breakdown.get(key, 0) + size
                                     total_size += size
-                                    if storage_type == 'IntelligentTieringStorage':
+                                    if key == 'IntelligentTieringStorage':
                                         has_intelligent_tiering = True
                         except (ClientError, BotoCoreError) as e:
                             self._warn_swallowed(
@@ -3218,8 +3235,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             "S3 bucket object count", "cloudwatch:GetMetricStatistics", e,
                         )
                     
-                    # Historical size for growth (30 days ago, Standard only)
-                    if total_size > 0:
+                    # Historical size for growth (30 days ago, Standard only).
+                    # CLO-738: the baseline is a Standard size, so it is
+                    # compared with today's Standard bytes
+                    # (storage_breakdown['StandardStorage']), never with the
+                    # bucket total, for every bucket. A mixed Standard +
+                    # Intelligent-Tiering bucket is neither flagged as growth
+                    # against the total (CLO-734's false 900%) nor skipped
+                    # (a log bucket whose lifecycle moves data to IA still
+                    # grows in Standard). No extra CloudWatch call.
+                    standard_size = storage_breakdown.get('StandardStorage', 0)
+                    if standard_size > 0:
                         try:
                             hist_resp = cloudwatch.get_metric_statistics(
                                 Namespace='AWS/S3',
@@ -3239,7 +3265,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                                 size_previous = int(latest.get('Average', 0))
                                 if size_previous > 0:
                                     growth_pct = round(
-                                        ((total_size - size_previous) / size_previous) * 100, 1
+                                        ((standard_size - size_previous) / size_previous) * 100, 1
                                     )
                         except (ClientError, BotoCoreError) as e:
                             self._warn_swallowed(
@@ -3258,6 +3284,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 # CloudWatch publishes BucketSizeBytes once daily; newly-created
                 # buckets won't have datapoints for up to 24-48 hours. Use
                 # list_objects_v2 to get real-time size and storage class info.
+                # CLO-734: what CloudWatch counted, before the listing below
+                # overwrites object_count. NumberOfObjects counts noncurrent
+                # versions and delete markers too.
+                cw_object_count = object_count
                 if total_size == 0:
                     try:
                         # Use a regional S3 client so ListObjectsV2 works for
@@ -3274,7 +3304,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             'ONEZONE_IA': 'OneZoneIAStorage',
                             'GLACIER': 'GlacierStorage',
                             'GLACIER_INSTANT_RETRIEVAL': 'GlacierInstantRetrievalStorage',
+                            # CLO-734: ListObjectsV2 returns GLACIER_IR (the
+                            # key above never matched and fell to Standard).
+                            'GLACIER_IR': 'GlacierInstantRetrievalStorage',
                             'DEEP_ARCHIVE': 'DeepArchiveStorage',
+                            'REDUCED_REDUNDANCY': 'ReducedRedundancyStorage',
                         }
                         for page in paginator.paginate(Bucket=bucket_name):
                             for obj in page.get('Contents', []):
@@ -3298,6 +3332,44 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         object_count = fallback_count
                         has_intelligent_tiering = 'IntelligentTieringStorage' in fallback_breakdown
                         contents_observed = True
+                        # CLO-734: the listing sees current objects only. A
+                        # versioned bucket whose objects were all deleted
+                        # still holds its noncurrent versions (and delete
+                        # markers). CloudWatch counted objects (it counts
+                        # noncurrent versions and delete markers too) yet
+                        # sized none, and the listing is empty: ask
+                        # ListObjectVersions for one entry before calling the
+                        # bucket empty. Gated on that count, not on
+                        # GetBucketVersioning (a second permission): a bucket
+                        # CloudWatch counts nothing in has no versions to
+                        # find, so a role older than template 1.33.0 (no
+                        # s3:ListBucketVersions) still flags a truly empty
+                        # bucket. Any Version or DeleteMarker means not empty
+                        # (object_count is then a lower bound of 1). A failed
+                        # read, AccessDenied included, leaves the contents
+                        # unknown, never empty.
+                        if fallback_count == 0 and cw_object_count > 0:
+                            try:
+                                ver_resp = regional_s3.list_object_versions(
+                                    Bucket=bucket_name, MaxKeys=1,
+                                )
+                                if ver_resp.get('Versions') or ver_resp.get('DeleteMarkers'):
+                                    object_count = 1
+                            except (ClientError, BotoCoreError) as e:
+                                contents_observed = False
+                                if (bucket_region or 'us-east-1') == self._region:
+                                    self._warn_swallowed(
+                                        "S3 bucket object versions", "s3:ListBucketVersions", e,
+                                    )
+                                    self._note_idle_verdict_missing(
+                                        's3', bucket_name,
+                                        f"version listing failed ({self._error_label(e)})",
+                                        verdict="empty-bucket", evidence="object version listings",
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"S3 list_object_versions failed for {bucket_name}: {e}"
+                                    )
                         if fallback_total > 0:
                             logger.info(
                                 f"S3 fallback: {bucket_name} — {fallback_total / (1024**3):.1f} GB, "
@@ -3397,6 +3469,41 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         return buckets
 
+    # ListBuckets' page-size ceiling (the S3 API's maximum for MaxBuckets).
+    _LIST_BUCKETS_PAGE_SIZE = 10000
+
+    @staticmethod
+    def _list_s3_buckets(s3) -> List[Dict[str, Any]]:
+        """Every bucket in the account, each with its ``BucketRegion`` when S3 gives it.
+
+        CLO-580: S3 includes ``BucketRegion`` only when the ListBuckets request
+        carries a parameter, so this asks with ``MaxBuckets`` and follows
+        ``ContinuationToken``. It is the same answer GetBucketLocation gives
+        (us-east-1 for a null constraint, eu-west-1 for the legacy 'EU'),
+        without the one call per bucket per region: 26 buckets cost 52 serial
+        calls in every region's scan, the longest wait of a near-empty region.
+        Same IAM action (s3:ListAllMyBuckets), no request-side filter: both S3
+        checks still see every bucket. A botocore too old to know MaxBuckets
+        falls back to the unpaginated call, whose buckets carry no region, so
+        the caller asks GetBucketLocation as before.
+        """
+        try:
+            buckets: List[Dict[str, Any]] = []
+            kwargs: Dict[str, Any] = {'MaxBuckets': OnlineDataProvider._LIST_BUCKETS_PAGE_SIZE}
+            seen_tokens = set()
+            while True:
+                page = s3.list_buckets(**kwargs)
+                buckets.extend(page.get('Buckets', []))
+                token = page.get('ContinuationToken')
+                # Only a new, non-empty string token continues: a repeated or
+                # malformed one would otherwise loop forever.
+                if not isinstance(token, str) or not token or token in seen_tokens:
+                    return buckets
+                seen_tokens.add(token)
+                kwargs['ContinuationToken'] = token
+        except ParamValidationError:
+            return s3.list_buckets().get('Buckets', [])
+
     @staticmethod
     def _s3_default_encryption(s3, bucket_name: str) -> Tuple[bool, Optional[str]]:
         """A bucket's default encryption: (enabled, algorithm)."""
@@ -3438,107 +3545,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         service_keys: Optional[List[str]] = None,
         days: int = 30,
     ) -> Dict[str, ExtendedSupportCostData]:
-        """Query Cost Explorer for extended support surcharge totals.
+        """No billing data in online mode: every extended-support check uses its estimate.
 
-        Returns service-level totals keyed by normalized service key.
-
-        CLO-358: memoized per (account, service_keys, days) for the life of
-        this provider (see ``extended_support_cache`` on ``__init__``) so
-        callers that ask for the identical breakdown more than once during
-        one scan — today that's the ``rds`` and ``aurora`` detectors, both
-        requesting ``service_keys=['rds'], days=30`` — issue one billed
-        ``ce:GetCostAndUsage`` call instead of one each.
+        This deliberately sends no Cost Explorer request. CE can only give an
+        account-wide total per service, and a detector would give that whole
+        total to each resource as its own billed amount (see
+        docs/decisions/2026-11-01-no-extended-support-cost-explorer-query.md).
+        Offline exports can name a resource, so ``OfflineDataProvider`` still
+        answers this.
         """
-        cache_key = (self._account_id, tuple(sorted(service_keys or [])), days)
-        cached = self._extended_support_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        return {}
 
-        breakdowns: Dict[str, ExtendedSupportCostData] = {}
-
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=days)
-
-        try:
-            ce = self._get_client('ce', region='us-east-1')
-            response = ce.get_cost_and_usage(
-                TimePeriod={
-                    'Start': start_date.date().isoformat(),
-                    'End': end_date.date().isoformat(),
-                },
-                Granularity='MONTHLY',
-                Metrics=['UnblendedCost'],
-                Filter={
-                    'Or': [
-                        {'Dimensions': {'Key': 'USAGE_TYPE', 'MatchOptions': ['CONTAINS'], 'Values': ['ExtendedSupport']}},
-                        {'Dimensions': {'Key': 'USAGE_TYPE', 'MatchOptions': ['CONTAINS'], 'Values': ['Extended Support']}},
-                        {'Dimensions': {'Key': 'USAGE_TYPE', 'MatchOptions': ['CONTAINS'], 'Values': ['LegacySupport']}},
-                        {'Dimensions': {'Key': 'USAGE_TYPE', 'MatchOptions': ['CONTAINS'], 'Values': ['Legacy Support']}},
-                    ]
-                },
-                GroupBy=[
-                    {'Type': 'DIMENSION', 'Key': 'SERVICE'},
-                    {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'},
-                ],
-            )
-        except Exception as e:
-            if self._is_access_denied(e):
-                self._record_permission_error(
-                    resource="Extended Support Cost Breakdown", permission="ce:GetCostAndUsage", error=e,
-                )
-                self._warn_access_denied("Extended Support Cost Breakdown", "ce:GetCostAndUsage", e)
-                raise
-            logger.debug(f"Extended support cost breakdown unavailable: {e}")
-            return breakdowns
-
-        service_map = {
-            'Amazon Relational Database Service': 'rds',
-            'AmazonRDS': 'rds',
-            'Amazon ElastiCache': 'elasticache',
-            'AmazonElastiCache': 'elasticache',
-            'Amazon Elastic Kubernetes Service': 'eks',
-            'AmazonEKS': 'eks',
-            'Amazon OpenSearch Service': 'opensearch',
-            'AmazonOpenSearchService': 'opensearch',
-            'Amazon DocumentDB': 'documentdb',
-            'AmazonDocDB': 'documentdb',
-        }
-
-        for result in response.get('ResultsByTime', []):
-            for group in result.get('Groups', []):
-                keys = group.get('Keys', [])
-                if len(keys) < 2:
-                    continue
-
-                service_name = keys[0]
-                usage_type = keys[1]
-                normalized = service_map.get(service_name)
-                if not normalized:
-                    continue
-                if service_keys and normalized not in service_keys:
-                    continue
-
-                amount = float(group.get('Metrics', {}).get('UnblendedCost', {}).get('Amount', 0.0))
-                if amount <= 0:
-                    continue
-
-                if normalized not in breakdowns:
-                    breakdowns[normalized] = ExtendedSupportCostData(
-                        service_key=normalized,
-                        amount_usd=0.0,
-                        days=days,
-                        billing_source='cost_explorer',
-                    )
-
-                breakdowns[normalized].amount_usd += amount
-                breakdowns[normalized].usage_types.append(usage_type)
-
-        # Cache only a successful response — a transient CE failure above
-        # returns early without reaching here, so it is never memoized as a
-        # false "no extended support cost" for the rest of the scan.
-        self._extended_support_cache[cache_key] = breakdowns
-        return breakdowns
-    
     # =========================================================================
     # EFS
     # =========================================================================
@@ -4874,6 +4891,87 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         
         return clusters
     
+    _REDSHIFT_WLM_LIST_METRICS_MAX_PAGES = 10
+    # Per-queue dimension names, in preference order. WLMQueueLength and
+    # WLMQueueWaitTime are published under more than one (overlapping) scheme;
+    # one scheme per metric is read so a queue is never counted twice.
+    _REDSHIFT_WLM_QUEUE_DIMS = ('QueueName', 'wlmid', 'service class')
+
+    def _redshift_wlm_dimension_sets(self, cloudwatch, cluster_id: str, metric_name: str) -> List[list]:
+        """The per-queue dimension sets ``metric_name`` is published under for
+        the cluster (ListMetrics), one naming scheme only. Raises
+        ``_RedshiftWlmMissing`` when none is listed or the listing is truncated."""
+        kwargs: Dict[str, Any] = {
+            'Namespace': 'AWS/Redshift',
+            'MetricName': metric_name,
+            'Dimensions': [{'Name': 'ClusterIdentifier', 'Value': cluster_id}],
+        }
+        by_scheme: Dict[str, List[list]] = {}
+        for _ in range(self._REDSHIFT_WLM_LIST_METRICS_MAX_PAGES):
+            try:
+                page = cloudwatch.list_metrics(**kwargs)
+            except (ClientError, BotoCoreError) as e:
+                # A denial is recorded at the call (permission_missing names
+                # cloudwatch:ListMetrics, not GetMetricStatistics).
+                self._warn_swallowed("Redshift WLM metrics", "cloudwatch:ListMetrics", e)
+                raise _RedshiftWlmMissing(
+                    f"{metric_name} ListMetrics failed ({self._error_label(e)})"
+                ) from e
+            for m in page.get('Metrics', []):
+                dims = m.get('Dimensions', [])
+                names = {d.get('Name') for d in dims}
+                extra = names - {'ClusterIdentifier'}
+                if len(extra) == 1 and next(iter(extra)) in self._REDSHIFT_WLM_QUEUE_DIMS:
+                    by_scheme.setdefault(next(iter(extra)), []).append(dims)
+            token = page.get('NextToken')
+            if not token:
+                break
+            kwargs = {**kwargs, 'NextToken': token}
+        else:
+            raise _RedshiftWlmMissing(f"{metric_name} ListMetrics answer truncated")
+        for scheme in self._REDSHIFT_WLM_QUEUE_DIMS:
+            if by_scheme.get(scheme):
+                return by_scheme[scheme]
+        raise _RedshiftWlmMissing(f"no per-queue {metric_name} series listed")
+
+    def _read_redshift_wlm(self, cloudwatch, cluster_id: str, start_time, end_time, own) -> Dict[str, float]:
+        """CLO-602: cluster-level WLM figures from the per-queue series.
+
+        Per day: queue length and running queries are summed across queues
+        (cluster totals, the running peak being the sum of queue peaks, an
+        upper bound); wait time is the worst queue's (a queue that waits is
+        enough to withhold), converted from milliseconds to seconds. Every figure is the mean over the days. Raises
+        ``_RedshiftWlmMissing`` when a metric has no listed series or no
+        datapoints."""
+        def combine(metric_name, stat):
+            per_day: Dict[Any, List[float]] = {}
+            for dims in self._redshift_wlm_dimension_sets(cloudwatch, cluster_id, metric_name):
+                resp = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/Redshift', MetricName=metric_name, Dimensions=dims,
+                    StartTime=start_time, EndTime=end_time, Period=86400,
+                    Statistics=['Average', 'Maximum'] if stat == 'both' else [stat],
+                )
+                for dp in own(resp):
+                    per_day.setdefault(dp['Timestamp'], []).append(dp)
+            if not per_day:
+                raise _RedshiftWlmMissing(f"no {metric_name} datapoints")
+            return per_day
+
+        def mean(values):
+            return sum(values) / len(values)
+
+        queue = combine('WLMQueueLength', 'Average')
+        wait = combine('WLMQueueWaitTime', 'Average')
+        running = combine('WLMRunningQueries', 'both')
+        return {
+            'queue_avg': mean([sum(d['Average'] for d in dps) for dps in queue.values()]),
+            # WLMQueueWaitTime is published in milliseconds (Redshift guide);
+            # the detector's threshold and text are in seconds.
+            'wait_avg': mean([max(d['Average'] for d in dps) for dps in wait.values()]) / 1000.0,
+            'running_avg': mean([sum(d['Average'] for d in dps) for dps in running.values()]),
+            'running_max': max(sum(d['Maximum'] for d in dps) for dps in running.values()),
+        }
+
     async def get_redshift_metrics(
         self,
         cluster_ids: List[str],
@@ -4970,45 +5068,29 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     wlm_running_max = 0.0
                     wlm_metrics_missing = False
                     try:
-                        # WLM Queue Length
-                        wlm_queue_response = cloudwatch.get_metric_statistics(
-                            Namespace='AWS/Redshift',
-                            MetricName='WLMQueueLength',
-                            Dimensions=[{'Name': 'ClusterIdentifier', 'Value': cluster_id}],
-                            StartTime=start_time,
-                            EndTime=end_time,
-                            Period=86400,
-                            Statistics=['Average'],
+                        # CLO-602: WLM metrics are published per queue
+                        # (ClusterIdentifier + QueueName / wlmid / service
+                        # class), never under ClusterIdentifier alone, so the
+                        # series are found with ListMetrics and combined.
+                        # A zero-connection cluster is the idle detector's; the
+                        # WLM check defers to it, so its WLM series are not read
+                        # (and their absence is not a MISSING note).
+                        if round(conn_avg, 2) > 0:
+                            wlm = self._read_redshift_wlm(
+                                cloudwatch, cluster_id, start_time, end_time, _own,
+                            )
+                            wlm_queue_avg = wlm['queue_avg']
+                            wlm_wait_avg = wlm['wait_avg']
+                            wlm_running_avg = wlm['running_avg']
+                            wlm_running_max = wlm['running_max']
+                    except _RedshiftWlmMissing as e:
+                        # CLO-602: no WLM series listed, or none with data:
+                        # MISSING (never judged on 0 defaults).
+                        wlm_metrics_missing = True
+                        self._note_idle_verdict_missing(
+                            'redshift wlm', cluster_id, str(e),
+                            verdict="WLM over-provisioned", evidence="WLM metrics",
                         )
-                        wlm_queue_dps = _own(wlm_queue_response)
-                        wlm_queue_avg = sum(dp['Average'] for dp in wlm_queue_dps) / len(wlm_queue_dps) if wlm_queue_dps else 0.0
-                        
-                        # WLM Queue Wait Time
-                        wlm_wait_response = cloudwatch.get_metric_statistics(
-                            Namespace='AWS/Redshift',
-                            MetricName='WLMQueueWaitTime',
-                            Dimensions=[{'Name': 'ClusterIdentifier', 'Value': cluster_id}],
-                            StartTime=start_time,
-                            EndTime=end_time,
-                            Period=86400,
-                            Statistics=['Average'],
-                        )
-                        wlm_wait_dps = _own(wlm_wait_response)
-                        wlm_wait_avg = sum(dp['Average'] for dp in wlm_wait_dps) / len(wlm_wait_dps) if wlm_wait_dps else 0.0
-                        
-                        # WLM Running Queries
-                        wlm_running_response = cloudwatch.get_metric_statistics(
-                            Namespace='AWS/Redshift',
-                            MetricName='WLMRunningQueries',
-                            Dimensions=[{'Name': 'ClusterIdentifier', 'Value': cluster_id}],
-                            StartTime=start_time,
-                            EndTime=end_time,
-                            Period=86400,
-                            Statistics=['Average', 'Maximum'],
-                        )
-                        wlm_running_dps = _own(wlm_running_response)
-                        wlm_running_avg = sum(dp['Average'] for dp in wlm_running_dps) / len(wlm_running_dps) if wlm_running_dps else 0.0
-                        wlm_running_max = max((dp['Maximum'] for dp in wlm_running_dps), default=0.0)
                     except (ClientError, BotoCoreError) as e:
                         # CLO-600: a read that failed part-way left the later
                         # WLM fields at 0, which the over-provisioned check
@@ -5127,7 +5209,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         self,
         cluster_ids: List[str],
     ) -> Dict[str, RedshiftCostData]:
-        """Get Cost Explorer data for Redshift clusters (Spectrum vs compute)."""
+        """Get Cost Explorer data for this region's Redshift clusters.
+
+        Cost Explorer is account-wide, so the REGION filter is what stops every
+        region's scan dividing the whole account's bill among its own clusters.
+
+        The Spectrum figures stay 0 on real AWS, so redshift_spectrum_heavy
+        doesn't fire: see the comment on the name match below.
+        ``compute_cost_monthly`` is everything except Spectrum, so it includes
+        RMS storage, snapshots and the rest. Nothing reads it while the ratio is 0.
+        """
         costs: Dict[str, RedshiftCostData] = {}
         
         if not cluster_ids:
@@ -5138,45 +5229,41 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             end_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime('%Y-%m-%d')
             
-            # Get Redshift compute costs
+            request = {
+                'TimePeriod': {'Start': start_date, 'End': end_date},
+                'Granularity': 'MONTHLY',
+                'Filter': {
+                    'And': [
+                        {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Redshift']}},
+                        {'Dimensions': {'Key': 'REGION', 'Values': [self._region]}},
+                    ]
+                },
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}],
+            }
+            total_redshift = 0.0
+            total_spectrum = 0.0
             try:
-                compute_response = ce.get_cost_and_usage(
-                    TimePeriod={'Start': start_date, 'End': end_date},
-                    Granularity='MONTHLY',
-                    Filter={
-                        'Dimensions': {
-                            'Key': 'SERVICE',
-                            'Values': ['Amazon Redshift'],
-                        }
-                    },
-                    Metrics=['UnblendedCost'],
-                )
-                
-                total_redshift = 0
-                for result in compute_response.get('ResultsByTime', []):
-                    total_redshift += float(result.get('Total', {}).get('UnblendedCost', {}).get('Amount', 0))
-            except ClientError:
-                total_redshift = 0
-            
-            # Get Redshift Spectrum costs
-            try:
-                spectrum_response = ce.get_cost_and_usage(
-                    TimePeriod={'Start': start_date, 'End': end_date},
-                    Granularity='MONTHLY',
-                    Filter={
-                        'And': [
-                            {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Redshift']}},
-                            {'Dimensions': {'Key': 'USAGE_TYPE', 'MatchOptions': ['CONTAINS'], 'Values': ['Spectrum']}},
-                        ]
-                    },
-                    Metrics=['UnblendedCost'],
-                )
-                
-                total_spectrum = 0
-                for result in spectrum_response.get('ResultsByTime', []):
-                    total_spectrum += float(result.get('Total', {}).get('UnblendedCost', {}).get('Amount', 0))
-            except ClientError:
-                total_spectrum = 0
+                while True:
+                    response = ce.get_cost_and_usage(**request)
+                    for result in response.get('ResultsByTime', []):
+                        for group in result.get('Groups', []):
+                            amount = float(group.get('Metrics', {}).get('UnblendedCost', {}).get('Amount', 0))
+                            total_redshift += amount
+                            # Stale: no real usage type matches this. AWS bills Spectrum scans
+                            # as `<prefix>-DataScanned`. Matching that would revive a finding
+                            # whose savings claim and per-cluster attribution aren't settled.
+                            if 'spectrum' in group.get('Keys', [''])[0].lower():
+                                total_spectrum += amount
+                    next_page = response.get('NextPageToken')
+                    if not next_page:
+                        break
+                    request['NextPageToken'] = next_page
+            except ClientError as e:
+                # All or nothing: a partial sum would read as a real, smaller bill.
+                logger.debug(f"Redshift cost breakdown unavailable: {e}")
+                total_redshift = 0.0
+                total_spectrum = 0.0
             
             compute_cost = total_redshift - total_spectrum
             spectrum_ratio = (total_spectrum / compute_cost * 100) if compute_cost > 0 else 0
@@ -7466,7 +7553,28 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 try:
                     details = transfer.describe_server(ServerId=server_id).get('Server', {})
                     enriched.append(details)
-                except Exception:
+                except Exception as e:
+                    # CLO-713 review: the standard scan role has no
+                    # transfer:DescribeServer, so this fails for most
+                    # accounts. Keep the ListServers entry (no Protocols:
+                    # the detector reads them as unknown and keeps the
+                    # one-protocol default). Deliberately NOT a permission
+                    # error: permission_missing drives the "Role update
+                    # needed" banner, and no template update grants this
+                    # action. A WARNING log and one informational scan note.
+                    if self._is_access_denied(e):
+                        reason = "the scan role does not include transfer:DescribeServer"
+                    else:
+                        reason = f"transfer:DescribeServer failed ({e.__class__.__name__})"
+                    logger.warning(
+                        "Transfer server %s: protocols not read (%s); judged at the "
+                        "one-protocol default", server_id, reason,
+                    )
+                    self._warn_once(
+                        f"Transfer Family: server protocols were not read in {self._region} because "
+                        f"{reason}, so Transfer Family servers there were judged at the "
+                        "one-protocol default"
+                    )
                     enriched.append(server)
             return enriched
         except Exception as e:
@@ -8599,7 +8707,23 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
             # Duration metrics (primarily useful for Express workflows)
             avg_duration = _cw_stat('ExecutionTime', 'Average')
-            p95_duration = _cw_stat('ExecutionTime', 'Maximum')  # Approximation of p95
+            # CLO-602: a real p95 (CloudWatch extended statistic), not the
+            # Maximum, which is >= p95 and fired the duration check on one
+            # outlier. Buckets of the window each carry a p95; the largest is
+            # taken (the window can straddle two buckets).
+            p95_resp = cw.get_metric_statistics(
+                Namespace='AWS/States',
+                MetricName='ExecutionTime',
+                Dimensions=dim,
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=period,
+                ExtendedStatistics=['p95'],
+            )
+            p95_duration = max(
+                (d.get('ExtendedStatistics', {}).get('p95', 0.0) for d in p95_resp.get('Datapoints', [])),
+                default=0.0,
+            )
 
             avg_transitions_per_success = (
                 total_transitions / succeeded if succeeded > 0 else 0.0
@@ -9283,6 +9407,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 ip_address=i.get('publicIpAddress'),
                 is_static_ip=i.get('isStaticIp', False),
                 region=self._region,
+                arn=i.get('arn'),
             ) for i in instances]
         except Exception as e:
             if self._is_access_denied(e):
@@ -9309,6 +9434,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 is_attached=ip.get('isAttached', False),
                 attached_to=ip.get('attachedTo'),
                 region=self._region,
+                arn=ip.get('arn'),
             ) for ip in ips]
         except Exception as e:
             if self._is_access_denied(e):
@@ -9337,6 +9463,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 attached_to=d.get('attachedTo'),
                 path=d.get('path'),
                 region=self._region,
+                arn=d.get('arn'),
             ) for d in disks]
         except Exception as e:
             if self._is_access_denied(e):
@@ -9364,6 +9491,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 from_instance_name=s.get('fromInstanceName'),
                 is_from_auto_snapshot=s.get('isFromAutoSnapshot', False),
                 region=self._region,
+                arn=s.get('arn'),
             ) for s in snaps]
         except Exception as e:
             if self._is_access_denied(e):
@@ -9392,6 +9520,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 instance_health_summary=lb.get('instanceHealthSummary', []),
                 tls_certificate_summaries=lb.get('tlsCertificateSummaries', []),
                 region=self._region,
+                arn=lb.get('arn'),
             ) for lb in lbs]
         except Exception as e:
             if self._is_access_denied(e):
@@ -9421,6 +9550,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 master_database_name=db.get('masterDatabaseName', ''),
                 secondary_availability_zone=db.get('secondaryAvailabilityZone'),
                 region=self._region,
+                arn=db.get('arn'),
             ) for db in dbs]
         except Exception as e:
             if self._is_access_denied(e):
