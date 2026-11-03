@@ -241,7 +241,7 @@ ALWAYS_RUN_DETECTORS: Set[str] = {
     # even for service-filtered scans.  GLOBAL_SERVICE_DETECTORS then removes them from
     # non-us-east-1 regions, achieving the "account-level once per scan" effect.
     'savings_opportunities',  # CE GetReservation* — global API, runs once in us-east-1
-    'commitment',             # CE GetReservationUtilization etc. — global API, runs once in us-east-1
+    'commitment',             # Reads the cached CE Savings Plans usage — global API, runs once in us-east-1
     'sagemaker',  # Notebooks/endpoints may exist without CUR cost history (newly created, stopped)
     'glue',     # Dev endpoints cost $1,606/month and may not appear in CUR immediately
     'lightsail',  # Static IPs, unused disks, old snapshots often forgotten and not in CUR
@@ -331,10 +331,28 @@ DETECTOR_METHODS: Dict[str, str] = {
 GLOBAL_SERVICE_DETECTORS: Set[str] = {
     'cloudfront', 'route53', 'global_accelerator',
     'savings_opportunities',  # CE GetReservationRecommendation — global API, runs once in us-east-1
-    'commitment',             # CE GetReservationUtilization etc. — global API, runs once in us-east-1
+    'commitment',             # Reads the cached CE Savings Plans usage — global API, runs once in us-east-1
     'orphaned_dns',           # Route 53 is global — running per-region emitted the same
                               # dangling record once per scanned region (17× duplicates)
+    # CLO-815: CloudWatch dashboards are account-global, so every region's
+    # ListDashboards returns the same list: running per region emitted each
+    # unused dashboard once per scanned region, and a region that refuses the
+    # call (eu-south-2 answers AccessDenied with an empty message, even for an
+    # admin) put a false "permission missing" on the accounts page.
+    'cloudwatch_dashboard',
 }
+
+# Global detectors whose findings keep the scan region (us-east-1) instead of
+# 'global'. A dashboard is acted on through a regional CloudWatch endpoint, so
+# 'global' is no region the remediation executor or the finding id can use.
+GLOBAL_DETECTORS_KEEPING_REGION: Set[str] = {'cloudwatch_dashboard'}
+
+
+# Detectors reading the RI/SP cache, which is keyed by the account the scan's
+# credentials belong to. A scan on another account's role (an Organizations member
+# on its payer's role) would show that account's commitments and could bill it for
+# a refresh, so its callers pass these as ``skip_detectors``.
+COMMITMENT_CACHE_DETECTORS = frozenset({'savings_opportunities', 'commitment'})
 
 
 # CLO-465: CUR service names we deliberately have no detector for.
@@ -461,6 +479,11 @@ def _detector_label(method_name: str) -> str:
     if key:
         return key.upper()
     return method_name or "DETECTOR"
+
+
+async def _run_after(prerequisite: "asyncio.Future[Any]", detector: Coroutine) -> Any:
+    await asyncio.wait([prerequisite])
+    return await detector
 
 
 def _run_detector_coroutine_sync(coro: Coroutine) -> Any:
@@ -637,6 +660,13 @@ class WasteDetectionServiceBase:
     DETECTOR_METHODS: Dict[str, str] = DETECTOR_METHODS
     ALWAYS_RUN_DETECTORS: Set[str] = ALWAYS_RUN_DETECTORS
     GLOBAL_SERVICE_DETECTORS: Set[str] = GLOBAL_SERVICE_DETECTORS
+    # detector key -> the detector key it must not start before. Empty here; the
+    # hosted assembly (``hosted_service.py``) and the local runtime set it.
+    DETECTOR_RUN_AFTER: Dict[str, str] = {}
+    # CLO-771: detectors the in-process breaker leaves alone. Only for one that
+    # makes no AWS call the breaker could be protecting, so empty here; hosted
+    # commitment reads DynamoDB and stays subject to it.
+    IN_PROCESS_BREAKER_EXEMPT: frozenset = frozenset()
     SERVICE_TO_DETECTORS: Dict[str, List[str]] = SERVICE_TO_DETECTORS
     
     MAX_CONCURRENT_API_CALLS = 10
@@ -747,6 +777,7 @@ class WasteDetectionServiceBase:
         enabled_services: List[str] = None,
         customer_tier: str = None,
         scan_id: Optional[str] = None,
+        skip_detectors: Optional[Set[str]] = None,
     ) -> WasteDetectionResult:
         """
         Run comprehensive waste detection for an AWS account.
@@ -830,6 +861,12 @@ class WasteDetectionServiceBase:
                 skipped_by_tier = cur_filtered_set - tier_allowed
                 active_detector_keys = list(tier_allowed)
 
+            # Not a tier or CUR skip, so not on the scan row. Skipped rather than
+            # filtered afterwards: totals stay right, the sweep clears old rows,
+            # and the detectors can't send a billed request.
+            if skip_detectors:
+                active_detector_keys = [k for k in active_detector_keys if k not in skip_detectors]
+
             self._emit_skip_metrics(
                 skipped_by_cur=skipped_by_cur,
                 skipped_by_tier=skipped_by_tier,
@@ -862,11 +899,17 @@ class WasteDetectionServiceBase:
                         self._run_detector_with_timeout(method, detector_key, creds, settings)
                     )
                     detector_names.append(detector_key.upper())
-                    if detector_key in self.GLOBAL_SERVICE_DETECTORS:
+                    if (
+                        detector_key in self.GLOBAL_SERVICE_DETECTORS
+                        and detector_key not in GLOBAL_DETECTORS_KEEPING_REGION
+                    ):
                         global_service_detector_indices.add(len(detector_tasks) - 1)
             
             # Run all detectors in parallel
-            detector_results = await asyncio.gather(*detector_tasks, return_exceptions=True)
+            detector_results = await asyncio.gather(
+                *self._order_detector_tasks(detector_names, detector_tasks),
+                return_exceptions=True,
+            )
             
             # Collect results
             staged_items: List[WasteItem] = []
@@ -1144,7 +1187,6 @@ class WasteDetectionServiceBase:
                 self._detect_secrets_manager_waste(data_provider, settings),
                 self._detect_kms_waste(data_provider, settings),
                 self._detect_cloudtrail_waste(data_provider, settings),
-                self._detect_cloudwatch_dashboard_waste(data_provider, settings),
                 # Security posture detectors (security.py) — advisory ($0) findings.
                 # All checks read describe-style resource attributes (encryption,
                 # deletion protection, public access, backup coverage) that the
@@ -1166,6 +1208,10 @@ class WasteDetectionServiceBase:
                     self._detect_cloudfront_waste(data_provider, settings),
                     self._detect_route53_waste(data_provider, settings),
                     self._detect_global_accelerator_waste(data_provider, settings),
+                    # CLO-817: dashboards are account-global (CLO-815), so the
+                    # offline path runs the detector once with the other
+                    # global detectors, not once per region.
+                    self._detect_cloudwatch_dashboard_waste(data_provider, settings),
                 ])
             else:
                 logger.info(
@@ -1386,22 +1432,16 @@ class WasteDetectionServiceBase:
         if not is_global_scan_region:
             active_detectors -= self.GLOBAL_SERVICE_DETECTORS
         else:
-            # CUR/Cost Explorer deliver the spaced product names ("Amazon
-            # CloudFront"); the compact API-style names only appear in older
-            # exports. Both must match — with only the compact forms this
-            # check was dead code on the CUR path, so the global-detector
-            # bulk-add never triggered (waste-audit Session 10).
-            global_services_in_cost = any(
-                service in enabled_services
-                for service in [
-                    'AmazonCloudFront', 'Amazon CloudFront',
-                    'AmazonRoute53', 'Amazon Route 53',
-                    'AWSGlobalAccelerator', 'AWS Global Accelerator',
-                ]
-            )
-            if global_services_in_cost:
-                active_detectors.update(self.GLOBAL_SERVICE_DETECTORS)
-        
+            # CLO-817: the us-east-1 unit always runs the global-service
+            # detectors (CloudFront, Route 53, Global Accelerator, orphaned DNS,
+            # dashboards, CE-backed ones). They used to be added only when the
+            # unit's CUR service list named CloudFront/Route 53/GA, but those
+            # costs are stored under region "global" and the planner drops them,
+            # so the list never named them and the detectors never ran. The
+            # unit is the only place they can run, so the service list no longer
+            # gates them, and an empty list still covers them.
+            active_detectors.update(self.GLOBAL_SERVICE_DETECTORS)
+
         logger.info(f"Service-filtered scan: {len(active_detectors)} detectors for {len(enabled_services)} services")
         return list(active_detectors)
 
@@ -1561,6 +1601,15 @@ class WasteDetectionServiceBase:
                         if isinstance(item.metadata, dict)
                         else None
                     ),
+                    # The resources AWS bills for a group-level finding the
+                    # CUR never names (an ElastiCache replication group: the
+                    # CUR bills each member node; an Aurora, DocumentDB or
+                    # Neptune cluster: its instances and storage row, CLO-810).
+                    member_ids=(
+                        item.metadata.get("cur_member_ids")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
                 )
 
             item.estimated_savings_list_price = estimate
@@ -1653,6 +1702,24 @@ class WasteDetectionServiceBase:
         for det in skipped_by_tier:
             _emit(det, cur=0, tier=1)
     
+    def _order_detector_tasks(self, detector_names: List[str], detector_tasks: List[Any]) -> List[Any]:
+        """Hold back each DETECTOR_RUN_AFTER detector until its prerequisite is done.
+
+        The wait comes before ``_run_detector_with_timeout``, so a held detector
+        keeps its whole timeout and takes no semaphore slot while it waits. A
+        prerequisite that fails or times out still releases it. A prerequisite
+        that isn't in this scan is not waited for.
+        """
+        if not self.DETECTOR_RUN_AFTER:
+            return detector_tasks
+        tasks = dict(zip(detector_names, detector_tasks))
+        for detector, prerequisite in self.DETECTOR_RUN_AFTER.items():
+            if detector.upper() in tasks and prerequisite.upper() in tasks:
+                first = asyncio.ensure_future(tasks[prerequisite.upper()])
+                tasks[prerequisite.upper()] = first
+                tasks[detector.upper()] = _run_after(first, tasks[detector.upper()])
+        return [tasks[name] for name in detector_names]
+
     async def _run_detector_with_timeout(
         self,
         detector_method,
@@ -1811,7 +1878,8 @@ class WasteDetectionServiceBase:
 
         start = time.monotonic()
         try:
-            if self._circuit_breaker.is_open:
+            breaker_exempt = detector_name.lower() in self.IN_PROCESS_BREAKER_EXEMPT
+            if self._circuit_breaker.is_open and not breaker_exempt:
                 logger.warning(f"Detector {detector_name} skipped - circuit breaker is open")
                 return {'items': [], 'permission_error': None, 'circuit_open_skip': True}
             
@@ -1850,7 +1918,10 @@ class WasteDetectionServiceBase:
                         timeout=detector_timeout
                     )
 
-                items = await self._circuit_breaker.call(run_with_circuit)
+                items = await (
+                    run_with_circuit() if breaker_exempt
+                    else self._circuit_breaker.call(run_with_circuit)
+                )
                 duration_ms = int((time.monotonic() - start) * 1000)
                 findings_count = len(items) if isinstance(items, list) else 0
                 # CLO-368: a detector that completed normally may still have

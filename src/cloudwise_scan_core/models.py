@@ -64,6 +64,9 @@ class WasteType(str, Enum):
       disabled the GetDevEndpoints API for every account ("GetDevEndpoints operation is
       currently disabled"), so neither can ever fire; Glue dev endpoints are retired
       in favour of Glue interactive sessions
+    - REDSHIFT_SPECTRUM_HEAVY: Removed (CLO-747) - its 60% saving from moving to Athena
+      was false: Redshift Data Scan and Athena both cost $5.00/TB in us-east-1. It never
+      fired on real AWS
     
     For right-sizing recommendations, use AWS Compute Optimizer instead.
     """
@@ -141,7 +144,7 @@ class WasteType(str, Enum):
     OVERSIZED_REDSHIFT = "oversized_redshift"
     UNDERUTILIZED_REDSHIFT = "underutilized_redshift"
     REDSHIFT_NO_PAUSE = "redshift_no_pause"
-    REDSHIFT_SPECTRUM_HEAVY = "redshift_spectrum_heavy"
+    REDSHIFT_SPECTRUM_HEAVY = "redshift_spectrum_heavy"  # DEPRECATED (CLO-747): Not actively detected
     REDSHIFT_LEGACY_DC2 = "redshift_legacy_dc2"
     REDSHIFT_WLM_OVER_PROVISIONED = "redshift_wlm_over_provisioned"
     REDSHIFT_CONCURRENCY_SCALING_WASTE = "redshift_concurrency_scaling_waste"
@@ -399,6 +402,11 @@ GOVERNANCE_WASTE_TYPES: frozenset = frozenset({
     WasteType.NO_LIFECYCLE_POLICY,          # $0 when s3_wrong_storage_class counts it
     WasteType.ECR_NO_LIFECYCLE_POLICY,      # $0 when old/untagged images count it
     WasteType.BACKUP_COPY_POLICY_OVERREACH, # which copies are unneeded is a DR call
+    # CLO-771: planning alerts. CLO-505 set their saving to $0 on purpose, since
+    # acting on them costs money or leaves the commitment unchanged.
+    WasteType.EXPIRING_RESERVED_INSTANCE,
+    WasteType.EXPIRING_SAVINGS_PLAN,
+    WasteType.CONVERTIBLE_RI_EXCHANGE_OPPORTUNITY,
 })
 
 # Membership buys VISIBILITY only, never a savings figure (CLO-448). The floor
@@ -424,6 +432,9 @@ GOVERNANCE_WASTE_TYPES: frozenset = frozenset({
 #     counted once. Otherwise they carry a real estimate. Side effect: one
 #     that reconciliation pulls below the floor now persists at $0 instead of
 #     dropping.
+#
+# CLO-771 added the three commitment alerts for the same reason: CLO-505 made
+# their detector emit $0 by design, and the floor then removed every one.
 
 
 # RI/SP purchase recommendations and existing-commitment findings (CLO-376).
@@ -1021,6 +1032,10 @@ class WasteDetectionSettings:
     """
     # CloudWatch Integration
     cloudwatch_enabled: bool = True   # Enabled by default for all tiers
+
+    # CLO-771: the regions a local scan covers, for the account-wide RI inventory.
+    # None (hosted) reads the account's enabled regions, if its role may list them.
+    scan_regions: Optional[List[str]] = None
     
     # EC2 Thresholds
     ec2_idle_cpu_threshold: float = 5.0      # % CPU average to consider idle
@@ -1055,7 +1070,6 @@ class WasteDetectionSettings:
     redshift_idle_days: int = 7               # Days with 0 connections = idle
     redshift_cpu_threshold: float = 10.0      # % CPU to consider oversized
     redshift_zero_connection_hours_threshold: float = 40.0  # % zero-connection hours for no-pause
-    redshift_spectrum_cost_ratio_threshold: float = 50.0    # % Spectrum cost vs compute for migration
     
     # OpenSearch Thresholds
     opensearch_idle_days: int = 7             # Days with low activity = idle
@@ -1169,7 +1183,6 @@ class WasteDetectionSettings:
             "redshift_idle_days": self.redshift_idle_days,
             "redshift_cpu_threshold": self.redshift_cpu_threshold,
             "redshift_zero_connection_hours_threshold": self.redshift_zero_connection_hours_threshold,
-            "redshift_spectrum_cost_ratio_threshold": self.redshift_spectrum_cost_ratio_threshold,
             # OpenSearch
             "opensearch_idle_days": self.opensearch_idle_days,
             "opensearch_cpu_threshold": self.opensearch_cpu_threshold,
@@ -1265,7 +1278,6 @@ class WasteDetectionSettings:
             redshift_idle_days=data.get("redshift_idle_days", 7),
             redshift_cpu_threshold=data.get("redshift_cpu_threshold", 10.0),
             redshift_zero_connection_hours_threshold=data.get("redshift_zero_connection_hours_threshold", 40.0),
-            redshift_spectrum_cost_ratio_threshold=data.get("redshift_spectrum_cost_ratio_threshold", 50.0),
             # OpenSearch
             opensearch_idle_days=data.get("opensearch_idle_days", 7),
             opensearch_cpu_threshold=data.get("opensearch_cpu_threshold", 10.0),

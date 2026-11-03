@@ -27,6 +27,18 @@ UNRESOLVED_ACCOUNT_WARNING = (
     "This is MISSING data, not 'no commitment waste'."
 )
 
+# CLO-777: approved 2026-11-02 under Rick's delegation.
+REFRESH_FAILED_WARNING = (
+    "Commitment data (RI/Savings Plans) could not be fully refreshed, so "
+    "commitment findings may be missing or out of date."
+)
+
+# CLO-771: approved 2026-11-02 under Rick's delegation.
+REGIONS_NOT_LISTED_WARNING = (
+    "Reserved Instances were read in us-east-1 only, because this role can't "
+    "list the account's enabled regions (ec2:DescribeRegions)."
+)
+
 
 def commitment_cache_account_id(data_provider: Any) -> Optional[str]:
     """The AWS account ID that keys the RI/SP savings cache, or None.
@@ -49,8 +61,22 @@ def commitment_cache_account_id(data_provider: Any) -> Optional[str]:
     return None
 
 
+def _note_once(data_provider: Any, warning: str) -> None:
+    warnings = getattr(data_provider, 'data_warnings', None)
+    if isinstance(warnings, list) and warning not in warnings:
+        warnings.append(warning)
+
+
 def note_unresolved_account(data_provider: Any) -> None:
     """Record the skipped commitment read as a MISSING-data scan warning."""
-    warnings = getattr(data_provider, 'data_warnings', None)
-    if isinstance(warnings, list) and UNRESOLVED_ACCOUNT_WARNING not in warnings:
-        warnings.append(UNRESOLVED_ACCOUNT_WARNING)
+    _note_once(data_provider, UNRESOLVED_ACCOUNT_WARNING)
+
+
+def note_regions_not_listed(data_provider: Any) -> None:
+    """Record that a role read RIs in us-east-1 but couldn't list the other regions."""
+    _note_once(data_provider, REGIONS_NOT_LISTED_WARNING)
+
+
+def note_refresh_failed(data_provider: Any) -> None:
+    """Record a refresh that failed, in whole or in part, as a scan warning."""
+    _note_once(data_provider, REFRESH_FAILED_WARNING)

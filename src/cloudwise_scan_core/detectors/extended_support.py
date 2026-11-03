@@ -383,13 +383,18 @@ def build_extended_support_explanation(detection: str, threshold: str, pricing: 
 
 
 def get_billed_surcharge_monthly(cost_breakdown: Dict[str, Any], service_key: str, resource_id: str = "") -> Tuple[Optional[float], bool]:
+    """The billed monthly amount from a resource's own row, and whether there is one.
+
+    A service-level row is never a resource's bill, even with one resource in
+    view: it covers the whole account (see
+    docs/decisions/2026-11-01-no-extended-support-cost-explorer-query.md).
+    """
     if not cost_breakdown:
         return None, False
 
     key_candidates = []
     if resource_id:
         key_candidates.append(f"{service_key}:{resource_id}")
-    key_candidates.append(service_key)
 
     for key in key_candidates:
         cost_data = cost_breakdown.get(key)

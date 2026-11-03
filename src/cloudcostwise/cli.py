@@ -47,7 +47,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         COST_EXPLORER_PRICE_PER_REQUEST, CredentialsError, ReadOnlyViolation, configure_local_runtime,
         resolve_credentials, resolve_regions,
     )
-    from cloudcostwise.scan import run_scan
+    from cloudcostwise.scan import global_checks_warning, run_scan
 
     configure_local_runtime()
     try:
@@ -56,6 +56,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     except CredentialsError as e:
         print(f"cloudcostwise: {e}", file=sys.stderr)
         return 1
+
+    # CLO-817: the account-level checks run only from us-east-1. Scanning it just
+    # for them would also run its regional checks on a Region the user left
+    # out, so say what is skipped, from the engine this scan really uses.
+    skipped = global_checks_warning(regions, include_cost_explorer=not args.no_cost_explorer)
+    if skipped:
+        print(skipped, file=sys.stderr)
 
     if not args.no_cost_explorer and args.format == "table":
         print("note: the RI/Savings Plans checks call Cost Explorer, which AWS bills at "

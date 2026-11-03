@@ -45,7 +45,6 @@ from cloudwise_scan_core.data_providers.models import (
     ElastiCacheRequestVolumeData,
     RedshiftClusterData,
     RedshiftMetricsData,
-    RedshiftCostData,
     OpenSearchDomainData,
     OpenSearchMetricsData,
     CloudWatchLogGroupData,
@@ -617,22 +616,6 @@ class WasteDataProvider(ABC):
             
         Returns:
             Dict mapping cluster_id to RedshiftMetricsData
-        """
-        pass
-    
-    @abstractmethod
-    async def get_redshift_cost_breakdown(
-        self,
-        cluster_ids: List[str],
-    ) -> Dict[str, "RedshiftCostData"]:
-        """
-        Get Cost Explorer data for Redshift clusters.
-        
-        Args:
-            cluster_ids: List of cluster identifiers
-            
-        Returns:
-            Dict mapping cluster_id to RedshiftCostData
         """
         pass
     

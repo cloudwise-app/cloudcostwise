@@ -22,6 +22,7 @@ from cloudwise_scan_core.models import (
     ConfidenceLevel,
     WasteDetectionSettings,
 )
+from cloudwise_scan_core.detectors.open.database import rds_cluster_member_ids
 
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers import WasteDataProvider
@@ -289,6 +290,8 @@ class SecurityPostureDetectorsMixin:
                         },
                         metadata={
                             'cluster_name': cluster.cluster_identifier,
+                            # CLO-810: the cluster's whole bill; the saving is $0, so this only labels it.
+                            'cur_member_ids': rds_cluster_member_ids(cluster, cluster_bill=True, instance_bill=True),
                             'engine_version': cluster.engine_version,
                             'num_instances': cluster.num_instances,
                             'detection_mode': data_provider.provider_type,

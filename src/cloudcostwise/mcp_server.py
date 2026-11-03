@@ -25,7 +25,7 @@ from cloudcostwise.runtime import (
     resolve_credentials,
     resolve_regions,
 )
-from cloudcostwise.scan import ScanReport, run_scan_async
+from cloudcostwise.scan import ScanReport, global_checks_warning, run_scan_async
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
                             open_world_hint=True)
@@ -119,6 +119,9 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
             lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
         if len(render.groups(report)) > 15:
             lines.append("- ... call list_findings for the rest")
+        skipped = global_checks_warning(region_list, include_cost_explorer=include_cost_explorer, full=full)
+        if skipped:
+            lines.append(skipped.replace("--regions", "regions"))
         lines += render.scope_notes(report)
         note = render.cost_explorer_note(report, skip_hint="include_cost_explorer=false")
         if note:

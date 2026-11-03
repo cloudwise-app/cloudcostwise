@@ -390,12 +390,105 @@ def _lambda_function_name(parts: list) -> Optional[str]:
     return parts[6] or None
 
 
+def _elasticache_node_id(parts: list) -> Optional[str]:
+    """ElastiCache cache cluster (node) id from ``cluster:<id>``.
+
+    The CUR bills ElastiCache per node: a replication group ``cwfx-cache-replicas``
+    appears only as ``...:cluster:cwfx-cache-replicas-001`` and ``-002``, a
+    cluster-mode group ``cwfx-w8b-ec-tier`` only as ``-0001-001``,
+    ``-0002-001``. The group id never appears. Per-node findings already
+    reach their row through the shared colon tail; this index exists so a
+    group-level finding can name its member nodes (see ``member_ids`` on
+    :meth:`BilledCostLookup.match_for`).
+    """
+    if len(parts) != 7 or parts[2] != "elasticache" or parts[5] != "cluster":
+        return None
+    return parts[6] or None
+
+
+def _rds_cluster_bill_key(parts: list) -> Optional[str]:
+    """``db:<instance id>`` or ``cluster:<cluster resource id>``, lower-cased.
+
+    The CUR bills an Aurora, DocumentDB or Neptune cluster as:
+
+    - ``arn:aws:rds:<r>:<a>:db:<DBInstanceIdentifier>`` for each member
+      instance's hours (and any Extended Support surcharge on them):
+      ``db:cwfx-idle-documentdb-0`` for cluster ``cwfx-idle-documentdb``.
+    - ``arn:aws:rds:<r>:<a>:cluster:<DbClusterResourceId>`` for the cluster's
+      storage, I/O and backup. The API returns that id upper-case
+      (``cluster-27ZXXCJJANJW55DPVE5GYKQ62Q``) and the CUR lower-case
+      (``cluster-27zxxcjjanjw55dpve5gykq62q``).
+
+    The cluster finding's ``DBClusterIdentifier`` is in neither, so the
+    findings carry these keys as ``cur_member_ids`` (see
+    :func:`rds_cluster_cur_member_ids`). The key keeps the ARN's resource
+    kind, so a finding's own ``resource_id`` (a bare cluster or instance name)
+    never reaches this index: only the carried member ids do, and every other
+    RDS, DocumentDB and Neptune finding keeps its old path. Snapshot rows
+    (``snapshot:``, ``cluster-snapshot:``) are not indexed.
+    """
+    # All three engines bill under ``rds`` ARNs. Written as two comparisons,
+    # not a tuple of names: scripts/generate_export_keep_fields.py reads a
+    # tuple of strings here as export keys the code reads.
+    if (
+        len(parts) != 7
+        or parts[2] != "rds"
+        or (parts[5] != "db" and parts[5] != "cluster")
+        or not parts[6]
+    ):
+        return None
+    return f"{parts[5]}:{parts[6]}".lower()
+
+
+def rds_cluster_cur_member_ids(
+    *,
+    db_cluster_resource_id: Optional[str],
+    instance_ids: Sequence[str],
+    cluster_bill: bool,
+    instance_bill: bool,
+) -> Optional[list]:
+    """The ``cur_member_ids`` an Aurora, DocumentDB or Neptune cluster
+    finding carries (CLO-810), or ``None`` when its bill cannot be named.
+
+    ``cluster_bill``: the saving comes out of the cluster's storage, I/O and
+    backup row (``cluster:<DbClusterResourceId>``). ``instance_bill``: out of
+    the member instances' rows (``db:<DBInstanceIdentifier>``). Each detector
+    picks the rows its saving can come from; the billed sum only ever caps
+    the estimate (``reconcile_savings``'s ``min``).
+
+    The ids are matched authoritatively, so a partial set would cap against
+    part of the bill. ``None`` (the finding keeps its pre-CLO-810 path) when:
+
+    - ``cluster_bill`` is wanted and the cluster resource id is unknown (an
+      offline export written without ``DbClusterResourceId``), or
+    - only ``instance_bill`` is wanted and the cluster has no member.
+
+    A cluster with no member instance and a known resource id is billed for
+    storage only, so for ``cluster_bill`` types it yields just that key.
+    """
+    keys: list = []
+    if instance_bill:
+        keys.extend(f"db:{i}".lower() for i in instance_ids if i)
+    if cluster_bill:
+        if not db_cluster_resource_id:
+            return None
+        keys.append(f"cluster:{db_cluster_resource_id}".lower())
+    return keys or None
+
+
 #: ``ResourceType`` value → (deriver, normalise the finding's id for lookup).
+#: The three RDS-family cluster types (CLO-810) are read only through
+#: ``member_ids``; see :func:`_rds_cluster_bill_key`. Aurora cluster findings
+#: are typed ``rds_instance``.
 _TYPED_NAME_DERIVERS = {
     "load_balancer": (_elb_name, str),
     "msk_cluster": (_msk_cluster_name, str),
     "sagemaker_endpoint": (_sagemaker_endpoint_name, str.lower),
     "lambda_function": (_lambda_function_name, str),
+    "elasticache_cluster": (_elasticache_node_id, str),
+    "rds_instance": (_rds_cluster_bill_key, str.lower),
+    "documentdb_cluster": (_rds_cluster_bill_key, str.lower),
+    "neptune_cluster": (_rds_cluster_bill_key, str.lower),
 }
 
 
@@ -451,6 +544,31 @@ def _arn_region(resource_id: str) -> str:
         return ""
     parts = resource_id.split(":")
     return parts[3] if len(parts) > 3 else ""
+
+
+def _sum_rollups(resource_id: str, parts: list) -> Optional[BilledCostRollup]:
+    """Several CUR resources' rollups as one bill, or ``None`` for none.
+
+    ``billed_total`` is the parts' total, ``has_discount_line_items`` is true
+    if any part has them, and ``cost_basis`` is the parts' common basis
+    (``UNKNOWN`` if they differ). ``days_covered`` is the largest part's,
+    because a rollup does not keep the union of the parts' usage dates. The
+    max can only undercount that union, which overstates the monthly figure
+    and so loosens the ``min(estimate, billed)`` cap rather than tightening
+    it.
+    """
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    bases = {p.cost_basis for p in parts}
+    return BilledCostRollup(
+        resource_id=resource_id,
+        billed_total=sum(p.billed_total for p in parts),
+        days_covered=max(p.days_covered for p in parts),
+        cost_basis=bases.pop() if len(bases) == 1 else CostBasis.UNKNOWN,
+        has_discount_line_items=any(p.has_discount_line_items for p in parts),
+    )
 
 
 @dataclass(frozen=True)
@@ -683,16 +801,7 @@ class BilledCostLookup:
         ``None`` when the type has no rollup index, the finding has no real
         region (empty or ``global``: it keeps the pre-CLO-740 path), or no
         part is billed in the finding's region. Parts in other regions are
-        never added.
-
-        The sum keeps the ``BilledCostRollup`` contract: ``billed_total`` is
-        the parts' total, ``has_discount_line_items`` is true if any part has
-        them, and ``cost_basis`` is the parts' common basis (``UNKNOWN`` if
-        they differ). ``days_covered`` is the largest part's, because a
-        rollup does not keep the union of the parts' usage dates. The max can
-        only undercount that union, which overstates the monthly figure and
-        so loosens the ``min(estimate, billed)`` cap rather than tightening
-        it.
+        never added. The sum is :func:`_sum_rollups`.
         """
         rtype = _resource_type_key(resource_type)
         if not rtype or rtype not in _TYPED_ROLLUP_DERIVERS:
@@ -704,17 +813,41 @@ class BilledCostLookup:
             for reg, rid in self.by_typed_rollup.get(rtype, {}).get(resource_id, ())
             if reg == region and rid in self.by_resource
         ]
-        if not parts:
-            return None
-        if len(parts) == 1:
-            return parts[0]
-        bases = {p.cost_basis for p in parts}
-        return BilledCostRollup(
-            resource_id=resource_id,
-            billed_total=sum(p.billed_total for p in parts),
-            days_covered=max(p.days_covered for p in parts),
-            cost_basis=bases.pop() if len(bases) == 1 else CostBasis.UNKNOWN,
-            has_discount_line_items=any(p.has_discount_line_items for p in parts),
+        return _sum_rollups(resource_id, parts)
+
+    def _member_match(
+        self,
+        resource_id: str,
+        member_ids: Sequence[str],
+        resource_type,
+        region: str,
+    ) -> BilledCostMatch:
+        """The summed bill of a finding's member resources (ElastiCache
+        replication group → its nodes; an RDS-family cluster → its instances
+        and/or its storage row, CLO-810), each found through the type's name
+        index in the finding's region.
+
+        Authoritative, like ``cur_resource_id``: members with no CUR rows are
+        absent, and the group's own id is never tried as an alias, since
+        the CUR never bills it and a hit could only be another resource. A
+        member that still names several CUR ids in the region (not expected:
+        a node id is unique per region) makes the whole match ambiguous.
+        """
+        found: dict = {}
+        ambiguous: set = set()
+        for member in member_ids:
+            rid, candidates = self._typed_name_candidates(
+                member, resource_type, region
+            )
+            if rid is not None:
+                found[rid] = self.by_resource[rid]
+            ambiguous.update(candidates)
+        if ambiguous:
+            return BilledCostMatch(
+                ambiguous=True, candidates=tuple(sorted(ambiguous))
+            )
+        return BilledCostMatch(
+            rollup=_sum_rollups(resource_id, list(found.values()))
         )
 
     def rollup_for(
@@ -726,6 +859,7 @@ class BilledCostLookup:
         region: Optional[str] = None,
         lb_type: Optional[str] = None,
         cur_resource_id: Optional[str] = None,
+        member_ids: Optional[Sequence[str]] = None,
     ) -> Optional[BilledCostRollup]:
         """The one CUR rollup this finding matches, or ``None``.
 
@@ -739,6 +873,7 @@ class BilledCostLookup:
             region=region,
             lb_type=lb_type,
             cur_resource_id=cur_resource_id,
+            member_ids=member_ids,
         ).rollup
 
     def match_for(
@@ -750,6 +885,7 @@ class BilledCostLookup:
         region: Optional[str] = None,
         lb_type: Optional[str] = None,
         cur_resource_id: Optional[str] = None,
+        member_ids: Optional[Sequence[str]] = None,
     ) -> BilledCostMatch:
         """Exact match first, then unambiguous alias in either direction.
 
@@ -782,6 +918,17 @@ class BilledCostLookup:
         Rollup types (CLO-740, ``_TYPED_ROLLUP_DERIVERS``): a REST API's
         stages in the finding's region are summed into one rollup. With no
         stage there, the remaining stages run exactly as before.
+
+        ``member_ids``: the names of the resources AWS bills for this
+        finding, when the finding names a group the CUR never bills (an
+        ElastiCache replication group: the CUR bills each member node). For
+        a type with a name index and a real region, each member is found in
+        that index and their rollups are summed. Like ``cur_resource_id``
+        this is authoritative: no member billed is absence, and the group id
+        is not tried as an alias. An Aurora, DocumentDB or Neptune cluster
+        (CLO-810) names its member instances as ``db:<instance id>`` and its
+        storage/I/O as ``cluster:<DbClusterResourceId>``, whichever its saving
+        comes out of (:func:`_rds_cluster_bill_key`).
         """
         if cur_resource_id:
             return BilledCostMatch(rollup=self.by_resource.get(cur_resource_id))
@@ -789,6 +936,15 @@ class BilledCostLookup:
         direct = self.by_resource.get(resource_id)
         if direct is not None:
             return BilledCostMatch(rollup=direct)
+
+        rtype = _resource_type_key(resource_type)
+        if (
+            member_ids
+            and rtype in _TYPED_NAME_DERIVERS
+            and region
+            and region != "global"
+        ):
+            return self._member_match(resource_id, member_ids, resource_type, region)
 
         summed = self._typed_rollup(resource_id, resource_type, region)
         if summed is not None:
@@ -882,11 +1038,12 @@ def reconcile_savings(
     lb_type: Optional[str] = None,
     cur_resource_id: Optional[str] = None,
     waste_type=None,
+    member_ids: Optional[Sequence[str]] = None,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
 
     ``secretsmanager_secret``, ``resource_type``, ``region``, ``lb_type``,
-    ``cur_resource_id``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
+    ``cur_resource_id``, ``member_ids``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
     with ``resource_type``: see ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
 
     Order matters, and each branch is a deliberate safety choice:
@@ -943,6 +1100,7 @@ def reconcile_savings(
         region=region,
         lb_type=lb_type,
         cur_resource_id=cur_resource_id,
+        member_ids=member_ids,
     )
 
     # CLO-739: "couldn't tell which resource" is not "not billed". Keep the

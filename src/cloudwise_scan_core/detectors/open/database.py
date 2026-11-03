@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
 from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_rds_monthly_cost
 from cloudwise_scan_core.cpu_sizing import has_min_coverage, is_as_old_as_window
+from cloudwise_scan_core.billed_cost import rds_cluster_cur_member_ids
 from cloudwise_scan_core.detectors.extended_support import resolve_version_policy, classify_support_state, estimate_surcharge, describe_estimate, surcharge_metadata, needs_base_price, get_billed_surcharge_monthly
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
@@ -231,6 +232,41 @@ def instance_is_standalone_rds(engine: str) -> bool:
     members, whose own detectors judge the cluster."""
     key = (engine or '').strip().lower()
     return key not in _NON_STANDALONE_RDS_ENGINES and not key.startswith(_NON_STANDALONE_RDS_ENGINE_PREFIXES)
+
+
+def rds_cluster_member_ids(cluster, *, cluster_bill: bool, instance_bill: bool) -> Optional[List[str]]:
+    """CLO-810: the ``cur_member_ids`` an Aurora, DocumentDB or Neptune
+    cluster finding carries, from the cluster's own API fields.
+
+    The CUR never bills the ``DBClusterIdentifier`` these findings name. It
+    bills each member instance (``DBClusterMembers[].DBInstanceIdentifier``,
+    held as ``instances[].db_instance_id`` on Aurora and Neptune and as the
+    raw ``db_cluster_members`` on DocumentDB) and the cluster's storage, I/O
+    and backup (``DbClusterResourceId``). The detector picks which of the two
+    its saving comes out of; see ``billed_cost.rds_cluster_cur_member_ids``,
+    which returns ``None`` when that bill cannot be named.
+    """
+    instance_ids: List[str] = []
+    instances = getattr(cluster, 'instances', None)
+    if isinstance(instances, (list, tuple)):
+        instance_ids = [
+            i.db_instance_id for i in instances
+            if isinstance(getattr(i, 'db_instance_id', None), str)
+        ]
+    else:
+        members = getattr(cluster, 'db_cluster_members', None)
+        if isinstance(members, (list, tuple)):
+            instance_ids = [
+                m.get('DBInstanceIdentifier') for m in members
+                if isinstance(m, dict) and isinstance(m.get('DBInstanceIdentifier'), str)
+            ]
+    resource_id = getattr(cluster, 'db_cluster_resource_id', None)
+    return rds_cluster_cur_member_ids(
+        db_cluster_resource_id=resource_id if isinstance(resource_id, str) else None,
+        instance_ids=instance_ids,
+        cluster_bill=cluster_bill,
+        instance_bill=instance_bill,
+    )
 
 
 # Stand-in age for a resource whose creation time the provider could not supply.
@@ -1769,6 +1805,8 @@ class OpenDatabaseDetectorsMixin:
                 metadata={
                     'cluster_id': representative.cluster_id,
                     'replication_group_id': representative.replication_group_id,
+                    # The CUR bills each member node, never the group id.
+                    'cur_member_ids': [m.cluster_id for m in members],
                     'node_type': representative.node_type,
                     'num_replicas': total_replicas,
                     'num_shards': representative.num_shards,
@@ -2212,6 +2250,8 @@ class OpenDatabaseDetectorsMixin:
                 metadata={
                     'cluster_id': cluster.cluster_id,
                     'replication_group_id': cluster.replication_group_id,
+                    # The CUR bills each member node, never the group id.
+                    'cur_member_ids': [m.cluster_id for m in members],
                     'current_type': cluster.node_type,
                     'num_nodes': total_nodes,
                     'num_shards': num_shards,

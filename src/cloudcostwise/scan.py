@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Type
 
-from cloudwise_scan_core.models import WasteItem
+from cloudwise_scan_core.models import WasteDetectionSettings, WasteItem
 from cloudwise_scan_core.open_service import OpenWasteDetectionService
 
 from cloudcostwise.runtime import COST_EXPLORER_SERVICE, COST_EXPLORER_SKIP_MARK, Credentials, ReadOnlyViolation, read_only_guard
@@ -19,6 +19,15 @@ COST_EXPLORER_DETECTORS = frozenset({"savings_opportunities"})
 # A Cost Explorer IAM action ("ce:GetCostAndUsage"), not a longer prefix that
 # merely ends in "ce" ("aws-marketplace:...").
 _COST_EXPLORER_ACTION = re.compile(r"(?<![\w-])ce:")
+# A local scan starts with an empty in-memory cache, so the commitment check has
+# nothing to read until the savings check's refresh has filled it. Hosted scans
+# wait too, for the weekly refresh (``hosted_service.py``); this keeps the local
+# build's order from depending on that.
+_LOCAL_DETECTOR_RUN_AFTER = {"commitment": "savings_opportunities"}
+# A local cache is in-memory only, so this check makes no AWS call the in-process
+# breaker could be protecting (its one STS lookup can't raise). Without this, five
+# unrelated failures would skip it while its rows sit ready in memory.
+_LOCAL_BREAKER_EXEMPT = frozenset({"commitment"})
 
 
 @dataclass
@@ -45,7 +54,10 @@ def full_engine_class() -> Type[OpenWasteDetectionService]:
     """
     from cloudwise_scan_core.hosted_service import WasteDetectionService
 
-    return WasteDetectionService
+    return type(WasteDetectionService.__name__, (WasteDetectionService,), {
+        "DETECTOR_RUN_AFTER": _LOCAL_DETECTOR_RUN_AFTER,
+        "IN_PROCESS_BREAKER_EXEMPT": _LOCAL_BREAKER_EXEMPT,
+    })
 
 
 def service_class(include_cost_explorer: bool = True, full: bool = False) -> Type[OpenWasteDetectionService]:
@@ -67,7 +79,9 @@ def service_class(include_cost_explorer: bool = True, full: bool = False) -> Typ
     )
 
 
-async def _scan_region(cls, creds: Credentials, region: str):
+async def _scan_region(cls, creds: Credentials, region: str, scan_regions: Optional[List[str]] = None):
+    settings = WasteDetectionSettings.get_defaults()
+    settings.scan_regions = scan_regions
     return await cls().detect_waste(
         user_id="local",
         account_id=creds.account_id,
@@ -75,6 +89,7 @@ async def _scan_region(cls, creds: Credentials, region: str):
         secret_access_key=creds.secret_access_key,
         session_token=creds.session_token,
         region=region,
+        settings=settings,
         force_refresh=True,
     )
 
@@ -94,7 +109,8 @@ class RegionResult:
 
 
 def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
-                log_level: Optional[int] = None, full: bool = False) -> RegionResult:
+                log_level: Optional[int] = None, full: bool = False,
+                scan_regions: Optional[List[str]] = None) -> RegionResult:
     """Scan one region in THIS process, under its own read-only guard.
 
     Runs in a worker process when regions are scanned in parallel: the engine
@@ -121,7 +137,7 @@ def scan_region(creds: Credentials, region: str, include_cost_explorer: bool,
     blocked = frozenset() if include_cost_explorer else frozenset({COST_EXPLORER_SERVICE})
     started = time.monotonic()
     with read_only_guard(blocked) as guard:
-        result = asyncio.run(_scan_region(cls, creds, region))
+        result = asyncio.run(_scan_region(cls, creds, region, scan_regions))
     for item in result.waste_items:
         if not item.region:
             item.region = region
@@ -167,7 +183,7 @@ async def run_scan_async(
     results: Dict[str, RegionResult] = {}
     if parallel <= 1 or len(regions) <= 1:
         for region in regions:
-            results[region] = await asyncio.to_thread(scan_region, creds, region, include_cost_explorer, None, full)
+            results[region] = await asyncio.to_thread(scan_region, creds, region, include_cost_explorer, None, full, regions)
             if on_region:
                 on_region(results[region])
     else:
@@ -175,7 +191,7 @@ async def run_scan_async(
         ctx = multiprocessing.get_context("spawn")  # never fork a process holding boto3 sessions/threads
         with concurrent.futures.ProcessPoolExecutor(max_workers=min(parallel, len(regions)), mp_context=ctx) as pool:
             level = logging.getLogger().getEffectiveLevel()  # workers follow the parent's verbosity
-            pending = {loop.run_in_executor(pool, scan_region, creds, r, include_cost_explorer, level, full): r
+            pending = {loop.run_in_executor(pool, scan_region, creds, r, include_cost_explorer, level, full, regions): r
                        for r in regions}
             for done in asyncio.as_completed(list(pending)):
                 res = await done
@@ -201,6 +217,35 @@ async def run_scan_async(
     if violations:
         raise ReadOnlyViolation(f"refused non-read AWS call(s): {', '.join(sorted(set(violations)))}")
     return report
+
+
+_GLOBAL_CHECK_LABELS = {
+    "cloudfront": "CloudFront",
+    "route53": "Route 53",
+    "global_accelerator": "Global Accelerator",
+    "orphaned_dns": "orphaned DNS records",
+    "cloudwatch_dashboard": "CloudWatch dashboards",
+    "savings_opportunities": "RI/Savings Plans",
+    "commitment": "commitment utilization",
+}
+
+
+def global_checks_warning(regions: List[str], include_cost_explorer: bool = True,
+                          full: bool = False) -> Optional[str]:
+    """CLO-817: a warning when ``regions`` leaves out us-east-1, else None.
+
+    The account-level checks run only from us-east-1. The list is built from
+    the service class this scan will use, so the free build names only what it
+    actually has (and RI/Savings Plans only with Cost Explorer on).
+    """
+    if "us-east-1" in regions:
+        return None
+    detectors = service_class(include_cost_explorer, full).GLOBAL_SERVICE_DETECTORS
+    names = sorted(_GLOBAL_CHECK_LABELS.get(k, k) for k in detectors)
+    if not names:
+        return None
+    return ("warning: us-east-1 is not in --regions, so the account-level checks were skipped "
+            f"({', '.join(names)}). Add us-east-1 to --regions to run them.")
 
 
 def run_scan(

@@ -709,6 +709,10 @@ class RedshiftClusterData:
     has_pause_schedule: bool = False
     is_paused: bool = False
     tags: Dict[str, str] = field(default_factory=dict)
+    # CLO-815: False when the scheduled-actions read failed (for example
+    # redshift:DescribeScheduledActions denied). has_pause_schedule=False is
+    # then "unknown", not "no schedule", and redshift_no_pause withholds.
+    pause_schedule_known: bool = True
 
 
 @dataclass
@@ -741,17 +745,6 @@ class RedshiftMetricsData:
     # window (redshift_idle_days). is_idle requires 75% of its hours; None =
     # not reported (the offline export is pre-aggregated).
     connection_hours_in_idle_window: Optional[int] = None
-
-
-@dataclass
-class RedshiftCostData:
-    """Cost Explorer data for a Redshift cluster."""
-    cluster_id: str
-    compute_cost_monthly: float = 0.0
-    spectrum_cost_monthly: float = 0.0
-    storage_cost_monthly: float = 0.0
-    total_cost_monthly: float = 0.0
-    spectrum_cost_ratio: float = 0.0  # spectrum / compute as percentage
 
 
 @dataclass
@@ -1117,6 +1110,12 @@ class DocumentDBClusterData:
     tags: Dict[str, str] = field(default_factory=dict)
     # CLO-455: for the overprovisioned minimum-age guard. None = unknown.
     cluster_create_time: Optional[datetime] = None
+    # CLO-810: DescribeDBClusters' DbClusterResourceId, e.g.
+    # "cluster-27ZXXCJJANJW55DPVE5GYKQ62Q". The CUR bills the cluster's
+    # storage, I/O and backup under ...:cluster:<this id, lower-cased>, and
+    # each member instance's hours under ...:db:<DBInstanceIdentifier>. The
+    # DBClusterIdentifier this model is keyed by appears in neither.
+    db_cluster_resource_id: Optional[str] = None
 
 
 @dataclass
@@ -1499,6 +1498,8 @@ class AuroraClusterData:
     # CLO-457: DescribeDBClusters' ClusterCreateTime. The cluster-level
     # AWS/RDS metrics are keyed on DBClusterIdentifier, a NAME.
     cluster_create_time: Optional[datetime] = None
+    # CLO-810: see DocumentDBClusterData.db_cluster_resource_id.
+    db_cluster_resource_id: Optional[str] = None
 
 
 @dataclass
@@ -1536,6 +1537,8 @@ class NeptuneClusterData:
     tags: Dict[str, str] = field(default_factory=dict)
     # CLO-480: for oversized_neptune's minimum-age guard. None = unknown.
     cluster_create_time: Optional[datetime] = None
+    # CLO-810: see DocumentDBClusterData.db_cluster_resource_id.
+    db_cluster_resource_id: Optional[str] = None
 
 
 @dataclass

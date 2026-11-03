@@ -436,3 +436,34 @@ def test_a_scan_sends_no_extended_support_request_and_reports_estimates(monkeypa
     assert all(f.metadata["billing_verified"] is False for f in report.findings)
     assert all(round(f.monthly_savings, 2) == 146.0 for f in rds_findings)   # the estimate, in each region
 
+
+
+def _run_cli(argv, capsys):
+    from cloudcostwise import cli
+    with patch("cloudcostwise.runtime.configure_local_runtime"), \
+         patch("cloudcostwise.runtime.resolve_credentials", return_value=CREDS), \
+         patch("cloudcostwise.scan.run_scan", side_effect=RuntimeError("stop")):
+        try:
+            cli.main(argv)
+        except RuntimeError:
+            pass
+    return capsys.readouterr().err
+
+
+def test_explicit_regions_without_us_east_1_warn_that_global_checks_were_skipped(capsys):
+    err = _run_cli(["scan", "--regions", "eu-west-1"], capsys)
+    assert "us-east-1 is not in --regions" in err
+    # Only what the free engine has: no CloudFront, Route 53 or Global Accelerator.
+    assert "orphaned DNS records" in err and "CloudWatch dashboards" in err and "RI/Savings Plans" in err
+    assert "CloudFront" not in err and "Route 53" not in err and "Global Accelerator" not in err
+
+
+def test_the_warning_drops_ri_savings_plans_with_no_cost_explorer(capsys):
+    err = _run_cli(["scan", "--regions", "eu-west-1", "--no-cost-explorer"], capsys)
+    assert "us-east-1 is not in --regions" in err
+    assert "CloudWatch dashboards" in err and "RI/Savings Plans" not in err.split("Add us-east-1")[0]
+
+
+def test_regions_with_us_east_1_do_not_warn(capsys):
+    err = _run_cli(["scan", "--regions", "eu-west-1,us-east-1"], capsys)
+    assert "not in --regions" not in err

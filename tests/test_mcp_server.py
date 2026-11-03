@@ -66,6 +66,34 @@ def test_four_read_only_tools_and_the_scan_tool_states_its_cost():
     assert set(scan.input_schema["properties"]) == {"profile", "regions", "include_cost_explorer"}
 
 
+def _scan_text(regions, args=None):
+    async def run():
+        server = mcp_server.build_server()
+
+        async def fake_scan(creds, region_list, include_cost_explorer=True, on_region=None, full=False):
+            return REPORT
+
+        with patch.object(mcp_server, "resolve_credentials", return_value=CREDS), \
+             patch.object(mcp_server, "resolve_regions", return_value=regions), \
+             patch.object(mcp_server, "run_scan_async", side_effect=fake_scan):
+            async with Client(server) as client:
+                return _text(await client.call_tool("scan", args or {}))
+
+    return asyncio.run(run())
+
+
+def test_scan_warns_when_regions_leave_out_us_east_1():
+    # CLO-817: names only what the free engine has, RI/Savings Plans with Cost Explorer on.
+    text = _scan_text(["eu-west-1"])
+    assert "us-east-1 is not in regions" in text
+    assert "orphaned DNS records" in text and "CloudWatch dashboards" in text
+    assert "RI/Savings Plans" in text
+    assert "CloudFront" not in text
+    no_ce = _scan_text(["eu-west-1"], {"include_cost_explorer": False})
+    assert "RI/Savings Plans" not in no_ce and "CloudWatch dashboards" in no_ce
+    assert "not in regions" not in _scan_text(["eu-west-1", "us-east-1"])
+
+
 def test_tools_before_a_scan_ask_for_one():
     async def call(client):
         return _text(await client.call_tool("list_findings", {}))

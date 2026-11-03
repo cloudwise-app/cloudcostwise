@@ -86,7 +86,6 @@ from cloudwise_scan_core.data_providers.models import (
     ElastiCacheRequestVolumeData,
     RedshiftClusterData,
     RedshiftMetricsData,
-    RedshiftCostData,
     OpenSearchDomainData,
     OpenSearchMetricsData,
     CloudWatchLogGroupData,
@@ -156,6 +155,15 @@ logger = logging.getLogger(__name__)
 
 # CLO-513: ListMultipartUploads pages read per bucket (1,000 uploads each).
 S3_MULTIPART_MAX_PAGES = 5
+# CLO-817: page caps for the reads that used to take only the first page.
+REDSHIFT_CLUSTERS_MAX_PAGES = 20
+# CLO-508: Redshift node families that support pause/resume (RA3, DC2). Defined
+# here, in the open provider, because the hosted redshift detector
+# (detectors/database.py) imports it from this module: one source, and the
+# open build cannot import the hosted detector.
+REDSHIFT_PAUSABLE_NODE_FAMILIES = ('ra3.', 'dc2.')
+CLOUDWATCH_DASHBOARDS_MAX_PAGES = 20
+TRANSFER_WEB_APPS_MAX_PAGES = 20
 
 # CLO-527 item 5: DescribeVolumes pages (500 is the API's MaxResults ceiling).
 # 40 pages = 20,000 volumes per region; past that the rest are MISSING and
@@ -4847,26 +4855,68 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         clusters = []
         try:
             redshift = self._get_client('redshift')
-            response = redshift.describe_clusters()
-            
+            # CLO-817: paged, bounded like the schedule list below.
+            cluster_rows: List[Dict[str, Any]] = []
+            cluster_marker = None
+            for _ in range(REDSHIFT_CLUSTERS_MAX_PAGES):
+                ckwargs = {'Marker': cluster_marker} if cluster_marker else {}
+                cresp = redshift.describe_clusters(**ckwargs)
+                cluster_rows.extend(cresp.get('Clusters', []))
+                cluster_marker = cresp.get('Marker')
+                if not cluster_marker:
+                    break
+            else:
+                self._warn_once(
+                    f"redshift: more than {len(cluster_rows)} clusters in {self._region}; "
+                    f"DescribeClusters stopped at {REDSHIFT_CLUSTERS_MAX_PAGES} pages. Clusters past "
+                    "that are not judged: MISSING, not zero"
+                )
+            response = {'Clusters': cluster_rows}
+
             # Fetch scheduled actions to determine pause schedules
             scheduled_actions = {}
+            schedule_read_failure = None
             try:
-                sa_response = redshift.describe_scheduled_actions()
-                for action in sa_response.get('ScheduledActions', []):
-                    target = action.get('TargetAction', {})
-                    pause = target.get('PauseCluster', {})
-                    resume = target.get('ResumeCluster', {})
-                    cluster_id = pause.get('ClusterIdentifier') or resume.get('ClusterIdentifier')
-                    if cluster_id:
-                        scheduled_actions[cluster_id] = True
+                marker = None
+                for _ in range(50):
+                    kwargs = {'Marker': marker} if marker else {}
+                    sa_response = redshift.describe_scheduled_actions(**kwargs)
+                    for action in sa_response.get('ScheduledActions', []):
+                        target = action.get('TargetAction', {})
+                        pause = target.get('PauseCluster', {})
+                        resume = target.get('ResumeCluster', {})
+                        cluster_id = pause.get('ClusterIdentifier') or resume.get('ClusterIdentifier')
+                        if cluster_id:
+                            scheduled_actions[cluster_id] = True
+                    marker = sa_response.get('Marker')
+                    if not marker:
+                        break
+                else:
+                    # Never read to the end: an absent cluster is unknown.
+                    schedule_read_failure = "schedule list not fully read"
             except ClientError as e:
                 self._warn_swallowed(
                     "Redshift scheduled actions", "redshift:DescribeScheduledActions", e,
                 )
+                schedule_read_failure = f"read failed ({self._error_label(e)})"
             
             for cluster in response.get('Clusters', []):
                 cluster_id = cluster.get('ClusterIdentifier', '')
+                # CLO-815: with the schedule list unread, "no schedule" is
+                # unknown; a cluster not seen in a partial list is too.
+                schedule_known = schedule_read_failure is None or scheduled_actions.get(cluster_id, False)
+                # CLO-817: only RA3 and DC2 can be paused; for other node
+                # families the verdict does not exist, so there is nothing to
+                # say was withheld.
+                pausable = (cluster.get('NodeType') or '').lower().startswith(REDSHIFT_PAUSABLE_NODE_FAMILIES)
+                if (
+                    not schedule_known and pausable
+                    and cluster.get('ClusterStatus', '').lower() != 'paused'
+                ):
+                    self._note_idle_verdict_missing(
+                        'redshift_pause_schedule', cluster_id, schedule_read_failure,
+                        verdict='no-pause-schedule', evidence='scheduled actions',
+                    )
                 clusters.append(RedshiftClusterData(
                     cluster_id=cluster_id,
                     node_type=cluster.get('NodeType', ''),
@@ -4879,6 +4929,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     created_time=cluster.get('ClusterCreateTime'),
                     has_pause_schedule=scheduled_actions.get(cluster_id, False),
                     is_paused=cluster.get('ClusterStatus', '').lower() == 'paused',
+                    pause_schedule_known=bool(schedule_known),
                 ))
         except ClientError as e:
             if self._is_access_denied(e):
@@ -5204,90 +5255,6 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             logger.error(f"Error fetching Redshift metrics: {e}")
         
         return metrics
-    
-    async def get_redshift_cost_breakdown(
-        self,
-        cluster_ids: List[str],
-    ) -> Dict[str, RedshiftCostData]:
-        """Get Cost Explorer data for this region's Redshift clusters.
-
-        Cost Explorer is account-wide, so the REGION filter is what stops every
-        region's scan dividing the whole account's bill among its own clusters.
-
-        The Spectrum figures stay 0 on real AWS, so redshift_spectrum_heavy
-        doesn't fire: see the comment on the name match below.
-        ``compute_cost_monthly`` is everything except Spectrum, so it includes
-        RMS storage, snapshots and the rest. Nothing reads it while the ratio is 0.
-        """
-        costs: Dict[str, RedshiftCostData] = {}
-        
-        if not cluster_ids:
-            return costs
-        
-        try:
-            ce = self._get_client('ce')
-            end_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime('%Y-%m-%d')
-            
-            request = {
-                'TimePeriod': {'Start': start_date, 'End': end_date},
-                'Granularity': 'MONTHLY',
-                'Filter': {
-                    'And': [
-                        {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Redshift']}},
-                        {'Dimensions': {'Key': 'REGION', 'Values': [self._region]}},
-                    ]
-                },
-                'Metrics': ['UnblendedCost'],
-                'GroupBy': [{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}],
-            }
-            total_redshift = 0.0
-            total_spectrum = 0.0
-            try:
-                while True:
-                    response = ce.get_cost_and_usage(**request)
-                    for result in response.get('ResultsByTime', []):
-                        for group in result.get('Groups', []):
-                            amount = float(group.get('Metrics', {}).get('UnblendedCost', {}).get('Amount', 0))
-                            total_redshift += amount
-                            # Stale: no real usage type matches this. AWS bills Spectrum scans
-                            # as `<prefix>-DataScanned`. Matching that would revive a finding
-                            # whose savings claim and per-cluster attribution aren't settled.
-                            if 'spectrum' in group.get('Keys', [''])[0].lower():
-                                total_spectrum += amount
-                    next_page = response.get('NextPageToken')
-                    if not next_page:
-                        break
-                    request['NextPageToken'] = next_page
-            except ClientError as e:
-                # All or nothing: a partial sum would read as a real, smaller bill.
-                logger.debug(f"Redshift cost breakdown unavailable: {e}")
-                total_redshift = 0.0
-                total_spectrum = 0.0
-            
-            compute_cost = total_redshift - total_spectrum
-            spectrum_ratio = (total_spectrum / compute_cost * 100) if compute_cost > 0 else 0
-            
-            # Distribute evenly across clusters (best effort without per-cluster tags)
-            num_clusters = max(len(cluster_ids), 1)
-            for cluster_id in cluster_ids:
-                costs[cluster_id] = RedshiftCostData(
-                    cluster_id=cluster_id,
-                    compute_cost_monthly=round(compute_cost / num_clusters, 2),
-                    spectrum_cost_monthly=round(total_spectrum / num_clusters, 2),
-                    total_cost_monthly=round(total_redshift / num_clusters, 2),
-                    spectrum_cost_ratio=round(spectrum_ratio, 1),
-                )
-        except Exception as e:
-            if self._is_access_denied(e):
-                self._record_permission_error(
-                    resource="Redshift Cost Breakdown", permission="ce:GetCostAndUsage", error=e,
-                )
-                self._warn_access_denied("Redshift Cost Breakdown", "ce:GetCostAndUsage", e)
-                raise
-            logger.error(f"Error fetching Redshift cost breakdown: {e}")
-        
-        return costs
     
     # =========================================================================
     # OpenSearch
@@ -5923,8 +5890,22 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         dashboards = []
         try:
             cw = self._get_client('cloudwatch')
-            response = cw.list_dashboards()
-            for entry in response.get('DashboardEntries', []):
+            entries: List[Dict[str, Any]] = []
+            token = None
+            for _ in range(CLOUDWATCH_DASHBOARDS_MAX_PAGES):
+                kwargs = {'NextToken': token} if token else {}
+                response = cw.list_dashboards(**kwargs)
+                entries.extend(response.get('DashboardEntries', []))
+                token = response.get('NextToken')
+                if not token:
+                    break
+            else:
+                self._warn_once(
+                    f"cloudwatch: more than {len(entries)} dashboards in {self._region}; "
+                    f"ListDashboards stopped at {CLOUDWATCH_DASHBOARDS_MAX_PAGES} pages. Dashboards "
+                    "past that are not judged: MISSING, not zero"
+                )
+            for entry in entries:
                 dashboards.append(CloudWatchDashboardData(
                     dashboard_name=entry.get('DashboardName', ''),
                     dashboard_arn=entry.get('DashboardArn', ''),
@@ -7615,14 +7596,33 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         """Get all Transfer Family Web Apps with enriched details."""
         try:
             transfer = self._get_client('transfer')
-            web_apps = transfer.list_web_apps().get('WebApps', [])
+            web_apps: List[Dict[str, Any]] = []
+            token = None
+            for _ in range(TRANSFER_WEB_APPS_MAX_PAGES):
+                kwargs = {'NextToken': token} if token else {}
+                resp = transfer.list_web_apps(**kwargs)
+                web_apps.extend(resp.get('WebApps', []))
+                token = resp.get('NextToken')
+                if not token:
+                    break
+            else:
+                self._warn_once(
+                    f"transfer: more than {len(web_apps)} web apps in {self._region}; "
+                    f"ListWebApps stopped at {TRANSFER_WEB_APPS_MAX_PAGES} pages. Web apps past "
+                    "that are not judged: MISSING, not zero"
+                )
             enriched = []
             for app in web_apps:
                 app_id = app.get('WebAppId', '')
                 try:
                     details = transfer.describe_web_app(WebAppId=app_id).get('WebApp', {})
                     enriched.append(details)
-                except Exception:
+                except Exception as e:
+                    # CLO-815: a denial is recorded (permission_missing); the
+                    # list entry stands in for the details either way.
+                    self._warn_swallowed(
+                        "Transfer Web App details", "transfer:DescribeWebApp", e,
+                    )
                     enriched.append(app)
             return enriched
         except Exception as e:
@@ -8013,6 +8013,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         deletion_protection=c.get('DeletionProtection', False),
                         tags=tags,
                         cluster_create_time=c.get('ClusterCreateTime'),
+                        db_cluster_resource_id=c.get('DbClusterResourceId') or None,
                     ))
 
             logger.info(f"DocumentDB: Found {len(clusters)} clusters")
@@ -8919,6 +8920,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         ),
                         tags=self._tags_to_dict(cluster.get('TagList', [])),
                         cluster_create_time=cluster.get('ClusterCreateTime'),
+                        db_cluster_resource_id=cluster.get('DbClusterResourceId') or None,
                     ))
         except ClientError as e:
             if self._is_access_denied(e):
@@ -9051,6 +9053,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     serverless_v2_config=sv2_config,
                     tags=self._tags_to_dict(cluster.get('TagList', [])),
                     cluster_create_time=cluster.get('ClusterCreateTime'),
+                    db_cluster_resource_id=cluster.get('DbClusterResourceId') or None,
                 ))
         except ClientError as e:
             if self._is_access_denied(e):

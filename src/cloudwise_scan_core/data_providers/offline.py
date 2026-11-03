@@ -66,7 +66,6 @@ from cloudwise_scan_core.data_providers.models import (
     ElastiCacheRequestVolumeData,
     RedshiftClusterData,
     RedshiftMetricsData,
-    RedshiftCostData,
     OpenSearchDomainData,
     OpenSearchMetricsData,
     CloudWatchLogGroupData,
@@ -2744,39 +2743,6 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         
         return metrics
     
-    async def get_redshift_cost_breakdown(
-        self,
-        cluster_ids: List[str],
-    ) -> Dict[str, RedshiftCostData]:
-        """Get cost breakdown for Redshift clusters from the export."""
-        costs: Dict[str, RedshiftCostData] = {}
-        
-        exported_costs = {}
-        for cost in self._get_data('redshift_costs'):
-            cid = cost.get('cluster_id', '')
-            exported_costs[cid] = cost
-        
-        for cluster_id in cluster_ids:
-            if cluster_id in exported_costs:
-                c = exported_costs[cluster_id]
-                compute = float(c.get('compute_cost_monthly', 0))
-                spectrum = float(c.get('spectrum_cost_monthly', 0))
-                storage = float(c.get('storage_cost_monthly', 0))
-                total = float(c.get('total_cost_monthly', compute + spectrum + storage))
-                ratio = (spectrum / compute * 100) if compute > 0 else 0
-                costs[cluster_id] = RedshiftCostData(
-                    cluster_id=cluster_id,
-                    compute_cost_monthly=round(compute, 2),
-                    spectrum_cost_monthly=round(spectrum, 2),
-                    storage_cost_monthly=round(storage, 2),
-                    total_cost_monthly=round(total, 2),
-                    spectrum_cost_ratio=round(ratio, 1),
-                )
-            else:
-                costs[cluster_id] = RedshiftCostData(cluster_id=cluster_id)
-        
-        return costs
-    
     # =========================================================================
     # OpenSearch
     # =========================================================================
@@ -4333,6 +4299,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 deletion_protection=c.get('DeletionProtection', False),
                 tags=tags,
                 cluster_create_time=self._parse_datetime(c.get('ClusterCreateTime')),
+                db_cluster_resource_id=c.get('DbClusterResourceId') or None,
             ))
         return clusters
 
@@ -4853,6 +4820,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     cluster.get('ReplicationSourceIdentifier')
                 ),
                 cluster_create_time=self._parse_datetime(cluster.get('ClusterCreateTime')),
+                db_cluster_resource_id=cluster.get('DbClusterResourceId') or None,
             ))
 
         return clusters
@@ -4936,6 +4904,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 instances=instances,
                 serverless_v2_config=sv2_config,
                 cluster_create_time=self._parse_datetime(cluster.get('ClusterCreateTime')),
+                db_cluster_resource_id=cluster.get('DbClusterResourceId') or None,
             ))
 
         return clusters

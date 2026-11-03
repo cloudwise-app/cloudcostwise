@@ -49,7 +49,6 @@ ADVISORY_WASTE_TYPES: frozenset[str] = frozenset({
     "redshift_concurrency_scaling_waste",
     "redshift_legacy_dc2",
     "redshift_no_pause",
-    "redshift_spectrum_heavy",
     "redshift_wlm_over_provisioned",
     "ri_opportunity_ec2",
     "ri_opportunity_elasticache",
@@ -149,6 +148,7 @@ TRUSTED_WASTE_TYPES: frozenset[str] = frozenset({
     "redundant_backup",
     "resource_without_backup_coverage",
     "s3_empty_bucket",
+    "s3_rapid_growth",
     "s3_wrong_storage_class",
     "stale_backup_plan_assignment",
     "step_functions_express_duration_waste",
@@ -163,11 +163,13 @@ TRUSTED_WASTE_TYPES: frozenset[str] = frozenset({
     "unencrypted_efs_filesystem",
     "unencrypted_rds_instance",
     "untagged_ecr_images",
+    "unused_api_gateway",
     "unused_appsync",
     "unused_distribution",
     "unused_hosted_zone",
     "unused_kms_key",
     "unused_lambda",
+    "unused_secret",
 })
 
 # L0/L1 with a path to L2.
@@ -214,10 +216,7 @@ UNVALIDATED_WASTE_TYPES: frozenset[str] = frozenset({
     "oversized_neptune",
     "oversized_rds_optimizer",
     "oversized_workspace",
-    "s3_rapid_growth",
-    "unused_api_gateway",
     "unused_dashboard",
-    "unused_secret",
     "unused_vpc_endpoint",
     "workspaces_autostop_opportunity",
 })
@@ -248,7 +247,6 @@ ADVISORY_REASONS: Dict[str, str] = {
     "redshift_concurrency_scaling_waste": "over_budget",
     "redshift_legacy_dc2": "retired_config",
     "redshift_no_pause": "over_budget",
-    "redshift_spectrum_heavy": "over_budget",
     "redshift_wlm_over_provisioned": "over_budget",
     "ri_opportunity_ec2": "commitment",
     "ri_opportunity_elasticache": "commitment",
