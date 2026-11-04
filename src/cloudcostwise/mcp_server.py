@@ -17,6 +17,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from cloudcostwise import __version__, render
+from cloudcostwise import share as share_mod
 from cloudcostwise.runtime import (
     COST_EXPLORER_PRICE_PER_REQUEST,
     CredentialsError,
@@ -60,20 +61,27 @@ def _money(x) -> str:
     return f"${float(x or 0):,.2f}"
 
 
-def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcostwise",
+def build_server(full: bool = False, upsell: bool = True, share: bool = False, name: str = "cloudcostwise",
                  version: str = __version__,
                  register: Optional[Callable[[MCPServer, Callable[[], Optional[ScanReport]]], None]] = None,
                  transform: Optional[Callable[[ScanReport], ScanReport]] = None,
+                 gate: Optional[Callable[[object], Optional[str]]] = None,
                  ) -> MCPServer:
     """The MCP server. The defaults are the free tool.
 
     ``full`` runs all 46 service checks (partner build only), ``upsell=False``
-    drops the hosted-product footer and links, and ``register(server,
+    drops the hosted-product footer and links, ``share=True`` (the free ``serve()`` only)
+    lets a scan send a summary when the human's own setting says yes (CLO-824; never a
+    tool parameter, never a prompt; the partner build leaves it off), and ``register(server,
     last_report)`` lets a build add its own tools over the last scan, and
-    ``transform`` rewrites each scan before any tool shows it.
+    ``transform`` rewrites each scan before any tool shows it. ``gate(creds)``
+    runs after the account is resolved and before any check: it returns None to
+    allow the ``full`` checks, or a message that makes this scan run the free
+    checks only (the partner build's single-account licence).
     """
     configure_local_runtime()
     session = _Session(upsell=upsell)
+    share_enabled = share
     server = MCPServer(name=name, version=version, instructions=INSTRUCTIONS)
 
     # Same one-line decorator shape as the other three tools: directories that
@@ -91,6 +99,8 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
         try:
             creds = resolve_credentials(profile)
             region_list = resolve_regions(regions, creds)
+            refusal = gate(creds) if (gate is not None and full) else None
+            run_full = full and refusal is None
             finished = 0
 
             def progress(res) -> None:
@@ -102,15 +112,19 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
                     f"{res.region}: {len(res.findings)} finding(s) in {res.seconds:.0f}s"))
 
             report = await run_scan_async(creds, region_list, include_cost_explorer=include_cost_explorer,
-                                          on_region=progress, full=full)
+                                          on_region=progress, full=run_full)
         except CredentialsError as e:
             return f"Could not scan: {e}"
         except ReadOnlyViolation as e:
             return f"Scan stopped: {e}. This is a bug in cloudcostwise; nothing was changed in AWS."
+        if refusal:
+            report.warnings.append(refusal)
         if transform is not None:
             report = transform(report)
         session.report = report
         session.by_id = {str(i.id): i for i in report.findings}
+        if share_enabled:
+            share_mod.share_from_settings_mcp(report)
         lines = [f"Account {report.account_id}, regions {', '.join(report.regions)}: "
                  f"{len(report.findings)} findings, estimated savings "
                  f"{_money(render.counted_total(report))}/month (advisory findings excluded)."]
@@ -119,13 +133,15 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
             lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
         if len(render.groups(report)) > 15:
             lines.append("- ... call list_findings for the rest")
-        skipped = global_checks_warning(region_list, include_cost_explorer=include_cost_explorer, full=full)
+        skipped = global_checks_warning(region_list, include_cost_explorer=include_cost_explorer, full=run_full)
         if skipped:
             lines.append(skipped.replace("--regions", "regions"))
         lines += render.scope_notes(report)
         note = render.cost_explorer_note(report, skip_hint="include_cost_explorer=false")
         if note:
             lines.append(note)
+        if refusal:
+            lines.append(refusal)
         if report.warnings:
             lines.append(f"{len(report.warnings)} data warning(s): those findings are MISSING, not zero.")
         if report.permission_errors:
@@ -202,4 +218,4 @@ def build_server(full: bool = False, upsell: bool = True, name: str = "cloudcost
 
 
 def serve() -> None:
-    build_server().run("stdio")
+    build_server(share=True).run("stdio")

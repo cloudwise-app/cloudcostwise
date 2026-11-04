@@ -1,4 +1,5 @@
-"""Open-core detectors (FSL-1.1-ALv2).
+# SPDX-License-Identifier: Apache-2.0
+"""Open-core detectors (Apache-2.0).
 
 The 20 service entrypoints in ``tier_routing.FREE_TIER_DETECTORS`` and every
 method they call. Nothing in this package may import a closed detector module;

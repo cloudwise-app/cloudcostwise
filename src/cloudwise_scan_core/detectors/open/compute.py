@@ -1,4 +1,5 @@
-"""Open-core part of ``detectors/compute.py`` (FSL-1.1-ALv2).
+# SPDX-License-Identifier: Apache-2.0
+"""Open-core part of ``detectors/compute.py`` (Apache-2.0).
 
 The service entrypoints in ``FREE_TIER_DETECTORS`` and every method they call.
 ``ComputeDetectorsMixin`` in ``detectors/compute.py`` subclasses this mixin and adds the

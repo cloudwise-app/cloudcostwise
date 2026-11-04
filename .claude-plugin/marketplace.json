@@ -9,7 +9,7 @@
     {
       "name": "cloudcostwise",
       "source": "./",
-      "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally. Nothing is sent to CloudWise."
+      "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally. Nothing is sent to CloudWise unless you choose to share a summary at the end."
     }
   ]
 }

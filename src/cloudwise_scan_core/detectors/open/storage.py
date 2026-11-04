@@ -1,4 +1,5 @@
-"""Open-core part of ``detectors/storage.py`` (FSL-1.1-ALv2).
+# SPDX-License-Identifier: Apache-2.0
+"""Open-core part of ``detectors/storage.py`` (Apache-2.0).
 
 The service entrypoints in ``FREE_TIER_DETECTORS`` and every method they call.
 ``StorageDetectorsMixin`` in ``detectors/storage.py`` subclasses this mixin and adds the
@@ -100,6 +101,13 @@ EFS_LIFECYCLE_MIN_SIZE_GB = 1.0
 # old_ecr_images did not.
 ECR_OLD_IMAGES_MIN_GB = 0.5
 ECR_UNTAGGED_MIN_GB = 0.1
+# CLO-827: a percentage and a doubling time computed against a near-empty
+# 30-day baseline are meaningless (0.0 GB -> 12 GB prints 1199711540%). Below
+# this starting size, or below 1% of the current size, the text states the
+# absolute growth only.
+S3_GROWTH_NEAR_ZERO_BASE_GB = 0.1
+S3_GROWTH_NEAR_ZERO_BASE_FRACTION = 0.01
+S3_GROWTH_PCT_DISPLAY_CAP = 100000.0
 
 
 # CLO-691: no_lifecycle_policy is a one-click Fix This type, so its finding
@@ -1109,6 +1117,43 @@ class OpenStorageDetectorsMixin:
         growth_gb = growth_bytes / self.GB
         current_cost = curr_gb * S3_STANDARD_PER_GB
         projected_growth_cost = growth_gb * S3_STANDARD_PER_GB
+
+        # CLO-827: wording only. Detection above is unchanged.
+        near_zero_base = (
+            prev_gb < S3_GROWTH_NEAR_ZERO_BASE_GB
+            or prev_gb < curr_gb * S3_GROWTH_NEAR_ZERO_BASE_FRACTION
+        )
+        if near_zero_base:
+            start_text = (
+                f"under {S3_GROWTH_NEAR_ZERO_BASE_GB:g} GB"
+                if prev_gb < S3_GROWTH_NEAR_ZERO_BASE_GB
+                else f"{prev_gb:.1f} GB"
+            )
+            growth_phrase = (
+                f"grew from {start_text} to "
+                f"{curr_gb:.1f} GB in 30 days (+{growth_gb:.1f} GB)"
+            )
+            detection_text = f'Bucket {growth_phrase}'
+            doubling_sentence = ''
+        else:
+            if growth_pct > S3_GROWTH_PCT_DISPLAY_CAP:
+                pct_text = f">{S3_GROWTH_PCT_DISPLAY_CAP:,.0f}%"
+            else:
+                pct_text = f"{growth_pct:.0f}%"
+            growth_phrase = (
+                f"grew {pct_text} in 30 days ({prev_gb:.1f} GB → {curr_gb:.1f} GB)"
+            )
+            detection_text = (
+                f'Bucket grew {pct_text} in 30 days '
+                f'({prev_gb:.1f} GB → {curr_gb:.1f} GB, +{growth_gb:.1f} GB)'
+            )
+            doubling_days = 30 / max(growth_pct, 1) * 100
+            if round(doubling_days) >= 1:
+                doubling_sentence = (
+                    f' At this rate, costs will double in ~{doubling_days:.0f} days.'
+                )
+            else:
+                doubling_sentence = ''
         
         return [WasteItem(
             id=str(uuid.uuid4()),
@@ -1117,23 +1162,21 @@ class OpenStorageDetectorsMixin:
             waste_type=WasteType.S3_RAPID_GROWTH,
             title="S3 Rapid Growth Anomaly",
             description=(
-                f"S3 bucket '{bucket.bucket_name}' grew {growth_pct:.0f}% in 30 days "
-                f"({prev_gb:.1f} GB → {curr_gb:.1f} GB). "
+                f"S3 bucket '{bucket.bucket_name}' {growth_phrase}. "
                 f"Investigate source of growth. Consider adding lifecycle rules "
                 f"to expire old objects or transition to cheaper storage classes."
             ),
             monthly_savings=projected_growth_cost,
             confidence=ConfidenceLevel.LOW,
             action=(
-                f"S3 bucket '{bucket.bucket_name}' grew {growth_pct:.0f}% in 30 days "
-                f"({prev_gb:.1f} GB → {curr_gb:.1f} GB). "
+                f"S3 bucket '{bucket.bucket_name}' {growth_phrase}. "
                 f"Investigate source of growth. Consider adding lifecycle rules "
                 f"to expire old objects or transition to cheaper storage classes."
             ),
             explanation={
-                'detection': f'Bucket grew {growth_pct:.0f}% in 30 days ({prev_gb:.1f} GB → {curr_gb:.1f} GB, +{growth_gb:.1f} GB)',
+                'detection': detection_text,
                 'threshold': f'> {settings.s3_growth_threshold_pct}% growth in 30 days with > {settings.s3_growth_min_absolute_gb} GB absolute increase',
-                'pricing': f'Growth adds ~${projected_growth_cost:.2f}/month in storage costs. At this rate, costs will double in ~{30/max(growth_pct, 1)*100:.0f} days.',
+                'pricing': f'Growth adds ~${projected_growth_cost:.2f}/month in storage costs.{doubling_sentence}',
                 'why_waste': f'Abnormal growth often indicates runaway logging, build artifacts, or misconfigured data pipelines. Without lifecycle rules, this growth continues unchecked.',
                 'risk': 'Investigate the source of growth before adding lifecycle rules. Use S3 Storage Lens or S3 Inventory to identify which prefixes are growing.',
             },

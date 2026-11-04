@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 """The RI/Savings Plans cache key, shared by the open savings detector and the
-closed commitment detector (FSL-1.1-ALv2).
+closed commitment detector. This file is Apache-2.0; the closed detector is not.
 
 Moved verbatim from ``detectors/commitment.py`` (CLO-562) because
 ``savings_opportunities`` (open) writes the cache that ``commitment`` (closed)

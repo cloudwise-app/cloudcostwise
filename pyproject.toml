@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloudcostwise"
-version = "0.1.17"
-description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials. Nothing is sent to CloudWise."
+version = "0.1.18"
+description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials. Nothing is sent to CloudWise unless you choose to share a summary at the end."
 readme = "README.md"
 requires-python = ">=3.11"
 keywords = ["aws", "finops", "cost-optimization", "cloud-cost", "waste", "mcp", "claude-code", "cli"]
@@ -14,6 +14,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -22,7 +23,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
-license = { text = "FSL-1.1-ALv2" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "CloudWise" }]
 dependencies = ["boto3>=1.40", "mcp>=2.3,<3"]
 

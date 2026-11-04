@@ -1,4 +1,5 @@
-"""Open-core part of ``detectors/management.py`` (FSL-1.1-ALv2).
+# SPDX-License-Identifier: Apache-2.0
+"""Open-core part of ``detectors/management.py`` (Apache-2.0).
 
 The service entrypoints in ``FREE_TIER_DETECTORS`` and every method they call.
 ``ManagementDetectorsMixin`` in ``detectors/management.py`` subclasses this mixin and adds the

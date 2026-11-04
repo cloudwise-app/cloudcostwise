@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 29 at L1, 38 at L2, 23 at L3, 1 at L4.
+Summary for the checks in this repository: 29 at L1, 37 at L2, 24 at L3, 1 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -96,7 +96,7 @@ proven checks only.
 | `s3_empty_bucket` | L3 |  | none |
 | `s3_high_request_and_transfer_cost` | L1 | yes |  |
 | `s3_no_default_encryption` | L1 | yes |  |
-| `s3_rapid_growth` | L2 |  | partial |
+| `s3_rapid_growth` | L3 |  | partial |
 | `s3_wrong_storage_class` | L3 |  | partial |
 | `sp_opportunity_compute` | L1 | yes |  |
 | `sp_opportunity_ec2` | L1 | yes |  |

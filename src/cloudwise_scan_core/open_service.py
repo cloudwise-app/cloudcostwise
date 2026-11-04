@@ -1,4 +1,5 @@
-"""The open core's waste detection service (FSL-1.1-ALv2).
+# SPDX-License-Identifier: Apache-2.0
+"""The open core's waste detection service (Apache-2.0).
 
 The same orchestration as the hosted product (``WasteDetectionServiceBase``)
 with only the open detector mixins, and the registry narrowed to the 20

@@ -13,7 +13,7 @@ from cloudcostwise import __version__
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cloudcostwise",
-        description="Find AWS waste locally with your own read-only credentials. Nothing is sent to CloudWise.",
+        description="Find AWS waste locally with your own read-only credentials. Nothing is sent to CloudWise unless you choose to share a summary at the end.",
     )
     p.add_argument("--version", action="version", version=f"cloudcostwise {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
@@ -26,6 +26,12 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--parallel", type=int, default=4, metavar="N",
                    help="regions scanned at once, each in its own process (default 4; 1 = one at a time)")
     s.add_argument("--verbose", "-v", action="store_true", help="show data warnings and engine logs")
+    sh = sub.add_parser("share", help="opt in or out of sharing a scan summary with CloudWise (off unless you say yes)")
+    g = sh.add_mutually_exclusive_group()
+    g.add_argument("--on", action="store_true", help="share a summary after each scan (needs an interactive terminal)")
+    g.add_argument("--off", action="store_true", help="never share, never ask")
+    g.add_argument("--status", action="store_true", help="show the current setting (default)")
+    g.add_argument("--reset", action="store_true", help="forget the answer; ask once more in an interactive terminal")
     sub.add_parser("mcp", help="run as an MCP server (stdio) for Claude Code, Codex and other assistants")
     return p
 
@@ -35,6 +41,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # stderr always: on `mcp`, stdout carries the protocol and must stay clean.
     logging.basicConfig(level=logging.INFO if getattr(args, "verbose", False) else logging.ERROR,
                         stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
+
+    if args.command == "share":
+        from cloudcostwise import share
+
+        return share.command(args)
 
     if args.command == "mcp":
         from cloudcostwise.mcp_server import serve
@@ -92,6 +103,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(render.as_markdown(report))
     else:
         print(render.as_table(report, verbose=args.verbose))
+    # CLO-824: after the results are out. Asks only a human at a terminal, or sends only on a
+    # setting a human wrote; never raises, never fails the scan.
+    from cloudcostwise import share
+
+    share.offer(report)
     return 0
 
 
