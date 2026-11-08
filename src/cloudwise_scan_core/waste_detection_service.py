@@ -905,6 +905,8 @@ class WasteDetectionServiceBase:
                     ):
                         global_service_detector_indices.add(len(detector_tasks) - 1)
             
+            result.detectors_run = len(detector_tasks)
+
             # Run all detectors in parallel
             detector_results = await asyncio.gather(
                 *self._order_detector_tasks(detector_names, detector_tasks),
@@ -1607,6 +1609,16 @@ class WasteDetectionServiceBase:
                     # Neptune cluster: its instances and storage row, CLO-810).
                     member_ids=(
                         item.metadata.get("cur_member_ids")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
+                    # A resource with no CUR rows that is younger than the
+                    # CUR's latest covered day has not been billed yet, not
+                    # billed $0: it keeps its estimate, labelled
+                    # unreconciled_not_yet_billed, instead of being floored.
+                    # Only detectors that know the creation time stamp it.
+                    resource_created_at=(
+                        item.metadata.get("resource_created_at")
                         if isinstance(item.metadata, dict)
                         else None
                     ),

@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,17 @@ class ReconciliationStatus:
     #: floor dropped the finding. See ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
     UNRECONCILED_NOT_ATTRIBUTABLE = "unreconciled_not_attributable"
 
+    #: The account has resource-level CUR, but this resource has no rows in it,
+    #: and either it is younger than the CUR's latest covered day or it is a
+    #: type AWS bills whenever it exists (an Elastic IP), so "no rows" cannot
+    #: mean "$0". The CUR lands a day or more behind usage, so every
+    #: brand-new resource used to read as "AWS bills $0" here and the $0.01
+    #: floor dropped it (an idle Elastic IP created at 14:06 UTC, scanned at
+    #: 14:08, reported $0 although AWS bills it from that hour). Estimate
+    #: stands, labelled, until the CUR catches up. See
+    #: :func:`_not_yet_billed` for the exact rule.
+    UNRECONCILED_NOT_YET_BILLED = "unreconciled_not_yet_billed"
+
     #: Every status that leaves ``monthly_savings`` at the list-price estimate.
     UNRECONCILED = frozenset(
         {
@@ -154,6 +165,7 @@ class ReconciliationStatus:
             UNRECONCILED_COMMITMENT,
             UNRECONCILED_AMBIGUOUS,
             UNRECONCILED_NOT_ATTRIBUTABLE,
+            UNRECONCILED_NOT_YET_BILLED,
         }
     )
 
@@ -593,6 +605,12 @@ class BilledCostMatch:
     ambiguous: bool = False
     candidates: tuple = ()
 
+    #: True when ``rollup`` is ``None`` because every candidate the finding's
+    #: name reached bills $0 (the case above), not because the CUR has no row
+    #: for it. That is positive evidence of a $0 bill, so the not-yet-billed
+    #: rule (:func:`_not_yet_billed`) never applies to it.
+    zero_billed_candidates: bool = False
+
 
 @dataclass(frozen=True)
 class BilledCostLookup:
@@ -618,6 +636,12 @@ class BilledCostLookup:
     #: to reject a "resource has no rows ⇒ not billed" conclusion drawn from a
     #: window the CUR has barely populated.
     account_days_covered: int = 0
+
+    #: The latest ``usage_date`` any of the account's rows in the window
+    #: carry: the last day the CUR has billed anything for. ``None`` when the
+    #: adapter did not report it, which keeps the pre-existing behaviour (no
+    #: resource can be shown to be younger than the CUR's coverage).
+    latest_usage_date: Optional[date] = None
 
     #: Unambiguous alias → resource id, for the ARN/bare-name mismatch above.
     #: Built by :meth:`build`; ambiguous aliases are deliberately omitted.
@@ -661,6 +685,7 @@ class BilledCostLookup:
         *,
         resource_ids_present: bool,
         account_days_covered: int = 0,
+        latest_usage_date: Optional[date] = None,
     ) -> "BilledCostLookup":
         """Index rollups by resource id AND by unambiguous alias."""
         by_resource = {r.resource_id: r for r in rollups}
@@ -731,6 +756,7 @@ class BilledCostLookup:
             by_resource=by_resource,
             resource_ids_present=resource_ids_present,
             account_days_covered=account_days_covered,
+            latest_usage_date=latest_usage_date,
             by_alias=by_alias,
             ambiguous_aliases=ambiguous_aliases,
             by_secret_name=by_secret_name,
@@ -992,8 +1018,9 @@ class BilledCostLookup:
             r.billed_total <= 0 and not r.has_discount_line_items for r in rollups
         ):
             # Every candidate bills $0: whichever is the finding's, AWS is
-            # not charging for it. Same verdict as an absent resource.
-            return BilledCostMatch()
+            # not charging for it. Same verdict as an absent resource, but
+            # flagged: these are rows, so "not billed yet" cannot apply.
+            return BilledCostMatch(zero_billed_candidates=True)
         ordered = tuple(sorted(candidates))
         logger.debug(
             "Ambiguous CUR match for %s (region %s): candidates %s",
@@ -1002,6 +1029,104 @@ class BilledCostLookup:
             ordered,
         )
         return BilledCostMatch(ambiguous=True, candidates=ordered)
+
+
+#: CLO-234 follow-up (not-yet-billed): resource types AWS bills by the hour
+#: for as long as they exist, with no usage dimension that could leave an
+#: existing resource without a CUR line. An Elastic IP bills $0.005/hour
+#: allocated, attached or not (public IPv4 pricing, February 2024). Free-tier
+#: hours still land as CUR rows at $0, which read as ``CONFIRMED_ZERO_BILLED``
+#: through the rows branch, so for these types *absence* of rows on a
+#: populated resource-level CUR means the report has not billed it yet (or
+#: cannot name it), never that AWS charges nothing. This is per-type
+#: knowledge, which CLO-234 otherwise avoids; it is here only because
+#: ``DescribeAddresses`` returns no allocation time, so the age rule below
+#: has nothing to compare for an EIP. Matched on the value, like
+#: ``CUR_NOT_ATTRIBUTABLE_RESOURCE_TYPE``.
+BILLED_WHILE_ALLOCATED_RESOURCE_TYPES = frozenset({"elastic_ip"})
+
+
+def latest_usage_date_of(usage_dates) -> Optional[date]:
+    """The latest ``YYYY-MM-DD`` usage date in ``usage_dates``, or ``None``.
+
+    Adapters collect the account's distinct ``usage_date`` strings while
+    reading the window; this turns them into
+    :attr:`BilledCostLookup.latest_usage_date`. Unparseable values are
+    skipped rather than raised, per the port's never-raise contract.
+    """
+    latest: Optional[date] = None
+    for raw in usage_dates or ():
+        try:
+            d = date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            continue
+        if latest is None or d > latest:
+            latest = d
+    return latest
+
+
+def _as_utc_datetime(value) -> Optional[datetime]:
+    """A detector's ``resource_created_at`` (ISO string or datetime) in UTC."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _not_yet_billed(
+    *,
+    lookup: "BilledCostLookup",
+    match: "BilledCostMatch",
+    estimated_savings: float,
+    resource_type,
+    resource_created_at,
+) -> bool:
+    """Is a finding with no CUR rows too young for the CUR to have billed it?
+
+    The rule, applied only after every earlier branch of
+    :func:`reconcile_savings` has passed (resource-level CUR present, a
+    populated window, not ambiguous, no discount lines):
+
+    - The match found **no rows at all** for the resource. Rows that sum to
+      $0, and an ambiguous name whose candidates all bill $0, are positive
+      evidence of a $0 bill and stay ``CONFIRMED_ZERO_BILLED`` at any age
+      (the free-tier and free-trial cases CLO-234 exists for).
+    - The estimate is above $0: a $0 estimate has nothing to keep.
+    - And one of:
+
+      a. The detector supplied the resource's creation time
+         (``metadata["resource_created_at"]``), the lookup knows the CUR's
+         latest covered usage day ``L``, and the resource was created on or
+         after ``L`` 00:00 UTC. ``L`` itself counts: the CUR refreshes a day
+         in several passes, so a resource created during ``L`` may not have
+         a row for it yet. A resource created before ``L`` with no rows is
+         old enough to have been billed, and keeps ``CONFIRMED_ZERO_BILLED``.
+      b. The resource type bills by the hour while it exists
+         (``BILLED_WHILE_ALLOCATED_RESOURCE_TYPES``) and so cannot be both
+         present and absent from a populated CUR for any reason but lag or
+         an id the CUR does not use. No creation time is needed.
+
+    Without either, absence keeps meaning "not billed", as before: an unknown
+    creation time is never read as "young".
+    """
+    if match.rollup is not None or match.zero_billed_candidates:
+        return False
+    if estimated_savings <= 0:
+        return False
+    if _resource_type_key(resource_type) in BILLED_WHILE_ALLOCATED_RESOURCE_TYPES:
+        return True
+    created = _as_utc_datetime(resource_created_at)
+    if created is None or lookup.latest_usage_date is None:
+        return False
+    return created.date() >= lookup.latest_usage_date
 
 
 @dataclass(frozen=True)
@@ -1039,12 +1164,15 @@ def reconcile_savings(
     cur_resource_id: Optional[str] = None,
     waste_type=None,
     member_ids: Optional[Sequence[str]] = None,
+    resource_created_at=None,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
 
     ``secretsmanager_secret``, ``resource_type``, ``region``, ``lb_type``,
     ``cur_resource_id``, ``member_ids``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
     with ``resource_type``: see ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
+    ``resource_created_at`` (ISO string or datetime, from the detector's
+    ``metadata["resource_created_at"]``): see :func:`_not_yet_billed`.
 
     Order matters, and each branch is a deliberate safety choice:
 
@@ -1060,10 +1188,13 @@ def reconcile_savings(
        so we cannot claim it has none.
     5. Discount line items → labelled. We have no amortized column, so we
        cannot say by how much the bill disagrees, only that it does.
-    6. No rows, or rows summing to $0, on an account that demonstrably *has*
+    6. No rows at all, for a resource younger than the CUR's latest covered
+       day (or of a type billed while it exists) → labelled, *not* zeroed:
+       the CUR has not billed it yet. See :func:`_not_yet_billed`.
+    7. No rows, or rows summing to $0, on an account that demonstrably *has*
        resource-level CUR → genuinely not billed. This is the free-tier fix.
-    7. Too few days on this specific resource → labelled, not zeroed.
-    8. Otherwise cap: ``min(estimate, monthly-equivalent billed)``.
+    8. Too few days on this specific resource → labelled, not zeroed.
+    9. Otherwise cap: ``min(estimate, monthly-equivalent billed)``.
     """
     if lookup is None or not lookup.resource_ids_present:
         return ReconciliationOutcome(
@@ -1120,6 +1251,21 @@ def reconcile_savings(
             reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
             billed_cost_observed=rollup.monthly_equivalent(),
             cost_basis=rollup.cost_basis,
+        )
+
+    # No rows at all, and the resource is too young for the CUR to have
+    # billed it (or bills while it exists). "Not in the report yet" is not
+    # "AWS bills $0": keep the estimate, labelled, until the CUR catches up.
+    if _not_yet_billed(
+        lookup=lookup,
+        match=match,
+        estimated_savings=estimated_savings,
+        resource_type=resource_type,
+        resource_created_at=resource_created_at,
+    ):
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_NOT_YET_BILLED,
         )
 
     # No rows for this resource, or rows that sum to nothing. The account has

@@ -319,6 +319,15 @@ class OpenStorageDetectorsMixin:
                             'size_gb': volume.size_gb,
                             'volume_type': volume.volume_type,
                             'detection_mode': data_provider.provider_type,
+                            # Read by billed-cost reconciliation: a volume
+                            # created on or after the CUR's latest covered
+                            # day has no CUR line yet, which is "not yet
+                            # billed", not "$0" (billed_cost._not_yet_billed).
+                            'resource_created_at': (
+                                volume.create_time.isoformat()
+                                if hasattr(volume.create_time, 'isoformat')
+                                else volume.create_time
+                            ),
                         }
                     ))
                 

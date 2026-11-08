@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 29 at L1, 37 at L2, 24 at L3, 1 at L4.
+Summary for the checks in this repository: 29 at L1, 37 at L2, 23 at L3, 2 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -27,7 +27,7 @@ proven checks only.
 |---|---|---|---|
 | `ami_orphaned_snapshot` | L2 |  | none |
 | `classic_lb_migration` | L2 |  | none |
-| `dynamodb_no_autoscaling` | L2 |  |  |
+| `dynamodb_no_autoscaling` | L2 |  | partial |
 | `dynamodb_no_deletion_protection` | L3 |  | covered |
 | `ecr_no_lifecycle_policy` | L3 |  | covered |
 | `eip_on_stopped_instance` | L3 |  | covered |
@@ -104,7 +104,7 @@ proven checks only.
 | `stopped_ec2_with_ebs` | L3 |  | covered |
 | `stopped_sagemaker_notebook_storage` | L3 |  | none |
 | `unattached_ebs` | L3 |  | covered |
-| `unattached_eip` | L3 |  | covered |
+| `unattached_eip` | L4 |  | covered |
 | `unencrypted_documentdb_cluster` | L2 |  | covered |
 | `unencrypted_ebs_volume` | L3 |  | covered |
 | `unencrypted_efs_filesystem` | L2 |  | covered |

@@ -34,12 +34,13 @@ LOCAL_READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempo
                              open_world_hint=False)
 
 INSTRUCTIONS = (
-    "cloudcostwise finds AWS waste in the user's own account with their own read-only credentials. "
-    "Call `scan` first (it takes 30-60 seconds per region), then `list_findings`, `explain_finding` "
-    "and `fix_guidance` on its results. Nothing can modify AWS. Before the first `scan`, tell the user "
-    "that the RI/Savings Plans checks call Cost Explorer, which AWS bills at "
-    f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and that "
-    "include_cost_explorer=false skips them."
+    "cloudcostwise finds AWS waste with the user's own credentials and cannot modify AWS: non-read "
+    "calls are refused, and `fix_guidance` only returns text. Call `scan` first (it takes 30-60 seconds "
+    "per region), then `list_findings`, `explain_finding` and `fix_guidance` on its results. Before the "
+    "first `scan`, tell the user two things. The RI/Savings Plans checks call Cost Explorer, which AWS "
+    f"bills at ${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and "
+    "include_cost_explorer=false skips them. Results, including the account ID and resource IDs, come "
+    "back to you, the assistant."
 )
 
 
@@ -66,6 +67,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                  register: Optional[Callable[[MCPServer, Callable[[], Optional[ScanReport]]], None]] = None,
                  transform: Optional[Callable[[ScanReport], ScanReport]] = None,
                  gate: Optional[Callable[[object], Optional[str]]] = None,
+                 spend: bool = True,
                  ) -> MCPServer:
     """The MCP server. The defaults are the free tool.
 
@@ -91,8 +93,9 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                  description="Scan the user's AWS account for waste with their local credentials (read-only; "
                              "any non-read AWS call is refused). Takes 30-60 s per region; up to 4 regions run "
                              "at once. COST: the RI/Savings Plans checks call Cost Explorer, billed by AWS at "
-                             f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan); tell the user before running, and pass "
-                             "include_cost_explorer=false to skip them. regions: comma-separated, or 'all'; "
+                             f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), plus one request for the last 30 days of spend, "
+                             "which scores the result; tell the user before running, and pass "
+                             "include_cost_explorer=false to skip them (the score is then labelled \"without spend data\"). regions: comma-separated, or 'all'; "
                              "default us-east-1 plus the profile's region.")
     async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,
                    include_cost_explorer: bool = True) -> str:
@@ -112,7 +115,10 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                     f"{res.region}: {len(res.findings)} finding(s) in {res.seconds:.0f}s"))
 
             report = await run_scan_async(creds, region_list, include_cost_explorer=include_cost_explorer,
-                                          on_region=progress, full=run_full)
+                                          on_region=progress, full=run_full,
+                                          # CLO-858: the score's one extra request; the partner build opts out
+                                          # and keeps making exactly the requests it always did.
+                                          **({"with_spend": True} if spend else {}))
         except CredentialsError as e:
             return f"Could not scan: {e}"
         except ReadOnlyViolation as e:
@@ -125,7 +131,8 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
         session.by_id = {str(i.id): i for i in report.findings}
         if share_enabled:
             share_mod.share_from_settings_mcp(report)
-        lines = [f"Account {report.account_id}, regions {', '.join(report.regions)}: "
+        lines = [*render.score_card(report, markdown=True), "",
+                 f"Account {report.account_id}, regions {', '.join(report.regions)}: "
                  f"{len(report.findings)} findings, estimated savings "
                  f"{_money(render.counted_total(report))}/month (advisory findings excluded)."]
         for g in render.groups(report)[:15]:

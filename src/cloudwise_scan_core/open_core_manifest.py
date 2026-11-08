@@ -20,6 +20,10 @@ PACKAGE = "cloudwise_scan_core"
 ROOT_MODULE = "open_service"
 LAZY_CLOSED_EDGES = frozenset({"hosted_service"})
 
+# Open files nothing in the service imports, shipped because the CLI does
+# (CLO-858: the score formula).
+EXTRA_OPEN_FILES = frozenset({"score.py"})
+
 OPEN_CORE_FILES = (
     "__init__.py",
     "advisory_types.py",
@@ -60,6 +64,7 @@ OPEN_CORE_FILES = (
     "ports.py",
     "py.typed",
     "savings_cache_service.py",
+    "score.py",
     "tier_routing.py",
     "waste_detection_service.py",
 )
@@ -128,4 +133,4 @@ def compute_closure(pkg_dir: Path) -> Set[str]:
             continue
         seen.add(rel)
         stack.extend(_imports(path, pkg_dir))
-    return seen | {"py.typed", "open_core_manifest.py"}
+    return seen | {"py.typed", "open_core_manifest.py"} | EXTRA_OPEN_FILES

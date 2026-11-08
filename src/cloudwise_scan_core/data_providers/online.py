@@ -142,7 +142,7 @@ from cloudwise_scan_core.data_providers.models import (
     WorkspacePoolData,
     WorkspaceMetricsData,
     BeanstalkEnvironmentData,
-    BeanstalkConfigData,
+    BeanstalkConfigData, beanstalk_config_from_settings,
     BeanstalkMetricsData,
     ApiGatewayRestApiData,
     beanstalk_rds_marks,
@@ -752,6 +752,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         # endpoint).
         self.swallowed_error_count: int = 0
         self._warned_swallowed: set = set()
+        self._workspaces_pools_unavailable_logged = False
         # CLO-493: LaunchTime per instance, recorded by get_ec2_instances so
         # get_ec2_metrics can skip the MISSING note for an instance younger
         # than the idle window (the detector calls both on this instance).
@@ -932,6 +933,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         if not isinstance(error, ClientError):
             return False
         return error.response.get('Error', {}).get('Code', '') in ACCESS_DENIED_ERROR_CODES
+
+    # CLO-850: AWS answers some end-of-sale services with an
+    # AccessDeniedException whose message says the service is closed to the
+    # account (WorkSpaces Pools, 2026-07-30). Narrow on purpose: an IAM denial
+    # never carries this wording.
+    _SERVICE_UNAVAILABLE_PHRASE = "no longer available to new customers"
+
+    def _is_service_unavailable_to_account(self, error: Exception) -> bool:
+        """True for an access-denied ``ClientError`` whose message says the
+        service is no longer offered to this account (not an IAM gap)."""
+        if not self._is_access_denied(error):
+            return False
+        message = error.response.get('Error', {}).get('Message', '') or str(error)
+        return self._SERVICE_UNAVAILABLE_PHRASE in message.lower()
 
     def _warn_access_denied(self, resource: str, permission: str, error: Exception) -> None:
         """Shared WARNING format for an access-denied/unauthorized
@@ -10019,6 +10034,19 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     running_user_sessions=capacity.get('RunningUserSessions', 0) if capacity else 0,
                 ))
         except ClientError as e:
+            if self._is_service_unavailable_to_account(e):
+                # CLO-850: AWS closed WorkSpaces Pools to new accounts
+                # (AccessDeniedException "no longer available to new
+                # customers"). Not an IAM gap: the account has no pools and
+                # cannot have any, so nothing is missing -> empty result, no
+                # permission error, no swallowed-error count, no scan note.
+                if not self._workspaces_pools_unavailable_logged:
+                    self._workspaces_pools_unavailable_logged = True
+                    logger.info(
+                        "WorkSpaces Pools is not available to this account (AWS end of sale); "
+                        "treating as no pools: %s", e,
+                    )
+                return results
             if self._is_access_denied(e):
                 self._record_permission_error(
                     resource="WorkSpaces Pools", permission="workspaces:DescribeWorkspacesPools", error=e,
@@ -10183,8 +10211,42 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return None
         return merge_beanstalk_statuses((env.environment_name, env.status) for env in environments)
 
+    # CLO-830: DescribeConfigurationSettings for an environment in a VPC with
+    # a load balancer makes EC2 calls on the caller's behalf. When the
+    # caller lacks one, Beanstalk answers InvalidParameterValue (not an
+    # access-denied code) with this sentence naming the missing action.
+    _BEANSTALK_ON_BEHALF_DENIAL = re.compile(
+        r"do not have permission to perform the '([a-z0-9-]+:[A-Za-z0-9]+)' action"
+    )
+
+    def _beanstalk_on_behalf_denial(self, error: ClientError) -> Optional[str]:
+        """The IAM action Beanstalk was denied on the caller's behalf, or None."""
+        message = error.response.get('Error', {}).get('Message', '') or str(error)
+        match = self._BEANSTALK_ON_BEHALF_DENIAL.search(message)
+        return match.group(1) if match else None
+
+    def _record_beanstalk_denial_once(
+        self, permission: str, error: ClientError, context: str = "Beanstalk Configurations",
+    ) -> None:
+        """One WARNING and one ``permission_errors`` entry per denied action
+        per scan (CLO-833, CLO-368), however many environments hit it. Shares
+        ``_warned_swallowed`` with ``_warn_swallowed``."""
+        key = ('beanstalk-permission', permission)
+        if key in self._warned_swallowed:
+            return
+        self._warned_swallowed.add(key)
+        self._record_permission_error(resource=context, permission=permission, error=error)
+        self._warn_access_denied(context, permission, error)
+
     async def get_beanstalk_configurations(self) -> Dict[str, BeanstalkConfigData]:
-        """Get configuration settings for all Beanstalk environments."""
+        """Get configuration settings for all Beanstalk environments.
+
+        CLO-830: an environment whose configuration read failed is LEFT OUT
+        (never a default configuration): the detector reads a missing key as
+        MISSING and skips the checks that need the configuration. A default
+        (t3.micro, SingleInstance, min=max=1) used to stand in for it, which
+        silently cleared beanstalk_previous_gen_instances and
+        beanstalk_unnecessary_alb."""
         configs = {}
         try:
             eb = self._get_client('elasticbeanstalk')
@@ -10196,40 +10258,53 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 app_name = env.get('ApplicationName', '')
 
                 try:
-                    settings = eb.describe_configuration_settings(
+                    response = eb.describe_configuration_settings(
                         ApplicationName=app_name,
                         EnvironmentName=env_name,
-                    ).get('ConfigurationSettings', [{}])[0]
-
-                    options = {
-                        (opt.get('Namespace', ''), opt.get('OptionName', '')): opt.get('Value', '')
-                        for opt in settings.get('OptionSettings', [])
-                    }
-
-                    configs[env_id] = BeanstalkConfigData(
-                        environment_id=env_id,
-                        instance_type=options.get(
-                            ('aws:autoscaling:launchconfiguration', 'InstanceType'), 't3.micro'
-                        ),
-                        environment_type=options.get(
-                            ('aws:elasticbeanstalk:environment', 'EnvironmentType'), 'SingleInstance'
-                        ),
-                        load_balancer_type=options.get(
-                            ('aws:elasticbeanstalk:environment', 'LoadBalancerType'), ''
-                        ),
-                        min_size=int(options.get(
-                            ('aws:autoscaling:asg', 'MinSize'), '1'
-                        )),
-                        max_size=int(options.get(
-                            ('aws:autoscaling:asg', 'MaxSize'), '1'
-                        )),
-                        rds_endpoint=options.get(
-                            ('aws:rds:dbinstance', 'DBEngine'), ''
-                        ),
                     )
+                    # CLO-833: an empty list, or a read that lacks an option
+                    # the checks need, is MISSING like a failed read.
+                    entries = response.get('ConfigurationSettings') or []
+                    config = beanstalk_config_from_settings(env_id, entries[0] if entries else None)
+                    if config is None:
+                        self._warn_swallowed(
+                            "Beanstalk configuration settings (empty or incomplete)",
+                            'elasticbeanstalk:DescribeConfigurationSettings',
+                            ValueError("incomplete configuration settings"),
+                        )
+                    else:
+                        configs[env_id] = config
                 except ClientError as e:
-                    logger.warning(f"Error describing config for {env_name}: {e}")
-                    configs[env_id] = BeanstalkConfigData(environment_id=env_id)
+                    # CLO-830/CLO-833: counted (DetectorErrors) and, when it is
+                    # a permission gap, recorded in permission_missing. The
+                    # environment is left out of ``configs`` (MISSING). One
+                    # warning and one permission_errors entry per denied
+                    # action per scan, not per environment (CLO-368).
+                    if self._is_access_denied(e):
+                        self.swallowed_error_count += 1
+                        self._record_beanstalk_denial_once(
+                            'elasticbeanstalk:DescribeConfigurationSettings', e,
+                            context="Beanstalk configuration settings",
+                        )
+                    else:
+                        self._warn_swallowed(
+                            "Beanstalk configuration settings",
+                            'elasticbeanstalk:DescribeConfigurationSettings', e,
+                        )
+                    denied = self._beanstalk_on_behalf_denial(e)
+                    if denied == 'ec2:DescribeSubnets':
+                        # Named literally: template 1.36.0 grants it and the
+                        # template floor test pins this _record_permission_error
+                        # call. Deduped inline like _record_beanstalk_denial_once.
+                        key = ('beanstalk-permission', 'ec2:DescribeSubnets')
+                        if key not in self._warned_swallowed:
+                            self._warned_swallowed.add(key)
+                            self._record_permission_error(
+                                resource="Beanstalk Configurations", permission='ec2:DescribeSubnets', error=e,
+                            )
+                            self._warn_access_denied("Beanstalk Configurations", 'ec2:DescribeSubnets', e)
+                    elif denied:
+                        self._record_beanstalk_denial_once(denied, e)
         except ClientError as e:
             if self._is_access_denied(e):
                 self._record_permission_error(

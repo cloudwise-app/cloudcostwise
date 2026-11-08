@@ -84,15 +84,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"scanning {len(regions)} region(s), {min(max(args.parallel, 1), len(regions))} at a time ...",
           file=sys.stderr)
 
+    from cloudcostwise import board as board_mod
+
+    # CLO-858: a live board on an interactive stderr; anywhere else, today's plain lines. JSON keeps them too.
+    live = None
+    if args.format != "json" and board_mod.wants_board(sys.stderr):
+        live = board_mod.RegionBoard(regions, args.parallel, sys.stderr)
+        live.draw()
+
     def progress(res) -> None:
         nonlocal done
         done += 1
+        if live is not None:
+            live.region_done(res)
+            return
         print(f"  [{done}/{len(regions)}] {res.region:<15} {len(res.findings):>3} finding(s)  {res.seconds:>5.1f}s",
               file=sys.stderr)
 
     try:
         report = run_scan(creds, regions, include_cost_explorer=not args.no_cost_explorer, on_region=progress,
-                          parallel=args.parallel)
+                          parallel=args.parallel, with_spend=True)
     except ReadOnlyViolation as e:
         print(f"cloudcostwise: stopped, {e}. Please report this: it is a bug.", file=sys.stderr)
         return 3
@@ -100,9 +111,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.format == "json":
         print(render.as_json(report))
     elif args.format == "markdown":
-        print(render.as_markdown(report))
+        print(render.as_markdown(report, emoji=sys.stdout.isatty()))
     else:
-        print(render.as_table(report, verbose=args.verbose))
+        print(render.as_table(report, verbose=args.verbose, emoji=sys.stdout.isatty()))
     # CLO-824: after the results are out. Asks only a human at a terminal, or sends only on a
     # setting a human wrote; never raises, never fails the scan.
     from cloudcostwise import share

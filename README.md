@@ -8,29 +8,38 @@
 [![MCP server](https://img.shields.io/badge/MCP-Claude%20Code%20%7C%20Codex-8A2BE2)](#use-it-from-claude-code-codex-or-any-mcp-client)
 ![AWS access: read-only](https://img.shields.io/badge/AWS%20access-read--only-success)
 ![Sharing: opt-in only](https://img.shields.io/badge/sharing-opt--in%20only-success)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.18/LICENSE.md)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/LICENSE.md)
 
 Find AWS waste from your terminal or your AI assistant. `cloudcostwise` runs CloudWise's free waste
 checks on your own machine, with your own read-only AWS credentials.
 
-**See it first:** a real scan of our own test account, with its findings, fixes and dollars, and nothing to
-install: [cloudcostwise.io/sample-scan](https://cloudcostwise.io/sample-scan).
+**Before you run it with AWS credentials:**
 
-- **Nothing is sent to CloudWise unless you choose to share a summary at the end.**
-  The only network calls are AWS API calls in your account, plus that one
-  optional POST. No signup, no IAM role for a third party, no tracking. Used
-  through an AI assistant (MCP), the findings go to that assistant like any
-  tool output. See [Sharing a summary](#sharing-a-summary-optional).
-- **It cannot change anything.** Every AWS call goes through a guard that
-  refuses any operation that isn't a `Describe`, `List`, `Get`, `Search` or
-  `Lookup`, whatever your credentials allow.
+- **It cannot change your account.** Every AWS call a scan makes is checked, and anything that isn't a
+  `Describe`, `List`, `Get`, `Search` or `Lookup` is refused before it is sent, whatever your credentials allow.
+- **It talks to AWS and nothing else, unless you say yes.** After the first scan in a terminal it asks once
+  whether to share a summary (the CLI version, finding count, estimated savings and checks run, printed
+  before it asks; never account IDs, resource names, regions or ARNs). The default is no. `cloudcostwise share --off`
+  turns it off for good; `CLOUDCOSTWISE_SHARE=no` turns it off for that environment. See [Sharing a summary](#sharing-a-summary-optional).
+- **Through an AI assistant (MCP), the findings, including your account ID and resource IDs, go to that
+  assistant** like any tool output.
+- **It is not quite free to run.** The RI/Savings Plans checks call Cost Explorer, which AWS bills at
+  $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> a request, about
+  $<!-- fact:costExplorer.perScanUsd -->0.09<!-- /fact --> a scan. `--no-cost-explorer` skips them.
+- **It stores one file:** your share answer in `~/.config/cloudcostwise/share.json`. No report, cache or credentials are written.
+- **Open source (Apache-2.0).** Read the code: [github.com/cloudwise-app/cloudcostwise](https://github.com/cloudwise-app/cloudcostwise).
+
+Least-privilege IAM policy (<!-- fact:iam.cliPolicyActionCount -->71<!-- /fact --> read-only actions):
+[`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/docs/iam-policy.json). See a real scan first, no credentials needed:
+[cloudcostwise.io/sample-scan](https://cloudcostwise.io/sample-scan?utm_source=github&utm_medium=referral&utm_campaign=readme).
+
 - **<!-- fact:detectors.free -->20<!-- /fact --> of CloudWise's <!-- fact:detectors.total -->46<!-- /fact --> service checks**: EC2, Lambda, SageMaker, WorkSpaces,
   Lightsail, EBS, S3, EFS, ECR, RDS, DynamoDB, ElastiCache, Elastic IPs, NAT
   gateways and load balancers, VPC endpoints, dangling DNS records, CloudWatch
   logs and dashboards, security posture, RI/Savings Plans opportunities, and
   Compute Optimizer.
 
-![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.18/docs/demo.svg)
+![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.19/docs/demo.svg)
 
 ## Install and run
 
@@ -48,14 +57,14 @@ Options:
 | `--profile NAME` | AWS profile; otherwise the standard credential chain (env vars, SSO, instance role) |
 | `--regions LIST` | Comma-separated regions, or `all` for every enabled region. Account-level checks (CloudWatch dashboards, orphaned DNS records, RI/Savings Plans) run once, in us-east-1, and are skipped with a warning if it is not listed |
 | `--format table\|markdown\|json` | Output format |
-| `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> per request and a scan makes about <!-- fact:costExplorer.requestsPerScan -->8<!-- /fact -->. Skips the RI/Savings Plans checks |
+| `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> per request and a scan makes about <!-- fact:costExplorer.requestsPerScan -->9<!-- /fact -->. Skips the RI/Savings Plans checks and the one request that reads your last 30 days of spend, so the score falls back to "without spend data" |
 | `--parallel N` | Regions scanned at once, each in its own process (default <!-- fact:cli.defaultParallel -->4<!-- /fact -->; `--regions all` takes ~2–3 min instead of ~10) |
 | `--verbose` | Show data warnings (checks that could not read a metric report it as missing, never as zero) |
 
 ## What AWS's free tools don't flag
 
 <!-- aws-gap:start (generated by scripts/aws_gap.py) -->
-This tool has 53 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.18/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 11 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
+This tool has 54 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 12 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
 
 | Check | What it finds | Closest AWS check |
 |---|---|---|
@@ -78,6 +87,7 @@ This tool has 53 proven checks (L2 or above in [VALIDATION.md](https://github.co
 | `previous_gen_sagemaker_instance` | SageMaker instances on a previous generation with a cheaper current one | None |
 | `s3_empty_bucket` | Empty S3 buckets left behind for 30+ days | None |
 | `stopped_sagemaker_notebook_storage` | Stopped SageMaker notebook instances whose ML storage volume keeps billing | None |
+| `dynamodb_no_autoscaling` | Provisioned DynamoDB tables with no auto scaling on their read or write capacity | Idle recommendation for DynamoDB provisioned tables: Compute Optimizer (and Cost Optimization Hub) look at the same provisioned tables, but only flag ones with no consumed capacity at all. Security Hub CSPM control DynamoDB.1 (tables should scale capacity with demand) checks for auto scaling, but it is an availability control with no cost wording, and its Recover > Resilience category is one Trusted Advisor does not show (checked 2026-11-05). |
 | `elasticache_replication_waste` | Replicas kept on non-production ElastiCache replication groups, each billed like a full node | Amazon ElastiCache Multi-AZ clusters: Trusted Advisor's check looks at the same clusters with the opposite aim, alerting when Multi-AZ is inactive and recommending at least one replica per shard. Compute Optimizer, the source of Cost Optimization Hub's idle recommendations, calls a Redis or Valkey cluster idle only when all its nodes are idle over 14 days. None of the three tools documents a check for replicas on a non-production group that is in use (checked 2026-11-02). |
 | `excessive_retention_log_group` | Log groups keeping a year or more of data they are billed to store | Amazon CloudWatch Log Group Retention Period: Trusted Advisor checks log group retention but flags retention shorter than a minimum (365 days by default) for compliance, so long, costly retention passes it. |
 | `idle_efs` | EFS file systems with no mount targets: nothing can read them, and they still bill | Amazon EFS no mount target redundancy: Trusted Advisor checks EFS mount targets for multi-AZ redundancy, not file systems with no mount targets at all, and EFS is not among the resources Compute Optimizer or Cost Optimization Hub cover. |
@@ -92,7 +102,7 @@ This tool has 53 proven checks (L2 or above in [VALIDATION.md](https://github.co
 
 For idle EC2, RDS and NAT gateways, rightsizing and Savings Plans, AWS's tools cover the same ground: use them too. Trusted Advisor's cost checks need a Business, Enterprise or Unified Operations support plan; Cost Optimization Hub and Compute Optimizer are free.
 
-The hosted CloudWise product adds 22 more proven checks that none of AWS's tools flag, across AWS Backup, AppSync, CloudFront, Elastic Beanstalk, FSx, Glue, KMS, Kinesis, Route 53, Step Functions.
+The hosted CloudWise product adds 23 more proven checks that none of AWS's tools flag, across AWS Backup, AppSync, CloudFront, Elastic Beanstalk, FSx, Glue, KMS, Kinesis, Route 53, Step Functions.
 <!-- aws-gap:end -->
 
 <!-- facts-lint: allow dated capture of a real scan -->
@@ -154,8 +164,8 @@ Cost Explorer cost before it scans, and `include_cost_explorer=false` skips it.
 
 ## Permissions
 
-`ReadOnlyAccess` (AWS managed) is enough. The minimal policy the checks use is
-in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.18/docs/iam-policy.json). It was derived from a scan of
+The minimal policy the checks use is
+in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/docs/iam-policy.json). AWS-managed `ReadOnlyAccess` also works, but it is much broader than the scan needs. It was derived from a scan of
 an account with most supported resource types; if a check lacks a permission,
 the scan says so in its data warnings instead of failing.
 
@@ -171,8 +181,8 @@ account IDs, resource IDs or names, regions, ARNs or tags.
 
 Two further, separate yeses, asked only at that interactive prompt and only if you type an email address:
 "please email me about this report" (nothing from the report is uploaded; you can produce it yourself with
-`--format markdown`) and "tell me when new checks land" (marketing email; Rick confirms by hand reply before
-adding you to anything, and every message has an unsubscribe link). Answer once and it does not ask again on
+`--format markdown`) and "tell me when new checks land" (marketing email; we confirm by reply before
+adding you to anything, and you can withdraw consent at any time by replying to or emailing cloudwise@cloudcostwise.io). Answer once and it does not ask again on
 that machine.
 
 ```bash
@@ -184,7 +194,7 @@ cloudcostwise share --reset        # forget the answer and ask once more
 
 Without a terminal (a pipe, CI, a script) nothing is asked and nothing is sent unless you set
 `CLOUDCOSTWISE_SHARE=yes` (or `no`) yourself, or write `~/.config/cloudcostwise/share.json`. Those settings
-carry the four summary numbers only, never an email address. The MCP server
+carry the summary only (the CLI version, finding count, estimated savings and checks run, plus whether the scan came from the CLI or MCP), never an email address. The MCP server
 never prompts, its `scan` tool has no sharing parameter, and it sends only when one of those settings says yes.
 A failed or slow connection is ignored (about 3 seconds at most, after the results are printed).
 
@@ -218,9 +228,9 @@ next release.
 
 ## License
 
-Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.18/LICENSE.md)). 0.1.18 and later are Apache-2.0.
+Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/LICENSE.md)). 0.1.18 and later are Apache-2.0.
 0.1.17 and earlier are FSL-1.1-ALv2 (each becomes Apache-2.0 two years after it ships).
 
 ## How we know it's right
 
-See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.18/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.
+See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.19/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.

@@ -1434,7 +1434,11 @@ class WasteDetectionResult:
     # Statistics
     resources_scanned: int = 0
     waste_items_found: int = 0
-    
+    # CLO-857: how many detectors actually ran in this region (after tier, CUR
+    # and skip filtering). Feeds the per-region scan progress record. Not in
+    # to_dict(): that feeds the result cache and the SFN payload.
+    detectors_run: int = 0
+
     # Settings Used
     settings: Optional[WasteDetectionSettings] = None
     

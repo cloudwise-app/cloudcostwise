@@ -1889,6 +1889,56 @@ class BeanstalkConfigData:
     ebs_volume_size: int = 10                  # GB
 
 
+_BEANSTALK_REQUIRED_OPTIONS = (
+    ('instance_type', 'aws:autoscaling:launchconfiguration', 'InstanceType'),
+    ('environment_type', 'aws:elasticbeanstalk:environment', 'EnvironmentType'),
+    ('min_size', 'aws:autoscaling:asg', 'MinSize'),
+    ('max_size', 'aws:autoscaling:asg', 'MaxSize'),
+)
+
+
+def beanstalk_config_from_settings(env_id: str, settings: Any) -> Optional[BeanstalkConfigData]:
+    """CLO-833: build a BeanstalkConfigData from one DescribeConfigurationSettings
+    entry, or return None when the entry is unreadable or incomplete.
+
+    None means MISSING: the caller leaves the environment out of the
+    configuration map, so the checks that read it (previous-gen instance
+    type, load-balanced with min=max=1, instance price) skip it. A missing
+    InstanceType, EnvironmentType, MinSize or MaxSize is never replaced by a
+    default (t3.micro, SingleInstance, 1): a default can clear a finding
+    (an ALB on an environment that is really LoadBalanced) or fire one.
+    Shared by the online and offline providers so both apply one rule."""
+    if not isinstance(settings, dict):
+        return None
+    option_list = settings.get('OptionSettings')
+    if not isinstance(option_list, list):
+        return None
+    options = {
+        (opt.get('Namespace', ''), opt.get('OptionName', '')): opt.get('Value')
+        for opt in option_list if isinstance(opt, dict)
+    }
+    values: Dict[str, Any] = {}
+    for field_name, namespace, option_name in _BEANSTALK_REQUIRED_OPTIONS:
+        value = options.get((namespace, option_name))
+        if value in (None, ''):
+            return None
+        values[field_name] = value
+    try:
+        values['min_size'] = int(values['min_size'])
+        values['max_size'] = int(values['max_size'])
+    except (TypeError, ValueError):
+        return None
+    return BeanstalkConfigData(
+        environment_id=env_id,
+        instance_type=values['instance_type'],
+        environment_type=values['environment_type'],
+        load_balancer_type=options.get(('aws:elasticbeanstalk:environment', 'LoadBalancerType')) or '',
+        min_size=values['min_size'],
+        max_size=values['max_size'],
+        rds_endpoint=options.get(('aws:rds:dbinstance', 'DBEngine')) or '',
+    )
+
+
 def merge_beanstalk_statuses(pairs, fold_case: bool = False) -> Dict[str, str]:
     """CLO-609: ``{environment name: Status}`` from ``(name, status)`` pairs.
 

@@ -1,32 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 748 599" width="748" height="599" role="img" aria-label="cloudcostwise scan (our test account, excerpt, 2026-11-04, scan engine 49ab826832)">
-<title>cloudcostwise scan (our test account, excerpt, 2026-11-04, scan engine 49ab826832)</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 748 599" width="748" height="599" role="img" aria-label="cloudcostwise scan (our test account, excerpt, 2026-11-07, scan engine 466311db27)">
+<title>cloudcostwise scan (our test account, excerpt, 2026-11-07, scan engine 466311db27)</title>
 <rect width="748" height="599" rx="10" fill="#1b1d26" stroke="#2d3040"/>
 <circle cx="22" cy="20" r="5" fill="#2d3040"/><circle cx="40" cy="20" r="5" fill="#2d3040"/><circle cx="58" cy="20" r="5" fill="#2d3040"/>
-<text x="78" y="24" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="12" fill="#868887">cloudcostwise scan (our test account, excerpt, 2026-11-04, scan engine 49ab826832)</text>
+<text x="78" y="24" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="12" fill="#868887">cloudcostwise scan (our test account, excerpt, 2026-11-07, scan engine 466311db27)</text>
 <line x1="0" y1="38" x2="748" y2="38" stroke="#2d3040"/>
 <text x="20" y="58" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">$ cloudcostwise scan --profile test --regions us-east-1,us-west-2 --no-cost-explorer</text>
 <text x="20" y="79" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#c5c8c6">AWS account ...XXXX | regions: us-east-1, us-west-2</text>
 <text x="20" y="100" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#c5c8c6"></text>
 <text x="20" y="121" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">idle_dynamodb  x1  $5.69/mo</text>
 <text x="20" y="142" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       DynamoDB table B                              $5.69/mo</text>
-<text x="20" y="163" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">unattached_eip  x1  $3.65/mo</text>
-<text x="20" y="184" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       Elastic IP A                                  $3.65/mo</text>
-<text x="20" y="205" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">dynamodb_no_autoscaling  x1  $0.85/mo</text>
-<text x="20" y="226" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       DynamoDB table B                              $0.85/mo</text>
-<text x="20" y="247" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">s3_rapid_growth  x1  $0.28/mo</text>
-<text x="20" y="268" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       S3 bucket D                                   $0.28/mo</text>
-<text x="20" y="289" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">unattached_ebs  x2  $0.16/mo</text>
-<text x="20" y="310" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       EBS volume A                                  $0.08/mo</text>
-<text x="20" y="331" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    ... 1 more</text>
+<text x="20" y="163" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">dynamodb_no_autoscaling  x1  $0.85/mo</text>
+<text x="20" y="184" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       DynamoDB table B                              $0.85/mo</text>
+<text x="20" y="205" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">s3_rapid_growth  x1  $0.28/mo</text>
+<text x="20" y="226" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       S3 bucket D                                   $0.28/mo</text>
+<text x="20" y="247" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">orphaned_ebs_snapshot  x2  $0.10/mo</text>
+<text x="20" y="268" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       EBS snapshot A                                $0.05/mo</text>
+<text x="20" y="289" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    ... 1 more</text>
+<text x="20" y="310" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">unattached_ebs  x1  $0.08/mo</text>
+<text x="20" y="331" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       EBS volume A                                  $0.08/mo</text>
 <text x="20" y="352" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">old_ecr_images  x1  $0.06/mo</text>
 <text x="20" y="373" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       ECR repository B                              $0.06/mo</text>
 <text x="20" y="394" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">no_retention_log_group  x6  $0.06/mo</text>
 <text x="20" y="415" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       Log group F                                   $0.01/mo</text>
 <text x="20" y="436" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    ... 5 more</text>
-<text x="20" y="457" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">orphaned_ebs_snapshot  x1  $0.05/mo</text>
-<text x="20" y="478" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       EBS snapshot A                                $0.05/mo</text>
-<text x="20" y="499" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">... 12 more waste types</text>
+<text x="20" y="457" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">untagged_ecr_images  x1  $0.02/mo</text>
+<text x="20" y="478" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">    us-east-1       ECR repository C                              $0.02/mo</text>
+<text x="20" y="499" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">... 11 more waste types</text>
 <text x="20" y="520" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#c5c8c6"></text>
-<text x="20" y="541" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">Estimated savings: $10.87/month</text>
+<text x="20" y="541" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#d0b344">Estimated savings: $7.20/month</text>
 <text x="20" y="562" xml:space="preserve" font-family="ui-monospace,Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="14" fill="#868887">RI/Savings Plans checks skipped (--no-cost-explorer).</text>
 </svg>

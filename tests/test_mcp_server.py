@@ -41,8 +41,9 @@ def _text(result) -> str:
 async def _session(calls):
     server = mcp_server.build_server()
 
-    async def fake_scan(creds, regions, include_cost_explorer=True, on_region=None, full=False):
+    async def fake_scan(creds, regions, include_cost_explorer=True, on_region=None, full=False, with_spend=False):
         assert full is False  # the free server never asks for the partner engine
+        assert with_spend is True  # CLO-858: the free MCP scan reads spend for the score
         return REPORT
 
     with patch.object(mcp_server, "resolve_credentials", return_value=CREDS), \
@@ -70,7 +71,7 @@ def _scan_text(regions, args=None):
     async def run():
         server = mcp_server.build_server()
 
-        async def fake_scan(creds, region_list, include_cost_explorer=True, on_region=None, full=False):
+        async def fake_scan(creds, region_list, include_cost_explorer=True, on_region=None, full=False, with_spend=False):
             return REPORT
 
         with patch.object(mcp_server, "resolve_credentials", return_value=CREDS), \
@@ -110,6 +111,8 @@ def test_scan_then_list_explain_fix_with_advisory_excluded_and_footer_once():
     async def missing(c): return _text(await c.call_tool("explain_finding", {"finding_id": "nope"}))
 
     s, listing_text, e, f, m = asyncio.run(_session([scan, listing, explain, fix, missing]))
+    assert s.startswith("**Cost health score:") and "```" in s      # CLO-858: the card leads the result
+    assert "http" not in s.split("Account ")[0]                      # and carries no URL
     assert "estimated savings $52.50/month (advisory findings excluded)" in s
     assert f"{ADVISORY}: 1 resource(s), $300.00/month (advisory, not counted)" in s
     assert "7 Cost Explorer request(s)" in s and "include_cost_explorer=false to skip" in s

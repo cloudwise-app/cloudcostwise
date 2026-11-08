@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import re
+import time
 from dataclasses import dataclass, field
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Type
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from cloudwise_scan_core.models import WasteDetectionSettings, WasteItem
 from cloudwise_scan_core.open_service import OpenWasteDetectionService
 
@@ -45,6 +49,49 @@ class ScanReport:
     # not enabled: their findings are MISSING, not zero.
     permission_errors: List[str] = field(default_factory=list)
     coverage_notes: List[str] = field(default_factory=list)
+    # CLO-858: the last 30 complete days' unblended spend (None: not asked for or
+    # not available, the score then falls back to dollars alone) and wall seconds.
+    spend_monthly: Optional[float] = None
+    seconds: float = 0.0
+
+
+def spend_window(today: Optional[_dt.date] = None):
+    """(start, end) ISO dates for the score's spend: the last 30 complete days, end exclusive.
+
+    Same window the hosted product uses for "last 30 days" cost (backend
+    ``cur_data_service.complete_day_window(30)``: yesterday and the 29 days
+    before it, today's partial day left out), so the score has the same inputs
+    here and there. The backend reads those days as DAILY unblended cost.
+    """
+    today = today or _dt.datetime.now(_dt.timezone.utc).date()
+    return (today - _dt.timedelta(days=30)).isoformat(), today.isoformat()
+
+
+def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
+    """One Cost Explorer GetCostAndUsage request: the last 30 complete days, DAILY, UnblendedCost, no grouping.
+
+    Sets ``report.spend_monthly`` and counts the request in ``report.api_calls``.
+    Runs under the read-only guard (GetCostAndUsage is a read; any other
+    operation raises ReadOnlyViolation, which is deliberately not caught). Any
+    Cost Explorer or network error leaves ``spend_monthly`` None: the score
+    falls back to dollars alone and the scan never fails for it.
+    """
+    start, end = spend_window()
+    total: Optional[float] = None
+    with read_only_guard() as guard:
+        try:
+            client = boto3.client("ce", region_name="us-east-1", aws_access_key_id=creds.access_key_id,
+                                  aws_secret_access_key=creds.secret_access_key,
+                                  aws_session_token=creds.session_token)
+            resp = client.get_cost_and_usage(TimePeriod={"Start": start, "End": end}, Granularity="DAILY",
+                                             Metrics=["UnblendedCost"])
+            total = sum(float(r["Total"]["UnblendedCost"]["Amount"]) for r in resp.get("ResultsByTime", []))
+        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError):
+            total = None
+    n = guard.calls.get(COST_EXPLORER_SERVICE, 0)
+    if n:
+        report.api_calls[COST_EXPLORER_SERVICE] = report.api_calls.get(COST_EXPLORER_SERVICE, 0) + n
+    report.spend_monthly = total if total and total > 0 else None
 
 
 def full_engine_class() -> Type[OpenWasteDetectionService]:
@@ -166,12 +213,15 @@ async def run_scan_async(
     on_region: Optional[Callable[[RegionResult], None]] = None,
     parallel: int = DEFAULT_PARALLEL_REGIONS,
     full: bool = False,
+    with_spend: bool = False,
 ) -> ScanReport:
     """Scan regions, up to ``parallel`` at a time, each in its own process.
 
     ``on_region`` is called as each region finishes (progress). The report
     lists regions and findings in the order requested, whatever order they
     finished in. ``full`` runs all 46 service checks (partner build only).
+    ``with_spend`` adds one Cost Explorer request for the score's spend (CLI and
+    MCP server only; every other caller makes exactly the requests it did before).
     """
     import concurrent.futures
     import logging
@@ -181,6 +231,7 @@ async def run_scan_async(
                         entrypoints=len(service_class(include_cost_explorer, full).DETECTOR_METHODS),
                         cost_explorer_skipped=not include_cost_explorer)
     results: Dict[str, RegionResult] = {}
+    started = time.monotonic()
     if parallel <= 1 or len(regions) <= 1:
         for region in regions:
             results[region] = await asyncio.to_thread(scan_region, creds, region, include_cost_explorer, None, full, regions)
@@ -216,6 +267,9 @@ async def run_scan_async(
     report.blocked_calls = dict(blocked)
     if violations:
         raise ReadOnlyViolation(f"refused non-read AWS call(s): {', '.join(sorted(set(violations)))}")
+    if include_cost_explorer and with_spend:
+        await asyncio.to_thread(fetch_monthly_spend, creds, report)
+    report.seconds = round(time.monotonic() - started, 1)
     return report
 
 
@@ -255,5 +309,6 @@ def run_scan(
     on_region: Optional[Callable[[RegionResult], None]] = None,
     parallel: int = DEFAULT_PARALLEL_REGIONS,
     full: bool = False,
+    with_spend: bool = False,
 ) -> ScanReport:
-    return asyncio.run(run_scan_async(creds, regions, include_cost_explorer, on_region, parallel, full))
+    return asyncio.run(run_scan_async(creds, regions, include_cost_explorer, on_region, parallel, full, with_spend))

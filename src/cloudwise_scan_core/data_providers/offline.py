@@ -122,7 +122,7 @@ from cloudwise_scan_core.data_providers.models import (
     WorkspacePoolData,
     WorkspaceMetricsData,
     BeanstalkEnvironmentData,
-    BeanstalkConfigData,
+    BeanstalkConfigData, beanstalk_config_from_settings,
     BeanstalkMetricsData,
     ApiGatewayRestApiData,
     beanstalk_rds_marks,
@@ -5624,7 +5624,13 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         return self._trusted_export_list('lambda_functions', 'Functions') is not None
 
     async def get_beanstalk_configurations(self) -> Dict[str, BeanstalkConfigData]:
-        """Get Beanstalk configuration settings from offline export."""
+        """Get Beanstalk configuration settings from offline export.
+
+        CLO-830: an environment whose configuration file is absent or empty
+        (cloudwise-export.sh writes an empty file when
+        describe-configuration-settings fails) is LEFT OUT, never given a
+        default configuration: the detector reads the missing key as MISSING
+        and skips the checks that need the configuration."""
         configs = {}
         raw_envs = self._get_data('beanstalk_environments')
         for env in raw_envs:
@@ -5632,39 +5638,21 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             env_name = env.get('EnvironmentName', '')
             config_data = self._get_data(f'beanstalk_config_{env_name}')
             if not config_data:
-                configs[env_id] = BeanstalkConfigData(environment_id=env_id)
                 continue
 
-            settings = config_data if isinstance(config_data, list) else config_data.get('ConfigurationSettings', [{}])
-            if settings:
-                setting = settings[0] if isinstance(settings, list) else settings
-                options = {
-                    (opt.get('Namespace', ''), opt.get('OptionName', '')): opt.get('Value', '')
-                    for opt in setting.get('OptionSettings', [])
-                }
-                configs[env_id] = BeanstalkConfigData(
-                    environment_id=env_id,
-                    instance_type=options.get(
-                        ('aws:autoscaling:launchconfiguration', 'InstanceType'), 't3.micro'
-                    ),
-                    environment_type=options.get(
-                        ('aws:elasticbeanstalk:environment', 'EnvironmentType'), 'SingleInstance'
-                    ),
-                    load_balancer_type=options.get(
-                        ('aws:elasticbeanstalk:environment', 'LoadBalancerType'), ''
-                    ),
-                    min_size=int(options.get(
-                        ('aws:autoscaling:asg', 'MinSize'), '1'
-                    )),
-                    max_size=int(options.get(
-                        ('aws:autoscaling:asg', 'MaxSize'), '1'
-                    )),
-                    rds_endpoint=options.get(
-                        ('aws:rds:dbinstance', 'DBEngine'), ''
-                    ),
-                )
+            # CLO-833: a dict without ConfigurationSettings, an empty list,
+            # or settings lacking an option the checks need are MISSING too.
+            if isinstance(config_data, list):
+                settings = config_data
+            elif isinstance(config_data, dict):
+                settings = config_data.get('ConfigurationSettings')
             else:
-                configs[env_id] = BeanstalkConfigData(environment_id=env_id)
+                settings = None
+            setting = settings[0] if isinstance(settings, list) and settings else None
+            config = beanstalk_config_from_settings(env_id, setting)
+            if config is not None:
+                configs[env_id] = config
+            # else: the environment stays out of ``configs`` (MISSING, CLO-830).
         return configs
 
     async def get_beanstalk_metrics(

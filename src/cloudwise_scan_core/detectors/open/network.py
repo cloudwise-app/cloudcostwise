@@ -113,8 +113,8 @@ class OpenNetworkDetectorsMixin:
                         explanation={
                             'detection': f'Elastic IP {eip.public_ip} is not associated with any instance or network interface',
                             'threshold': 'EIP not attached to any resource',
-                            'pricing': f'Unattached EIP: ${eip_monthly_cost:.2f}/month (AWS charges for EIPs not associated with a running instance)',
-                            'why_waste': 'AWS charges for Elastic IPs that are allocated but not associated with a running instance. This EIP was likely left behind after an instance was terminated.',
+                            'pricing': f'Unattached EIP: ${eip_monthly_cost:.2f}/month (AWS bills every public IPv4 address, attached or not)',
+                            'why_waste': 'AWS bills every allocated Elastic IP, attached or not, and an unattached one serves nothing for that charge. This EIP was likely left behind after an instance was terminated.',
                             'risk': 'Releasing an EIP is permanent — the IP address cannot be recovered. If DNS records or allowlists reference this IP, update them first.',
                         },
                         metadata={
