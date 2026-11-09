@@ -13,7 +13,8 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Dict, Any, List, TYPE_CHECKING
 from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, get_ec2_monthly_cost, _region_price_multiplier
-from cloudwise_scan_core.aws_pricing_service import lightsail_bundle_monthly_price
+from cloudwise_scan_core.aws_pricing_service import lightsail_bundle_monthly_price, workspaces_pool_slot_monthly_price
+from cloudwise_scan_core.data_providers.base import WORKSPACES_POOL_PEAK_WINDOW_DAYS
 from cloudwise_scan_core.cpu_sizing import EC2_IDLE_MAX_CPU_THRESHOLD, EC2_IDLE_P95_AVG_CPU_THRESHOLD, EC2_IDLE_P95_MAX_CPU_THRESHOLD, is_as_old_as_window
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
@@ -1606,22 +1607,96 @@ class OpenComputeDetectorsMixin:
             # ── Detector D: Pool Overprovisioned Capacity ──
             try:
                 pools = await data_provider.get_workspaces_pools()
-                for pool in pools:
+                # CLO-909: only a RUNNING pool's session counts describe
+                # steady-state demand; a stopped or transitioning pool reads
+                # 0 active and would fire a bogus "reduce to 1".
+                candidates = [
+                    p for p in pools
+                    if p.state == 'RUNNING' and p.desired_user_sessions >= WORKSPACES_POOL_MIN_EXCESS
+                ]
+                # CLO-918: demand is the pool's peak active sessions over
+                # WORKSPACES_POOL_PEAK_WINDOW_DAYS (CloudWatch
+                # ActiveUserSessionCapacity, hourly Maximum), not
+                # CapacityStatus.ActiveUserSessions, which is a scan-time
+                # count (near 0 for a pool scanned at night). A pool whose
+                # peak is unknown is not judged; it never falls back to the
+                # snapshot. Only the Air-Gapped export, which does not
+                # capture the metric, keeps the snapshot.
+                use_snapshot = data_provider.provider_type == 'offline'
+                peaks: Dict[str, float] = {}
+                if candidates and not use_snapshot:
+                    peaks = await data_provider.get_workspaces_pool_peak_sessions(
+                        [p.pool_id for p in candidates], days=WORKSPACES_POOL_PEAK_WINDOW_DAYS,
+                    ) or {}
+                for pool in candidates:
                     desired = pool.desired_user_sessions
-                    running = pool.running_user_sessions
-
-                    if desired <= 0:
+                    if use_snapshot:
+                        demand = pool.active_user_sessions
+                    elif pool.pool_id in peaks:
+                        demand = int(math.ceil(peaks[pool.pool_id]))
+                    else:
                         continue
 
-                    excess = desired - running
-                    utilization_pct = (running / desired * 100) if desired > 0 else 0
+                    excess = desired - demand
+                    utilization_pct = (demand / desired * 100) if desired > 0 else 0
 
                     if utilization_pct > WORKSPACES_POOL_MAX_UTILIZATION_PCT or excess < WORKSPACES_POOL_MIN_EXCESS:
                         continue
 
-                    excess_monthly_cost = excess * 35
+                    # CLO-923: an idle slot costs the running rate in an
+                    # ALWAYS_ON pool and the stopped rate in an AUTO_STOP pool.
+                    slot = workspaces_pool_slot_monthly_price(pool.running_mode)
+                    excess_monthly_cost = excess * slot['monthly']
                     if excess_monthly_cost < max(settings.min_waste_threshold_usd, WORKSPACES_POOL_MIN_EXCESS_COST_USD):
                         continue
+
+                    if use_snapshot:
+                        # Offline has no session history.
+                        demand_text = f"{demand} in use when the export was taken"
+                        threshold_text = (
+                            f'Active sessions when the export was taken at or under '
+                            f'{WORKSPACES_POOL_MAX_UTILIZATION_PCT}% of desired, with at least '
+                            f'{WORKSPACES_POOL_MIN_EXCESS} idle slots (the export has no session history)'
+                        )
+                        risk_text = (
+                            'The export has no session history. '
+                            f"Check the pool's {WORKSPACES_POOL_PEAK_WINDOW_DAYS}-day peak of ActiveUserSessionCapacity "
+                            'in CloudWatch (Maximum) before reducing, and keep a safety margin above it. '
+                            'Account for seasonality and known peak events.'
+                        )
+                    else:
+                        demand_text = (
+                            f"a peak of {demand} in use over the last "
+                            f"{WORKSPACES_POOL_PEAK_WINDOW_DAYS} days"
+                        )
+                        threshold_text = (
+                            f'Peak active sessions over {WORKSPACES_POOL_PEAK_WINDOW_DAYS} days at or under '
+                            f'{WORKSPACES_POOL_MAX_UTILIZATION_PCT}% of desired, with at least '
+                            f'{WORKSPACES_POOL_MIN_EXCESS} idle slots at the peak'
+                        )
+                        risk_text = (
+                            'Reducing capacity too aggressively may cause session launch delays during peak hours. '
+                            f'Keep a safety margin above the {WORKSPACES_POOL_PEAK_WINDOW_DAYS}-day peak of '
+                            'ActiveUserSessionCapacity (CloudWatch Maximum). '
+                            'Account for seasonality and known peak events.'
+                        )
+
+                    if slot['mode'] == 'ALWAYS_ON':
+                        mode_text = 'always-on pool, idle slots billed at the running rate'
+                        bundle_text = ' Estimate at the lowest pool bundle rate; most bundles cost more.'
+                    elif slot['mode'] == 'AUTO_STOP':
+                        mode_text = 'auto-stop pool, idle slots billed at the stopped rate'
+                        bundle_text = ''
+                    else:
+                        mode_text = (
+                            'running mode not reported, so idle slots are priced at the lower stopped rate'
+                        )
+                        bundle_text = ''
+                    pricing_text = (
+                        f'Estimated excess cost: ~${excess_monthly_cost:.0f}/month ({excess} unused slots at '
+                        f'${slot["monthly"]:.2f}/slot, {mode_text}).{bundle_text} '
+                        'These are the lowest rates in any region, so most pools cost more.'
+                    )
 
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
@@ -1631,37 +1706,44 @@ class OpenComputeDetectorsMixin:
                         title="WorkSpaces Pool Overprovisioned Capacity",
                         description=(
                             f"WorkSpaces Pool '{pool.pool_name}' has {desired} configured sessions "
-                            f"but only {running} in use ({utilization_pct:.0f}% utilization). "
+                            f"but {demand_text} ({utilization_pct:.0f}% utilization). "
                             f"Reducing excess capacity could save ~${excess_monthly_cost:.0f}/month."
                         ),
                         monthly_savings=excess_monthly_cost,
-                        confidence=ConfidenceLevel.HIGH,
-                        action=f"Reduce pool capacity from {desired} to {running + max(1, running // 4)} sessions.",
+                        confidence=ConfidenceLevel.MEDIUM,
+                        action=f"Reduce pool capacity from {desired} to {demand + max(1, demand // 4)} sessions.",
                         action_command=f"# Review and adjust pool '{pool.pool_name}' capacity in the AWS Console",
                         explanation={
                             'detection': (
-                                f'Pool has {desired} desired sessions but only {running} active '
+                                f'Pool has {desired} desired sessions and {demand_text} '
                                 f'({utilization_pct:.0f}% utilization). Excess: {excess} idle slots.'
                             ),
-                            'threshold': 'Pool utilization < 75% with excess capacity > 25% above p95 sustained usage',
-                            'pricing': f'Estimated excess cost: ~${excess_monthly_cost:.0f}/month ({excess} unused slots)',
+                            'threshold': threshold_text,
+                            'pricing': pricing_text,
                             'why_waste': (
                                 'WorkSpaces Pools charge for provisioned capacity regardless of session usage. '
                                 'Excess buffer above peak demand wastes recurring hourly/stopped-instance charges.'
                             ),
-                            'risk': (
-                                'Reducing capacity too aggressively may cause session launch delays during peak hours. '
-                                'Keep a safety margin above p95 sustained concurrent sessions. '
-                                'Account for seasonality and known peak events.'
-                            ),
+                            'risk': risk_text,
                         },
                         metadata={
                             'pool_id': pool.pool_id,
                             'pool_name': pool.pool_name,
                             'configured_capacity': desired,
-                            'active_sessions': running,
+                            # The demand the verdict used (the remediation
+                            # planner reads this key): the 14-day peak online,
+                            # the export's count offline. The scan-time count
+                            # is kept apart so a night scan's 0 never sizes a plan.
+                            'active_sessions': demand,
+                            'scan_time_active_sessions': pool.active_user_sessions,
+                            'peak_active_sessions': None if use_snapshot else demand,
+                            'peak_window_days': None if use_snapshot else WORKSPACES_POOL_PEAK_WINDOW_DAYS,
+                            'demand_basis': 'export_snapshot' if use_snapshot else 'peak_active_sessions',
                             'utilization_pct': round(utilization_pct, 1),
                             'excess_slots': excess,
+                            'running_mode': slot['mode'],
+                            'running_mode_known': slot['mode_known'],
+                            'slot_monthly_cost': round(slot['monthly'], 2),
                             'detection_mode': data_provider.provider_type,
                         }
                     ))

@@ -13,6 +13,7 @@ import re
 import shlex
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, _region_price_multiplier, S3_STANDARD_PER_GB, S3_IT_MONITORING_PER_1K, S3_STANDARD_IA_PER_GB, S3_IT_MIN_TIERABLE_BYTES, S3_TIER2_REQUEST_PRICE
@@ -170,6 +171,156 @@ def is_backup_managed_snapshot(snapshot) -> bool:
     if any(key.startswith(BACKUP_SNAPSHOT_TAG_PREFIX) for key in (snapshot.tags or {})):
         return True
     return (snapshot.description or '').startswith(BACKUP_SNAPSHOT_DESCRIPTION)
+
+
+# CLO-891: the snapshot CloudWise takes before it deletes an EBS volume is the
+# undo's source (CLO-887). The remediation executor tags it with these keys
+# (lambdas/remediation_executor/handler.py SNAPSHOT_TAG_ACTION_ID and
+# SNAPSHOT_TAG_EXPIRES_AT) and its daily sweep deletes it once the expiry has
+# passed and no undo is possible. Its volume is gone by design, so without
+# this every such snapshot read as orphaned_ebs_snapshot (and, past the age
+# threshold, old_ebs_snapshot) with a delete-snapshot fix: an offer to delete
+# the undo source. The expiry is deliberately not read. The sweep keeps some
+# expired snapshots on purpose (a failed undo, remediation disabled, account
+# disconnected, dry run), so "expired" never means "safe to offer"; the sweep
+# or the user owns that snapshot.
+CLOUDWISE_UNDO_SNAPSHOT_TAG_KEYS = ('cloudwise:action_id', 'cloudwise:expires_at')
+
+
+def is_cloudwise_undo_snapshot(snapshot) -> bool:
+    """Whether an EBS snapshot is a CloudWise pre-delete (undo) snapshot.
+
+    Either tag is enough, whatever its value: never offer to delete an undo
+    source."""
+    tags = snapshot.tags or {}
+    return any(key in tags for key in CLOUDWISE_UNDO_SNAPSHOT_TAG_KEYS)
+
+
+# CLO-848: a snapshot the owner marked on purpose. Tag `cloudcostwise:keep`
+# (any value, including empty) or `DoNotDelete=true` keeps a snapshot out of
+# ami_orphaned_snapshot, orphaned_ebs_snapshot and old_ebs_snapshot. Key case
+# and the `true` value's case are ignored: an exemption list that misses on
+# capitalisation would flag the very snapshot someone protected. The scan notes
+# how many were skipped (data_warnings), and the CLI shows that note.
+KEEP_TAG_KEY = 'cloudcostwise:keep'
+DO_NOT_DELETE_TAG_KEY = 'DoNotDelete'
+EBS_SNAPSHOT_KEEP_NOTE_PREFIX = 'ebs_snapshot_keep:'
+EBS_SNAPSHOT_NEWEST_NOTE_PREFIX = 'old_ebs_snapshot:'
+# The CLI lists these separately from "missing data" warnings: they are
+# deliberate skips, not findings lost to a failed read.
+EBS_SNAPSHOT_WITHHELD_NOTE_PREFIXES = (
+    EBS_SNAPSHOT_KEEP_NOTE_PREFIX,
+    EBS_SNAPSHOT_NEWEST_NOTE_PREFIX,
+)
+_EBS_SNAPSHOT_NOTE_EXAMPLES = 3
+
+_NEWEST_OF_LIVE_VOLUME = 'the newest snapshot of a volume that still exists'
+_NEWEST_UNORDERED = (
+    'a snapshot of a volume that has a snapshot with no start time, so the newest cannot be told'
+)
+_NEWEST_UNSETTLED = 'a snapshot of a volume whose newest snapshot is not completed yet'
+
+
+def tags_mark_keep(tags) -> bool:
+    """Whether a tag map carries the scanner keep tag (CLO-848). Shared by
+    the scanner and the remediation executor's second-line check."""
+    for key, value in (tags or {}).items():
+        k = str(key).strip().lower()
+        if k == KEEP_TAG_KEY:
+            return True
+        if k == DO_NOT_DELETE_TAG_KEY.lower() and str(value).strip().lower() == 'true':
+            return True
+    return False
+
+
+def is_kept_snapshot(snapshot) -> bool:
+    """Whether an EBS snapshot is tagged to be kept (CLO-848)."""
+    return tags_mark_keep(getattr(snapshot, 'tags', None))
+
+
+def _snapshot_start(snapshot) -> Optional[datetime]:
+    value = getattr(snapshot, 'start_time', None)
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def newest_snapshot_protection(snapshots) -> Dict[str, str]:
+    """CLO-848: ``{snapshot_id: reason}`` for the snapshots of each volume
+    that old_ebs_snapshot must not flag.
+
+    Per volume_id: the newest snapshot, and the newest completed one when the
+    newest is still pending or errored (the restore point is the completed
+    one). A snapshot with no start time makes the order unknown, so every
+    snapshot of that volume is protected rather than guessed at. A snapshot
+    with no volume_id is not grouped. Missing data never produces a flag."""
+    groups: Dict[str, list] = {}
+    for snap in snapshots:
+        vol = getattr(snap, 'volume_id', None)
+        if vol:
+            groups.setdefault(vol, []).append(snap)
+    protected: Dict[str, str] = {}
+    for group in groups.values():
+        if any(_snapshot_start(s) is None for s in group):
+            for s in group:
+                protected[s.snapshot_id] = _NEWEST_UNORDERED
+            continue
+        ordered = sorted(group, key=lambda s: (_snapshot_start(s), s.snapshot_id))
+        newest = ordered[-1]
+        protected[newest.snapshot_id] = _NEWEST_OF_LIVE_VOLUME
+        if str(getattr(newest, 'state', '') or '').strip().lower() != 'completed':
+            for s in reversed(ordered[:-1]):
+                if str(getattr(s, 'state', '') or '').strip().lower() == 'completed':
+                    protected[s.snapshot_id] = _NEWEST_UNSETTLED
+                    break
+    return protected
+
+
+def _replace_or_append_note(data_provider, prefix: str, note: str) -> None:
+    warnings = getattr(data_provider, 'data_warnings', None)
+    if not isinstance(warnings, list):
+        return
+    for i, existing in enumerate(warnings):
+        if isinstance(existing, str) and existing.startswith(prefix):
+            warnings[i] = note
+            return
+    warnings.append(note)
+
+
+def _examples(ids: List[str]) -> str:
+    text = ', '.join(ids[:_EBS_SNAPSHOT_NOTE_EXAMPLES])
+    return text + (', ...' if len(ids) > _EBS_SNAPSHOT_NOTE_EXAMPLES else '')
+
+
+def _note_ebs_snapshots_kept(data_provider, kept_ids: List[str]) -> None:
+    """One aggregated note: snapshots skipped because they carry the keep tag."""
+    if not kept_ids:
+        return
+    region = getattr(data_provider, 'region', None) or 'this region'
+    n = len(kept_ids)
+    _replace_or_append_note(data_provider, EBS_SNAPSHOT_KEEP_NOTE_PREFIX, (
+        f"{EBS_SNAPSHOT_KEEP_NOTE_PREFIX} {n} snapshot{'s' if n != 1 else ''} in {region} "
+        f"left out because tagged {KEEP_TAG_KEY} or {DO_NOT_DELETE_TAG_KEY}=true "
+        f"({_examples(sorted(kept_ids))}). Remove the tag to check "
+        f"{'it' if n == 1 else 'them'} again"
+    ))
+
+
+def _note_ebs_snapshots_newest(data_provider, withheld: List[tuple]) -> None:
+    """One aggregated note: old snapshots skipped by the newest-snapshot rule."""
+    if not withheld:
+        return
+    region = getattr(data_provider, 'region', None) or 'this region'
+    n = len(withheld)
+    why = '; '.join(
+        f"{reason} (x{count})"
+        for reason, count in sorted(Counter(r for _, r in withheld).items())
+    )
+    _replace_or_append_note(data_provider, EBS_SNAPSHOT_NEWEST_NOTE_PREFIX, (
+        f"{EBS_SNAPSHOT_NEWEST_NOTE_PREFIX} {n} old snapshot{'s' if n != 1 else ''} in {region} "
+        f"not flagged ({_examples(sorted(sid for sid, _ in withheld))}). Each is {why}. "
+        "Older snapshots of the same volume are still checked"
+    ))
 
 
 def provisioned_iops_monthly_cost(volume_type: str, iops: int) -> float:
@@ -444,13 +595,26 @@ class OpenStorageDetectorsMixin:
             orphaned_snapshot_ids = set()
             ami_orphaned_snapshot_ids = set()
             backup_managed_snapshot_ids = set()
+            # CLO-891: CloudWise's own undo snapshots are never a finding of
+            # any of the three snapshot checks below.
+            cloudwise_undo_snapshot_ids = {
+                s.snapshot_id for s in all_snapshots if is_cloudwise_undo_snapshot(s)
+            }
+            # CLO-848: snapshots tagged to be kept that a check below would
+            # have flagged (counted once each, whichever check meets them).
+            kept_snapshot_ids = set()
             
             # Check 5: AMI Orphaned Snapshots (highest priority among snapshot checks)
             for snapshot in all_snapshots:
+                if snapshot.snapshot_id in cloudwise_undo_snapshot_ids:
+                    continue
                 match = AMI_SNAPSHOT_PATTERN.search(snapshot.description or '')
                 if match:
                     ami_id = match.group(1)
                     if ami_id not in registered_ami_ids:
+                        if is_kept_snapshot(snapshot):
+                            kept_snapshot_ids.add(snapshot.snapshot_id)
+                            continue
                         age_days = snapshot.age_days if snapshot.age_days else (
                             (datetime.now(timezone.utc) - snapshot.start_time).days if snapshot.start_time else 0
                         )
@@ -496,6 +660,8 @@ class OpenStorageDetectorsMixin:
                 # Skip if already flagged as AMI orphan (higher priority)
                 if snapshot.snapshot_id in ami_orphaned_snapshot_ids:
                     continue
+                if snapshot.snapshot_id in cloudwise_undo_snapshot_ids:
+                    continue
                 # CLO-589: AWS Backup owns this snapshot's lifecycle and EC2
                 # refuses to delete it. Kept out of old_ebs_snapshot below
                 # too, which would give the same refused command.
@@ -504,6 +670,9 @@ class OpenStorageDetectorsMixin:
                     continue
                 
                 if snapshot.volume_id and snapshot.volume_id not in existing_volume_ids:
+                    if is_kept_snapshot(snapshot):
+                        kept_snapshot_ids.add(snapshot.snapshot_id)
+                        continue
                     age_days = snapshot.age_days if snapshot.age_days else (
                         (datetime.now(timezone.utc) - snapshot.start_time).days if snapshot.start_time else 0
                     )
@@ -544,16 +713,42 @@ class OpenStorageDetectorsMixin:
             
             # Check 3: Old snapshots (skip those already flagged as orphaned)
             snapshots = await data_provider.get_ebs_snapshots(age_threshold_days=settings.snapshot_age_days)
-            
+
+            # CLO-848: never flag the newest snapshot of a volume that still
+            # exists. Groups come from every snapshot either read returned.
+            # When the volume list is incomplete "still exists" cannot be
+            # told, so it counts as existing (withhold, never flag).
+            by_id = {s.snapshot_id: s for s in all_snapshots}
+            by_id.update({s.snapshot_id: s for s in snapshots})
+            newest_protection = {
+                sid: reason
+                for sid, reason in newest_snapshot_protection(by_id.values()).items()
+                if not volume_list_complete
+                or by_id[sid].volume_id in existing_volume_ids
+            }
+            newest_withheld = []
+
             for snapshot in snapshots:
                 # Skip if already flagged by orphan detectors
                 if (
                     snapshot.snapshot_id in orphaned_snapshot_ids
                     or snapshot.snapshot_id in ami_orphaned_snapshot_ids
                     or snapshot.snapshot_id in backup_managed_snapshot_ids
+                    or snapshot.snapshot_id in cloudwise_undo_snapshot_ids
+                    # The threshold fetch is a separate read; check its own
+                    # tags too, not only the ids the first read saw.
+                    or is_cloudwise_undo_snapshot(snapshot)
                 ):
                     continue
-                
+                if is_kept_snapshot(snapshot):
+                    kept_snapshot_ids.add(snapshot.snapshot_id)
+                    continue
+                if snapshot.snapshot_id in newest_protection:
+                    newest_withheld.append(
+                        (snapshot.snapshot_id, newest_protection[snapshot.snapshot_id])
+                    )
+                    continue
+
                 age_days = snapshot.age_days if snapshot.age_days else (
                     (datetime.now(timezone.utc) - snapshot.start_time).days if snapshot.start_time else 0
                 )
@@ -587,6 +782,9 @@ class OpenStorageDetectorsMixin:
                     }
                 ))
             
+            _note_ebs_snapshots_kept(data_provider, sorted(kept_snapshot_ids))
+            _note_ebs_snapshots_newest(data_provider, newest_withheld)
+
             # Check 3: Over-provisioned IOPS (CLO-516). Runs LAST, so its
             # budgeted metric reads can never starve the volume and snapshot
             # checks above. It used to import a model and call a provider

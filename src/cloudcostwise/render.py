@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from cloudwise_scan_core.advisory_types import ADVISORY, validation_for
+from cloudwise_scan_core.detectors.open.storage import EBS_SNAPSHOT_WITHHELD_NOTE_PREFIXES
 from cloudwise_scan_core.score import Score, compute_score
 
 from cloudcostwise.runtime import COST_EXPLORER_PRICE_PER_REQUEST, COST_EXPLORER_SERVICE
@@ -81,6 +82,22 @@ def footer(report: ScanReport) -> str:
     return (f"{OPEN_ENTRYPOINTS} of {TOTAL_ENTRYPOINTS} service checks run locally. "
             f"The other {TOTAL_ENTRYPOINTS - OPEN_ENTRYPOINTS}, history, alerts and safe fixes: {HOSTED_URL}\n"
             f"{FEEDBACK_NOTE}")
+
+
+def _is_withheld_note(warning: str) -> bool:
+    """CLO-848: a deliberate skip (keep tag, newest snapshot), not lost data.
+    Scan notes carry a region prefix ("us-east-1: ebs_snapshot_keep: ...")."""
+    body = warning.split(": ", 1)[1] if ": " in warning else warning
+    return warning.startswith(EBS_SNAPSHOT_WITHHELD_NOTE_PREFIXES) or body.startswith(EBS_SNAPSHOT_WITHHELD_NOTE_PREFIXES)
+
+
+def withheld_notes(report: ScanReport) -> List[str]:
+    return [w for w in report.warnings if _is_withheld_note(w)]
+
+
+def data_warnings(report: ScanReport) -> List[str]:
+    """Warnings that mean findings are MISSING (everything but withheld notes)."""
+    return [w for w in report.warnings if not _is_withheld_note(w)]
 
 
 def scope_notes(report: ScanReport) -> List[str]:
@@ -206,12 +223,17 @@ def as_table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> 
     adv = advisory_total(report)
     if adv:
         lines.append(f"Advisory (unvalidated, excluded): {_money(adv)}/month")
-    if report.warnings:
+    withheld = withheld_notes(report)
+    if withheld:
+        lines += ["", "Left out on purpose:"]
+        lines += [f"  - {w}" for w in withheld]
+    warnings = data_warnings(report)
+    if warnings:
         if verbose:
             lines += ["", "Data warnings (findings these affect are MISSING, not zero):"]
-            lines += [f"  - {w}" for w in report.warnings]
+            lines += [f"  - {w}" for w in warnings]
         else:
-            lines.append(f"{len(report.warnings)} data warning(s); rerun with --verbose to see them.")
+            lines.append(f"{len(warnings)} data warning(s); rerun with --verbose to see them.")
     for e in report.errors:
         lines.append(f"error: {e}")
     lines += ["", *score_card(report, emoji=emoji)]
@@ -228,6 +250,9 @@ def as_markdown(report: ScanReport, emoji: bool = False) -> str:
         name = f"{g.waste_type} (advisory)" if g.advisory else g.waste_type
         for i in g.items:
             out.append(f"| {name} | {i.region or '-'} | `{i.resource_id}` | {_money(float(i.monthly_savings or 0))} |")
+    withheld = withheld_notes(report)
+    if withheld:
+        out += ["", "**Left out on purpose:**", "", *[f"- {w}" for w in withheld]]
     out += ["", f"**Estimated savings: {_money(counted_total(report))}/month** (advisory excluded)",
            "", *score_card(report, markdown=True, emoji=emoji)]
     note = cost_explorer_note(report)

@@ -963,6 +963,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 is_attached=bool(instance_id or network_interface_id),
                 domain=address.get('Domain', 'vpc'),
                 tags=self._get_tag_dict(address.get('Tags', [])),
+                public_ipv4_pool=address.get('PublicIpv4Pool'),
             ))
         
         return eips
@@ -5511,15 +5512,27 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         results = []
         raw = self._get_data('workspaces_pools')
         for p in raw:
-            capacity = p.get('Capacity', {})
+            capacity = p.get('CapacityStatus') or {}  # CLO-909: the response shape; Capacity is request-side only
             results.append(WorkspacePoolData(
                 pool_id=p.get('PoolId', ''),
                 pool_name=p.get('PoolName', p.get('PoolId', '')),
                 state=p.get('State', ''),
-                desired_user_sessions=capacity.get('DesiredUserSessions', 0),
-                running_user_sessions=capacity.get('RunningUserSessions', 0) if capacity else 0,
+                desired_user_sessions=capacity.get('DesiredUserSessions', 0) or 0,
+                active_user_sessions=capacity.get('ActiveUserSessions', 0) or 0,
+                running_mode=p.get('RunningMode') or None,
             ))
         return results
+
+    async def get_workspaces_pool_peak_sessions(
+        self,
+        pool_ids: List[str],
+        days: int = 14,
+    ) -> Optional[Dict[str, float]]:
+        """CLO-918: the export script does not capture the pools'
+        ActiveUserSessionCapacity series, so there is no windowed read
+        (None). workspaces_pool_overprovisioned_capacity keeps judging the
+        exported CapacityStatus snapshot offline."""
+        return None
 
     async def get_workspaces_metrics(
         self,

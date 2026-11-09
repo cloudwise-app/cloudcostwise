@@ -88,6 +88,48 @@ def lightsail_bundle_monthly_price(bundle_id: str) -> Optional[float]:
     return prices[index]
 
 
+# ─── WorkSpaces Pools slot prices (CLO-923) ───────────────────────────────
+# From the AWS Price List API (service AmazonWorkSpaces, region US East
+# (N. Virginia), runningMode "Pool", read 2026-11-09). A pool bills each
+# provisioned session slot by the hour: a running slot at the bundle's pool
+# rate, a stopped slot at one flat stopped-instance rate for every bundle
+# (USE1-AW-HW-Pools-Stopped-Usage and the BYOL twin, $0.025/hr, the lowest
+# stopped rate in any region; the 15 regions run $0.025 to $0.035). An ALWAYS_ON
+# pool keeps every slot running; an AUTO_STOP pool stops idle slots.
+# The pool response carries a BundleId, not a bundle name, so the running
+# rate is a FLOOR: the lowest running pool rate in ANY region, across every
+# bundle, license-included and BYOL. A read of all regions (2026-11-09,
+# effective 2026-10-01) puts it at Value BYOL in EU (Paris), usage type
+# EUW3-AW-HWB-5-Pools-Usage, $0.05/hr. For comparison, us-east-1 Value BYOL is
+# $0.059, Value $0.075, Standard BYOL $0.084, Standard $0.10, up to $2.73 for
+# GraphicsPro. Every other bundle and region costs more, so this under-states
+# them. Never overstates. Not region-scaled, for that reason.
+WORKSPACES_POOL_RUNNING_FLOOR_HOURLY_USD = 0.05
+WORKSPACES_POOL_STOPPED_HOURLY_USD = 0.025
+WORKSPACES_POOL_HOURS_PER_MONTH = 730
+
+
+def workspaces_pool_slot_monthly_price(running_mode: Optional[str]) -> Dict[str, Any]:
+    """Monthly cost of one idle session slot in a WorkSpaces Pool.
+
+    ALWAYS_ON -> running floor rate; AUTO_STOP -> stopped rate. Any other value,
+    or none, takes the lower (stopped) rate so the savings are never
+    over-stated, and is flagged ``mode_known=False``."""
+    mode = (running_mode or '').upper()
+    if mode == 'ALWAYS_ON':
+        hourly, known = WORKSPACES_POOL_RUNNING_FLOOR_HOURLY_USD, True
+    elif mode == 'AUTO_STOP':
+        hourly, known = WORKSPACES_POOL_STOPPED_HOURLY_USD, True
+    else:
+        hourly, known, mode = WORKSPACES_POOL_STOPPED_HOURLY_USD, False, 'UNKNOWN'
+    return {
+        'monthly': hourly * WORKSPACES_POOL_HOURS_PER_MONTH,
+        'hourly': hourly,
+        'mode': mode,
+        'mode_known': known,
+    }
+
+
 @dataclass
 class EC2Pricing:
     """Pricing information for an EC2 instance type."""

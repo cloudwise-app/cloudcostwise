@@ -50,6 +50,23 @@ def test_advisory_findings_are_listed_but_never_counted_in_the_total():
     assert "**Estimated savings: $15.50/month** (advisory excluded)" in render.as_markdown(report)
 
 
+def test_ebs_snapshot_withheld_notes_show_in_markdown_and_table_not_as_missing_data():
+    """CLO-848: the keep-tag and newest-snapshot notes are deliberate skips."""
+    report = _report(_item(TRUSTED, "a", 10.0))
+    kept = "us-east-1: ebs_snapshot_keep: 2 snapshots in us-east-1 left out because tagged cloudcostwise:keep"
+    newest = "us-east-1: old_ebs_snapshot: 1 old snapshot in us-east-1 not flagged (snap-1)"
+    report.warnings = [kept, newest, "us-east-1: elasticache-cpu: withheld"]
+    md = render.as_markdown(report)
+    assert "**Left out on purpose:**" in md
+    assert f"- {kept}" in md and f"- {newest}" in md
+    assert "elasticache-cpu" not in md
+    table = render.as_table(report)
+    assert "Left out on purpose:" in table and kept in table
+    assert "1 data warning(s)" in table
+    assert render.data_warnings(report) == ["us-east-1: elasticache-cpu: withheld"]
+    assert len(json.loads(render.as_json(report))["warnings"]) == 3
+
+
 def test_counted_groups_come_before_advisory_and_sort_by_savings():
     report = _report(_item(ADVISORY, "z", 999.0), _item(TRUSTED, "small", 1.0), _item("idle_efs", "big", 50.0))
     order = [g.waste_type for g in render.groups(report)]

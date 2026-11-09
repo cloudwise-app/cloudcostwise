@@ -114,6 +114,15 @@ class ElasticIPData:
     is_attached: bool = False
     domain: str = "vpc"  # 'vpc' or 'standard'
     tags: Dict[str, str] = field(default_factory=dict)
+    # CLO-882: DescribeAddresses PublicIpv4Pool. "amazon" (or absent) for an
+    # Amazon-owned address; "ipv4pool-ec2-..." for a BYOIP / customer-owned pool.
+    public_ipv4_pool: Optional[str] = None
+
+    @property
+    def is_byoip(self) -> bool:
+        """True for an address from a customer-owned pool (no per-address saving from releasing it)."""
+        pool = (self.public_ipv4_pool or "").strip()
+        return bool(pool) and pool.lower() != "amazon"
 
 
 @dataclass
@@ -1831,9 +1840,16 @@ class WorkspacePoolData:
     """Normalized WorkSpaces Pool data."""
     pool_id: str
     pool_name: str
-    state: str = ''                     # 'CREATING', 'AVAILABLE', etc.
+    state: str = ''                     # botocore enum: CREATING, DELETING, RUNNING, STARTING, STOPPED, STOPPING, UPDATING
+    # CLO-909: both read from the response's CapacityStatus (the request-side
+    # Capacity shape is never returned). desired = DesiredUserSessions, the
+    # session slots the pool is sized for; active = ActiveUserSessions, the
+    # sessions users are using now.
     desired_user_sessions: int = 0
-    running_user_sessions: int = 0
+    active_user_sessions: int = 0
+    # CLO-923: the pool's RunningMode (botocore: ALWAYS_ON, AUTO_STOP). None
+    # when the response or export does not carry it.
+    running_mode: Optional[str] = None
 
 
 @dataclass

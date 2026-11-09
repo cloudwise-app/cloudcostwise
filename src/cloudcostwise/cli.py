@@ -21,6 +21,10 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--profile", help="AWS profile (default: the standard credential chain)")
     s.add_argument("--regions", help="comma-separated regions, or 'all' (default: us-east-1 plus your profile's region)")
     s.add_argument("--format", choices=["table", "markdown", "json"], default="table")
+    s.add_argument("--anonymize", action="store_true",
+                   help="replace the account ID and the resource IDs, names and ARNs it recognizes with stable "
+                        "placeholders (account-1, resource-1, ...); works with every --format. Anonymizing is "
+                        "not complete: review the report before you send it")
     s.add_argument("--no-cost-explorer", action="store_true",
                    help="make no Cost Explorer call ($0.01 per request): skips the RI/Savings Plans checks")
     s.add_argument("--parallel", type=int, default=4, metavar="N",
@@ -108,12 +112,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cloudcostwise: stopped, {e}. Please report this: it is a bug.", file=sys.stderr)
         return 3
 
+    # CLO-929: the printed report only. The share offer below keeps the original report.
+    shown = report
+    if args.anonymize:
+        from cloudcostwise.anonymize import anonymize_report
+
+        shown = anonymize_report(report)
     if args.format == "json":
-        print(render.as_json(report))
+        print(render.as_json(shown))
     elif args.format == "markdown":
-        print(render.as_markdown(report, emoji=sys.stdout.isatty()))
+        print(render.as_markdown(shown, emoji=sys.stdout.isatty()))
     else:
-        print(render.as_table(report, verbose=args.verbose, emoji=sys.stdout.isatty()))
+        print(render.as_table(shown, verbose=args.verbose, emoji=sys.stdout.isatty()))
     # CLO-824: after the results are out. Asks only a human at a terminal, or sends only on a
     # setting a human wrote; never raises, never fails the scan.
     from cloudcostwise import share

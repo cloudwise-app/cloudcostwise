@@ -23,6 +23,7 @@ from cloudwise_scan_core.data_providers.base import (
     LIGHTSAIL_METRIC_WINDOW_DAYS,
     PROVISIONED_CONCURRENCY_WINDOW_DAYS,
     WORKSPACES_METRIC_WINDOW_DAYS,
+    WORKSPACES_POOL_PEAK_WINDOW_DAYS,
     WasteDataProvider,
 )
 from cloudwise_scan_core.data_providers.missing_data import (
@@ -1692,6 +1693,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     is_attached=bool(instance_id or network_interface_id),
                     domain=address.get('Domain', 'vpc'),
                     tags=self._tags_to_dict(address.get('Tags', [])),
+                    public_ipv4_pool=address.get('PublicIpv4Pool'),
                 ))
             self.elastic_ips_complete = True
         except ClientError as e:
@@ -10023,16 +10025,30 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         results = []
         try:
             ws = self._get_client('workspaces')
-            response = ws.describe_workspaces_pools()
-            for p in response.get('WorkspacesPools', []):
-                capacity = p.get('Capacity', {})
-                results.append(WorkspacePoolData(
-                    pool_id=p.get('PoolId', ''),
-                    pool_name=p.get('PoolName', p.get('PoolId', '')),
-                    state=p.get('State', ''),
-                    desired_user_sessions=capacity.get('DesiredUserSessions', 0),
-                    running_user_sessions=capacity.get('RunningUserSessions', 0) if capacity else 0,
-                ))
+            # CLO-854: boto3 has no paginator for this operation, so follow
+            # NextToken by hand. The end-of-sale denial (CLO-850) arrives on
+            # the first call and is handled below.
+            kwargs: Dict[str, Any] = {}
+            seen_tokens = set()
+            while True:
+                response = ws.describe_workspaces_pools(**kwargs)
+                for p in response.get('WorkspacesPools', []):
+                    # CLO-909: the response carries CapacityStatus, not the
+                    # request-side Capacity (which made both counts 0).
+                    capacity = p.get('CapacityStatus') or {}
+                    results.append(WorkspacePoolData(
+                        pool_id=p.get('PoolId', ''),
+                        pool_name=p.get('PoolName', p.get('PoolId', '')),
+                        state=p.get('State', ''),
+                        desired_user_sessions=capacity.get('DesiredUserSessions', 0) or 0,
+                        active_user_sessions=capacity.get('ActiveUserSessions', 0) or 0,
+                        running_mode=p.get('RunningMode') or None,
+                    ))
+                token = response.get('NextToken')
+                if not token or token in seen_tokens:
+                    break
+                seen_tokens.add(token)
+                kwargs = {'NextToken': token}
         except ClientError as e:
             if self._is_service_unavailable_to_account(e):
                 # CLO-850: AWS closed WorkSpaces Pools to new accounts
@@ -10055,6 +10071,163 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 raise
             logger.error(f"Error listing WorkSpaces Pools: {e}")
         return results
+
+    # CLO-918: one ListMetrics answer (500 series a page) covers a region's
+    # pools many times over; past this the answer is truncated and the pools
+    # it did not reach are MISSING.
+    _WORKSPACES_POOL_LIST_METRICS_MAX_PAGES = 10
+    WORKSPACES_POOL_PEAK_METRIC = 'ActiveUserSessionCapacity'
+    WORKSPACES_POOL_NOTE_SERVICE = 'workspaces-pools'
+    WORKSPACES_POOL_NOTE_VERDICT = 'over-provisioned'
+    WORKSPACES_POOL_NOTE_EVIDENCE = 'peak active sessions (ActiveUserSessionCapacity)'
+
+    def _workspaces_pool_session_series(self, cloudwatch) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+        """CLO-918: the ActiveUserSessionCapacity series AWS publishes for
+        each pool, found with ListMetrics rather than assumed.
+
+        The AWS docs agree on the metric name but not on where it lives: the
+        metrics page says namespace ``AWS/Workspaces``, the auto scaling
+        examples use ``AWS/WorkSpaces`` with the dimension named ``Pool`` in
+        two alarms and ``WorkSpaces pool ID`` in a third. CloudWatch matches
+        namespace and dimensions exactly, so a guessed shape that is wrong
+        returns an empty Complete series: the check would never fire and
+        nothing would say why (the CLO-528 failure). ListMetrics, filtered
+        on the metric name only, returns each series' real namespace and
+        dimensions; a series belongs to a pool when its namespace is the
+        WorkSpaces one (any case) and it carries exactly one dimension whose
+        value is the pool id. Its Metric is then queried verbatim.
+
+        Returns ``(series, reason)``: ``series`` maps pool id -> the Metric
+        dict; ``reason`` is set when the answer is not complete (denied,
+        failed, truncated), and then every pool missing from ``series`` is
+        MISSING for that reason. Cached per provider (one region)."""
+        cached = getattr(self, '_workspaces_pool_series_cache', None)
+        if cached is not None:
+            return cached
+        series: Dict[str, Dict[str, Any]] = {}
+        reason: Optional[str] = 'ListMetrics answer truncated'
+        try:
+            kwargs: Dict[str, Any] = {'MetricName': self.WORKSPACES_POOL_PEAK_METRIC}
+            for _ in range(self._WORKSPACES_POOL_LIST_METRICS_MAX_PAGES):
+                page = cloudwatch.list_metrics(**kwargs)
+                for metric in page.get('Metrics', []) or []:
+                    namespace = metric.get('Namespace') or ''
+                    dims = metric.get('Dimensions') or []
+                    if namespace.lower() != 'aws/workspaces' or len(dims) != 1:
+                        continue
+                    if metric.get('MetricName') != self.WORKSPACES_POOL_PEAK_METRIC:
+                        continue
+                    pool_id = dims[0].get('Value') or ''
+                    if pool_id and pool_id not in series:
+                        series[pool_id] = {
+                            'Namespace': namespace,
+                            'MetricName': self.WORKSPACES_POOL_PEAK_METRIC,
+                            'Dimensions': [{'Name': dims[0].get('Name'), 'Value': pool_id}],
+                        }
+                token = page.get('NextToken')
+                if not token:
+                    reason = None
+                    break
+                kwargs = {**kwargs, 'NextToken': token}
+        except (ClientError, BotoCoreError) as e:
+            if self._is_access_denied(e):
+                # Monitoring template 1.29.0 grants cloudwatch:ListMetrics; an
+                # older stack is denied. Recorded once (the answer is cached),
+                # so the account gets the CLO-534 targeted notice.
+                logger.info(
+                    "workspaces-pools: cloudwatch:ListMetrics denied in %s; pool peak "
+                    "sessions cannot be read and pools are not judged", self._region,
+                )
+                self._record_permission_error(
+                    resource="WorkSpaces Pools peak sessions",
+                    permission="cloudwatch:ListMetrics", error=e,
+                )
+                reason = 'cloudwatch:ListMetrics denied'
+            else:
+                self._warn_swallowed("WorkSpaces Pools peak sessions", "cloudwatch:ListMetrics", e)
+                reason = f"ListMetrics read failed ({self._error_label(e)})"
+            series = {}
+        self._workspaces_pool_series_cache = (series, reason)
+        return series, reason
+
+    async def get_workspaces_pool_peak_sessions(
+        self,
+        pool_ids: List[str],
+        days: int = WORKSPACES_POOL_PEAK_WINDOW_DAYS,
+    ) -> Optional[Dict[str, float]]:
+        """CLO-918: see WasteDataProvider.get_workspaces_pool_peak_sessions.
+
+        DescribeWorkspacesPools' CapacityStatus.ActiveUserSessions is a
+        scan-time count; a pool scanned at night reads near 0 however busy
+        its day is. This reads CloudWatch ActiveUserSessionCapacity ("the
+        number of user sessions currently being used for streaming
+        sessions", published every minute; valid statistics Average,
+        Minimum, Maximum) as hourly Maximum over ``days``, one query per
+        pool in batched GetMetricData requests, and keeps the highest hour.
+        A pool's peak is reported only when its series has data on at least
+        ceil(days * WORKSPACES_MIN_COVERAGE) distinct UTC calendar dates: 11
+        of the 15 dates a 14-day window touches. A pool with fewer, or none,
+        is MISSING and noted, never zero. Cost:
+        one ListMetrics request per region plus one metric per pool
+        ($0.01 per 1,000 metrics)."""
+        peaks: Dict[str, float] = {}
+        ids = [pid for pid in dict.fromkeys(pool_ids or []) if pid]
+        if not ids:
+            return peaks
+
+        def _missing(pid: str, reason: str) -> None:
+            self._note_idle_verdict_missing(
+                self.WORKSPACES_POOL_NOTE_SERVICE, pid, reason,
+                verdict=self.WORKSPACES_POOL_NOTE_VERDICT,
+                evidence=self.WORKSPACES_POOL_NOTE_EVIDENCE,
+            )
+
+        try:
+            cloudwatch = self._get_client('cloudwatch')
+        except Exception as e:  # noqa: BLE001 - no client means no read: MISSING
+            self._warn_swallowed("WorkSpaces Pools peak sessions", "cloudwatch client", e)
+            for pid in ids:
+                _missing(pid, f"read failed ({self._error_label(e)})")
+            return peaks
+        series, list_reason = self._workspaces_pool_session_series(cloudwatch)
+        queried: List[str] = []
+        for pid in ids:
+            if pid in series:
+                queried.append(pid)
+            else:
+                _missing(pid, list_reason or 'no ActiveUserSessionCapacity series')
+        if not queried:
+            return peaks
+        queries = [{
+            'Id': f'pas{idx}',
+            'MetricStat': {'Metric': series[pid], 'Period': 3600, 'Stat': 'Maximum'},
+            'ReturnData': True,
+        } for idx, pid in enumerate(queried)]
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=days)
+        try:
+            points, failed = self._run_metric_data_queries(cloudwatch, queries, start_time, end_time)
+        except Exception as e:  # noqa: BLE001 - any failure is MISSING, never zero
+            self._warn_swallowed("WorkSpaces Pools peak sessions", "cloudwatch:GetMetricData", e)
+            for pid in queried:
+                _missing(pid, f"read failed ({self._error_label(e)})")
+            return peaks
+        need_days = math.ceil(days * WORKSPACES_MIN_COVERAGE)
+        for idx, pid in enumerate(queried):
+            qid = f'pas{idx}'
+            if qid in failed:
+                _missing(pid, f"GetMetricData status {failed[qid]}")
+                continue
+            hourly = points.get(qid) or {}
+            if not hourly:
+                _missing(pid, 'no datapoints')
+                continue
+            covered_days = len({ts.date() for ts in hourly})
+            if covered_days < need_days:
+                _missing(pid, f"under {round(WORKSPACES_MIN_COVERAGE * 100)}% coverage")
+                continue
+            peaks[pid] = max(hourly.values())
+        return peaks
 
     async def get_workspaces_metrics(
         self,

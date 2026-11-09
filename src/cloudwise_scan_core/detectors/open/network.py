@@ -96,9 +96,18 @@ class OpenNetworkDetectorsMixin:
             # Track EIPs per instance for duplicate detection
             instance_eip_map: Dict[str, List[Any]] = {}
 
+            # CLO-882: an address from a customer-owned (BYOIP) pool has no
+            # per-address saving from releasing it and no CUR rows, so a
+            # list-price finding would invent $3.65/month. PublicIpv4Pool is
+            # "amazon" (or absent) for Amazon-owned addresses; anything else
+            # is a BYOIP pool. BYOIP addresses are skipped per check below but
+            # still count toward an instance's true EIP total.
+
             for eip in eips:
                 # Check 1: Unattached EIP
                 if not eip.instance_id and not eip.network_interface_id:
+                    if eip.is_byoip:
+                        continue
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
                         resource_id=eip.allocation_id,
@@ -132,20 +141,23 @@ class OpenNetworkDetectorsMixin:
             instances = await data_provider.get_ec2_instances()
             instance_map = {i.instance_id: i for i in instances}
             
-            for instance_id, eip_list in instance_eip_map.items():
+            for instance_id, all_eips in instance_eip_map.items():
+                eip_list = [e for e in all_eips if not e.is_byoip]
                 instance = instance_map.get(instance_id)
                 instance_name = instance.name if instance else instance_id
                 instance_state = instance.state if instance else 'unknown'
                 
                 # Check 2: EIP on stopped instance
-                if instance_state == 'stopped':
+                if instance_state == 'stopped' and eip_list:
                     # CLO-672: on a stopped instance every address is billed
                     # and each gets its own finding below, so check 3 stays
                     # silent; the count rides in the text instead.
                     shared_note = (
-                        f" It is one of {len(eip_list)} Elastic IPs on this instance, "
-                        "each listed and billed on its own."
-                        if len(eip_list) > 1 else ""
+                        f" It is one of {len(all_eips)} Elastic IPs on this instance"
+                        + (", each listed and billed on its own."
+                           if len(all_eips) == len(eip_list)
+                           else "; those from Amazon's pool are listed and billed on their own.")
+                        if len(all_eips) > 1 else ""
                     )
                     for eip in eip_list:
                         waste_items.append(WasteItem(
@@ -186,7 +198,8 @@ class OpenNetworkDetectorsMixin:
                 # addresses, so an "extra EIP" finding here counted the same
                 # dollars twice in every total ($3.65 on top of 2 x $3.65).
                 if len(eip_list) > 1 and instance_state != 'stopped':
-                    eip_ips = ', '.join(e.public_ip for e in eip_list)
+                    total_eips = len(all_eips)
+                    eip_ips = ', '.join(e.public_ip for e in all_eips)
                     extra_eips = len(eip_list) - 1
                     
                     waste_items.append(WasteItem(
@@ -196,18 +209,18 @@ class OpenNetworkDetectorsMixin:
                         waste_type=WasteType.MULTIPLE_EIPS_PER_INSTANCE,
                         title=f"Multiple Elastic IPs on Single Instance",
                         description=(
-                            f"Instance '{instance_name}' has {len(eip_list)} Elastic IPs attached: {eip_ips}. "
+                            f"Instance '{instance_name}' has {total_eips} Elastic IPs attached: {eip_ips}. "
                             f"This is typically an anti-pattern. Extra IPs cost ${eip_monthly_cost}/month each. "
                             f"Total extra cost: ${eip_monthly_cost * extra_eips:.2f}/month."
                         ),
                         monthly_savings=eip_monthly_cost * extra_eips,
                         confidence=ConfidenceLevel.HIGH,
                         action=(
-                            f"Review the {len(eip_list)} Elastic IPs on {instance_id} ({eip_ips}); "
+                            f"Review the {total_eips} Elastic IPs on {instance_id} ({eip_ips}); "
                             "release only one you have confirmed is unused. Releasing an address in use drops its traffic."
                         ),
                         explanation={
-                            'detection': f'{len(eip_list)} Elastic IPs attached to instance {instance_id}: {eip_ips}',
+                            'detection': f'{total_eips} Elastic IPs attached to instance {instance_id}: {eip_ips}',
                             'threshold': '> 1 EIP per instance',
                             'pricing': f'{extra_eips} extra EIP(s) × ${eip_monthly_cost}/month = ${eip_monthly_cost * extra_eips:.2f}/month',
                             'why_waste': f'Most instances need at most one public IP. Multiple EIPs typically indicate leftover configurations from network changes.',
@@ -216,9 +229,9 @@ class OpenNetworkDetectorsMixin:
                         metadata={
                             'instance_id': instance_id,
                             'instance_name': instance_name,
-                            'eip_count': len(eip_list),
-                            'eips': [e.public_ip for e in eip_list],
-                            'allocation_ids': [e.allocation_id for e in eip_list],
+                            'eip_count': total_eips,
+                            'eips': [e.public_ip for e in all_eips],
+                            'allocation_ids': [e.allocation_id for e in all_eips],
                             'detection_mode': data_provider.provider_type,
                         }
                     ))

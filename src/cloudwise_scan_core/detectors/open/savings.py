@@ -138,8 +138,16 @@ class SavingsOpportunitiesDetectorsMixin:
                 'scan_regions': settings.scan_regions,
             }
             
+            # CLO-880: whether this scan's refresh would send the Savings Plans usage
+            # requests. Also asked of needs_refresh, so a Free refresh followed by an
+            # upgrade inside the TTL fetches them instead of reading empty rows.
+            include_usage = (
+                'commitment' in getattr(self, 'DETECTOR_METHODS', ('commitment',))
+                and getattr(data_provider, '_commitment_routed', True) is not False
+            )
+
             # Check if we need to refresh recommendations (once per week)
-            if await cache_service.needs_refresh(account_id):
+            if await cache_service.needs_refresh(account_id, include_commitment_usage=include_usage):
                 logger.info(f"Refreshing RI/SP recommendations for account {account_id} (weekly refresh)")
                 
                 refreshing = True
@@ -147,8 +155,9 @@ class SavingsOpportunitiesDetectorsMixin:
                     creds,
                     # Each of these requests is billed to the customer, and only
                     # the commitment detector reads them. An engine without it
-                    # (the free CLI scan) has no use for them.
-                    include_commitment_usage='commitment' in getattr(self, 'DETECTOR_METHODS', ('commitment',)),
+                    # (the free CLI scan), or a scan whose tier doesn't route it
+                    # (hosted Free, CLO-880), has no use for them.
+                    include_commitment_usage=include_usage,
                 )
                 refreshing = False
 

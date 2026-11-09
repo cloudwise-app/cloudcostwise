@@ -198,6 +198,13 @@ class SavingsRecommendationsCacheService:
     2. Checks if refresh is needed (once per week per account)
     3. Refreshes during waste detection scan if cache expired
     4. Tracks API call costs for billing purposes
+
+    Every request here is unfiltered (no LINKED_ACCOUNT) and the cache is keyed
+    by the credentials' own account (commitment_cache_account_id). That is
+    correct only because a hosted scan runs on a role in the scanned account:
+    CLO-773 refuses a row whose role is in another account (an Organizations
+    member on its payer's role) before the scan assumes it. Don't add
+    member-scoped requests here; a member connects on its own role.
     
     Usage pattern (in waste detection Lambda):
     1. Call needs_refresh() to check if cache is older than 7 days
@@ -239,7 +246,17 @@ class SavingsRecommendationsCacheService:
         """Generate key for storing last refresh timestamp."""
         return f"{LAST_REFRESH_KEY_PREFIX}{account_id}"
     
-    async def needs_refresh(self, account_id: str) -> bool:
+    @staticmethod
+    def _usage_missing(marker: Dict[str, Any], include_commitment_usage: bool) -> bool:
+        """True when the caller reads Savings Plans usage but the last refresh didn't fetch it.
+
+        CLO-880: a hosted Free refresh skips those two requests, so an account that upgrades
+        inside the TTL would otherwise read empty rows for up to 7 days. A marker without the
+        attribute was written before the flag existed, when every hosted refresh fetched all 10.
+        """
+        return include_commitment_usage and marker.get('include_commitment_usage', True) is False
+
+    async def needs_refresh(self, account_id: str, include_commitment_usage: bool = False) -> bool:
         """
         Check if recommendations for this account need to be refreshed.
         
@@ -247,6 +264,9 @@ class SavingsRecommendationsCacheService:
         - No cached data exists for this account
         - Cached data is older than CACHE_TTL_DAYS (7 days)
         
+        - ``include_commitment_usage`` is True and the last refresh didn't fetch the
+          Savings Plans usage rows (CLO-880)
+
         This is the main check to decide whether to call Cost Explorer APIs.
         """
         pk = f"ACCOUNT#{account_id}"
@@ -257,7 +277,9 @@ class SavingsRecommendationsCacheService:
         if local_cache_key in self._local_cache:
             last_refresh = self._local_cache[local_cache_key].get('timestamp', 0)
             age_days = (datetime.now(timezone.utc).timestamp() - last_refresh) / 86400
-            if age_days < CACHE_TTL_DAYS:
+            if age_days < CACHE_TTL_DAYS and not self._usage_missing(
+                self._local_cache[local_cache_key], include_commitment_usage
+            ):
                 logger.debug(f"Account {account_id} refreshed {age_days:.1f} days ago, no refresh needed")
                 return False
 
@@ -284,9 +306,13 @@ class SavingsRecommendationsCacheService:
                 # Update local cache
                 self._local_cache[local_cache_key] = {
                     'timestamp': last_refresh, 'failed_ri_regions': item.get('failed_ri_regions') or [],
+                    'include_commitment_usage': item.get('include_commitment_usage', True),
                 }
                 
                 if age_days < CACHE_TTL_DAYS:
+                    if self._usage_missing(item, include_commitment_usage):
+                        logger.info(f"Account {account_id} refresh skipped Savings Plans usage, refresh needed")
+                        return self._retry_is_due(table, account_id)
                     logger.debug(f"Account {account_id} refreshed {age_days:.1f} days ago, no refresh needed")
                     return False
                 else:
@@ -363,6 +389,7 @@ class SavingsRecommendationsCacheService:
 
     async def _update_last_refresh_timestamp(
         self, account_id: str, failed_ri_regions: Optional[List[str]] = None,
+        include_commitment_usage: bool = True,
     ) -> None:
         """Update the last refresh timestamp for an account."""
         pk = f"ACCOUNT#{account_id}"
@@ -374,6 +401,7 @@ class SavingsRecommendationsCacheService:
         # Update local cache
         self._local_cache[local_cache_key] = {
             'timestamp': timestamp, 'failed_ri_regions': failed_ri_regions or [],
+            'include_commitment_usage': include_commitment_usage,
         }
 
         # Update DynamoDB
@@ -389,6 +417,8 @@ class SavingsRecommendationsCacheService:
                     'updated_at': datetime.now(timezone.utc).isoformat(),
                     'account_id': account_id,
                     'ttl': ttl,
+                    # CLO-880: whether the Savings Plans usage rows were fetched.
+                    'include_commitment_usage': include_commitment_usage,
                     # CLO-777: so each scan until the next refresh can say so.
                     **({'failed_ri_regions': failed_ri_regions} if failed_ri_regions else {}),
                 }
@@ -530,8 +560,11 @@ class SavingsRecommendationsCacheService:
         Args:
             creds: AWS credentials dict with access_key_id, secret_access_key, account_id
             include_commitment_usage: send the billed Savings Plans utilization and
-                coverage requests. Only the commitment detector reads them, so an
-                engine without it (the free CLI scan) passes False.
+                coverage requests. Only the commitment detector reads them, so a scan
+                that doesn't run it passes False: an engine without it (the free CLI
+                scan) or a hosted scan whose tier doesn't route it (Free, CLO-880).
+                The last-refresh marker records the choice so ``needs_refresh`` can
+                ask again once the commitment detector is routed.
 
         Returns:
             Summary of refreshed recommendations and API costs
@@ -652,6 +685,7 @@ class SavingsRecommendationsCacheService:
         # Update last refresh timestamp after successful refresh
         await self._update_last_refresh_timestamp(
             account_id, [f for f in failed_fetches if f.startswith('ri_inventory')],
+            include_commitment_usage=include_commitment_usage,
         )
         self._clear_failed_write(account_id)
 

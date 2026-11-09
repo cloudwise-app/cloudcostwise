@@ -1,6 +1,7 @@
 """The MCP server, driven through the SDK's in-process client."""
 
 import asyncio
+import json
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -132,3 +133,140 @@ def test_the_server_module_cannot_execute_commands():
     imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     imported |= {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert not imported & {"subprocess", "os", "shlex", "pty"}
+
+
+# ---- CLO-840: resources and prompts ----
+
+def _body(result) -> str:
+    return "\n".join(c.text for c in result.contents)
+
+
+def test_resources_listed_and_read_before_any_scan_say_no_scan_yet_and_make_no_aws_call():
+    async def run():
+        server = mcp_server.build_server()
+        with patch.object(mcp_server, "run_scan_async", side_effect=AssertionError("scan started")), \
+             patch.object(mcp_server, "resolve_credentials", side_effect=AssertionError("creds read")):
+            async with Client(server) as client:
+                listed = (await client.list_resources()).resources
+                latest = _body(await client.read_resource("cloudcostwise://scan/latest"))
+                summary = _body(await client.read_resource("cloudcostwise://scan/latest/summary"))
+                checks = _body(await client.read_resource("cloudcostwise://checks"))
+                return listed, latest, summary, checks
+
+    listed, latest, summary, checks = asyncio.run(run())
+    assert sorted(str(r.uri) for r in listed) == [
+        "cloudcostwise://checks", "cloudcostwise://scan/latest", "cloudcostwise://scan/latest/summary"]
+    assert '"status": "no_scan_yet"' in latest and "never starts one" in latest
+    assert "No scan yet" in summary
+    assert checks.startswith("# cloudcostwise checks")
+
+
+def test_resources_show_the_last_scan_after_scan_runs():
+    async def latest(client):
+        return _body(await client.read_resource("cloudcostwise://scan/latest"))
+
+    async def summary(client):
+        return _body(await client.read_resource("cloudcostwise://scan/latest/summary"))
+
+    async def scan(client):
+        return await client.call_tool("scan", {})
+
+    _, data, text = asyncio.run(_session([scan, latest, summary]))
+    parsed = json.loads(data)
+    assert parsed["account_id"] == "123456789012"
+    assert {f["resource_id"] for f in parsed["findings"]} == {"vol-1", "fs-1", "db-1"}
+    assert "123456789012" in text and "unattached_ebs" in text
+
+
+def test_checks_resource_names_waste_types_from_the_shipped_detectors():
+    async def run():
+        async with Client(mcp_server.build_server()) as client:
+            return _body(await client.read_resource("cloudcostwise://checks"))
+
+    body = asyncio.run(run())
+    assert "## " in body
+    states = [line.rsplit(": ", 1)[1] for line in body.splitlines() if line.startswith("- ")]
+    assert states and set(states) <= {"trusted", "unvalidated", "advisory", "unknown"}
+
+
+def test_scan_notifies_both_the_subscription_and_the_legacy_paths():
+    calls = []
+
+    class Rec:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def __getattr__(self, name):
+            async def rec(*args):
+                calls.append((self.tag, name, *args))
+            return rec
+
+    ctx = Rec("ctx")
+    ctx.session = Rec("session")
+    asyncio.run(mcp_server._notify_scan_changed(ctx))
+    assert ("ctx", "notify_resources_changed") in calls
+    assert ("session", "send_resource_list_changed") in calls
+    for uri in ("cloudcostwise://scan/latest", "cloudcostwise://scan/latest/summary"):
+        assert ("ctx", "notify_resource_updated", uri) in calls
+        assert ("session", "send_resource_updated", uri) in calls
+
+
+def test_a_failing_notification_does_not_stop_the_others():
+    sent = []
+
+    class Session:
+        async def send_resource_list_changed(self):
+            sent.append("list")
+
+        async def send_resource_updated(self, uri):
+            sent.append(uri)
+
+    class Boom:
+        session = Session()
+
+        async def notify_resources_changed(self):
+            raise RuntimeError("no stream")
+
+        async def notify_resource_updated(self, uri):
+            raise RuntimeError("no stream")
+
+    asyncio.run(mcp_server._notify_scan_changed(Boom()))
+    assert sent == ["list", "cloudcostwise://scan/latest", "cloudcostwise://scan/latest/summary"]
+
+
+def test_scan_tool_calls_the_notifier():
+    async def scan(client):
+        return await client.call_tool("scan", {})
+
+    calls = []
+
+    async def fake_notify(ctx):
+        calls.append(ctx)
+
+    with patch.object(mcp_server, "_notify_scan_changed", fake_notify):
+        asyncio.run(_session([scan]))
+    assert len(calls) == 1
+
+
+def test_three_prompts_listed_and_none_asks_to_change_aws():
+    async def run():
+        async with Client(mcp_server.build_server()) as client:
+            listed = (await client.list_prompts()).prompts
+            rendered = {
+                "scan-account": await client.get_prompt("scan-account", {"profile": "prod"}),
+                "explain-finding": await client.get_prompt("explain-finding", {"finding_id": "f1"}),
+                "fix-guidance": await client.get_prompt("fix-guidance", {"finding_id": "f1"}),
+            }
+            return listed, rendered
+
+    listed, rendered = asyncio.run(run())
+    assert sorted(p.name for p in listed) == ["explain-finding", "fix-guidance", "scan-account"]
+    args = {p.name: [a.name for a in (p.arguments or [])] for p in listed}
+    assert args["explain-finding"] == ["finding_id"] and args["fix-guidance"] == ["finding_id"]
+    assert set(args["scan-account"]) == {"profile", "regions"}
+    texts = {k: v.messages[0].content.text for k, v in rendered.items()}
+    assert "profile prod" in texts["scan-account"] and "'f1'" in texts["explain-finding"]
+    assert texts["fix-guidance"].index("read-only") < texts["fix-guidance"].index("recommended action")
+    for t in texts.values():
+        assert "read-only" in t or "Do not change anything in AWS" in t
+        assert "$" not in t

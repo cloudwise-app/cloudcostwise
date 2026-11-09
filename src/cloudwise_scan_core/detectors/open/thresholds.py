@@ -227,8 +227,12 @@ OPEN_THRESHOLDS: Mapping[str, Tuple[Threshold, ...]] = {
            "_detect_workspaces_waste"),
     ),
     "workspaces_pool_overprovisioned_capacity": (
-        _t("max_utilization_pct", "running sessions at or under this share of desired", f"{_OC}.WORKSPACES_POOL_MAX_UTILIZATION_PCT",
+        _t("max_utilization_pct", "peak active sessions at or under this share of desired", f"{_OC}.WORKSPACES_POOL_MAX_UTILIZATION_PCT",
            "percent", "_detect_workspaces_waste"),
+        _t("window_days", "peak active sessions measured over", f"{_BASE}.WORKSPACES_POOL_PEAK_WINDOW_DAYS", "days",
+           "_detect_workspaces_waste"),
+        _t("coverage_pct", "share of the window's days that must have data", "data_providers.online.WORKSPACES_MIN_COVERAGE",
+           "fraction", f"{_ONLINE}.get_workspaces_pool_peak_sessions"),
         _t("min_excess", "at least this many idle sessions", f"{_OC}.WORKSPACES_POOL_MIN_EXCESS", "count", "_detect_workspaces_waste"),
         _t("min_excess_cost_usd", "idle sessions cost per month at least", f"{_OC}.WORKSPACES_POOL_MIN_EXCESS_COST_USD", "USD",
            "_detect_workspaces_waste"),

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 # ``_aws_account_id_from_sts()``: the cache is a tenant-isolation boundary, so
 # the key never trusts a caller-supplied ``_account_id``. An unresolvable ID
 # skips the read.
+#
+# CLO-773: the STS key is the account the credentials belong to, so a row on
+# another account's role would read and refresh that account's entry. The
+# hosted scan refuses such a row before it assumes the role (list_regions and
+# the region scanner), and no writer creates one, so this module does not
+# handle it. Don't add member-row handling here; enforce the row invariant.
 UNRESOLVED_ACCOUNT_WARNING = (
     "Commitment checks (RI/Savings Plans) skipped: the AWS account ID could not "
     "be resolved, so the commitment data for this account could not be read. "

@@ -156,6 +156,15 @@ class ReconciliationStatus:
     #: :func:`_not_yet_billed` for the exact rule.
     UNRECONCILED_NOT_YET_BILLED = "unreconciled_not_yet_billed"
 
+    #: CLO-746: AWS bills Container Insights as CloudWatch metrics for the
+    #: whole account, by namespace (``CW:MetricMonitorUsage``,
+    #: ``MetricStorage:AWS/...``), never under a per-cluster resource id. A
+    #: cluster that is running tasks therefore has no CUR row to match, and a
+    #: miss is not "not billed". Estimate stands, labelled. An empty cluster
+    #: (no running tasks) emits no metrics and keeps the ordinary $0 result.
+    #: See ``CUR_ACCOUNT_WIDE_WASTE_TYPES``.
+    UNRECONCILED_BILLED_ACCOUNT_WIDE = "unreconciled_billed_account_wide"
+
     #: Every status that leaves ``monthly_savings`` at the list-price estimate.
     UNRECONCILED = frozenset(
         {
@@ -166,6 +175,7 @@ class ReconciliationStatus:
             UNRECONCILED_AMBIGUOUS,
             UNRECONCILED_NOT_ATTRIBUTABLE,
             UNRECONCILED_NOT_YET_BILLED,
+            UNRECONCILED_BILLED_ACCOUNT_WIDE,
         }
     )
 
@@ -178,7 +188,8 @@ class ReconciliationStatus:
 #:   with no running task bills nothing, so its zero is true.
 #: - ``ecs_container_insights_waste``: id is the cluster, and its cost is
 #:   CloudWatch metrics, not ECS tasks, so the reason this status gives
-#:   customers would be false. An empty cluster really does bill $0.
+#:   customers would be false. It has its own status (CLO-746, see
+#:   ``CUR_ACCOUNT_WIDE_WASTE_TYPES``); an empty cluster really does bill $0.
 #: All three types here only produce a saving for Fargate services (the
 #: detectors gate on ``launchType``); the EC2 launch type bills instances. An
 #: account threshold of $0 lets ``ecs_no_autoscaling`` fire at $0 on EC2, so
@@ -192,6 +203,15 @@ CUR_NOT_ATTRIBUTABLE_WASTE_TYPES = frozenset(
         "ecs_no_autoscaling",
     }
 )
+
+
+#: CLO-746: waste types whose cost AWS bills account-wide, so the CUR holds no
+#: row under the finding's resource id. Only a finding that also reports
+#: running tasks qualifies (an empty cluster really bills $0). Deliberately
+#: not matched against the ``/aws/ecs/containerinsights/<cluster>/performance``
+#: log group: the detector prices metrics, and a log-ingest bill would cap it
+#: far too low. Matched on the value, like ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
+CUR_ACCOUNT_WIDE_WASTE_TYPES = frozenset({"ecs_container_insights_waste"})
 
 
 class CostBasis:
@@ -1165,12 +1185,14 @@ def reconcile_savings(
     waste_type=None,
     member_ids: Optional[Sequence[str]] = None,
     resource_created_at=None,
+    running_tasks=None,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
 
     ``secretsmanager_secret``, ``resource_type``, ``region``, ``lb_type``,
     ``cur_resource_id``, ``member_ids``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
     with ``resource_type``: see ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
+    ``running_tasks`` with ``waste_type``: see ``CUR_ACCOUNT_WIDE_WASTE_TYPES``.
     ``resource_created_at`` (ISO string or datetime, from the detector's
     ``metadata["resource_created_at"]``): see :func:`_not_yet_billed`.
 
@@ -1183,6 +1205,10 @@ def reconcile_savings(
     3. A finding the CUR cannot attribute (an ECS service, billed by task) →
        labelled, *not* zeroed (CLO-740). Decided before any match: a row that
        happens to share its name is not its bill.
+    3a. Container Insights on a cluster that is running tasks (CLO-746) →
+       labelled, *not* zeroed. Its metric charges are billed account-wide
+       with no per-cluster resource id, so a miss is not "not billed". An
+       empty cluster skips this and takes the ordinary path below.
     4. The finding's name matched several CUR resources and none uniquely →
        labelled, *not* zeroed (CLO-739). We cannot tell which bill is its,
        so we cannot claim it has none.
@@ -1221,6 +1247,23 @@ def reconcile_savings(
             monthly_savings=estimated_savings,
             reconciliation_status=(
                 ReconciliationStatus.UNRECONCILED_NOT_ATTRIBUTABLE
+            ),
+        )
+
+    # CLO-746: Container Insights is billed as account-wide CloudWatch metrics,
+    # so a cluster that is running tasks has no row of its own. Decided before
+    # any match, like CLO-740. An empty cluster takes the ordinary path.
+    if (
+        _resource_type_key(waste_type) in CUR_ACCOUNT_WIDE_WASTE_TYPES
+        and estimated_savings > 0
+        and isinstance(running_tasks, (int, float))
+        and not isinstance(running_tasks, bool)
+        and running_tasks > 0
+    ):
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=(
+                ReconciliationStatus.UNRECONCILED_BILLED_ACCOUNT_WIDE
             ),
         )
 

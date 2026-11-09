@@ -352,6 +352,9 @@ GLOBAL_DETECTORS_KEEPING_REGION: Set[str] = {'cloudwatch_dashboard'}
 # credentials belong to. A scan on another account's role (an Organizations member
 # on its payer's role) would show that account's commitments and could bill it for
 # a refresh, so its callers pass these as ``skip_detectors``.
+# CLO-773: the hosted scan no longer skips them for such a row; it refuses the
+# whole scan (waste_detection_processor list_regions and the region scanner), so
+# no hosted caller passes them today. Kept for a caller that needs the skip.
 COMMITMENT_CACHE_DETECTORS = frozenset({'savings_opportunities', 'commitment'})
 
 
@@ -866,6 +869,11 @@ class WasteDetectionServiceBase:
             # and the detectors can't send a billed request.
             if skip_detectors:
                 active_detector_keys = [k for k in active_detector_keys if k not in skip_detectors]
+
+            # CLO-880: the weekly RI/SP refresh bills two Savings Plans usage requests
+            # to the customer that only the commitment detector reads. Say whether this
+            # scan routes it, so a tier that skips it (Free) doesn't pay for them.
+            creds['commitment_routed'] = 'commitment' in active_detector_keys
 
             self._emit_skip_metrics(
                 skipped_by_cur=skipped_by_cur,
@@ -1622,6 +1630,14 @@ class WasteDetectionServiceBase:
                         if isinstance(item.metadata, dict)
                         else None
                     ),
+                    # CLO-746: Container Insights bills account-wide
+                    # CloudWatch metrics; only a cluster running tasks
+                    # keeps its estimate (an empty one bills $0).
+                    running_tasks=(
+                        item.metadata.get("total_running_tasks")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
                 )
 
             item.estimated_savings_list_price = estimate
@@ -1905,6 +1921,9 @@ class WasteDetectionServiceBase:
                     session_token=creds.get('session_token'),
                     account_id=creds.get('account_id'),
                 )
+                # CLO-880: set only on the provider this scan built; absent means routed.
+                if creds.get('commitment_routed') is False:
+                    data_provider._commitment_routed = False
             
             async with self._get_api_semaphore():
                 async def run_with_circuit():

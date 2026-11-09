@@ -4,6 +4,11 @@ Four tools, all read-only: ``scan`` runs the same engine and read-only guard
 as ``cloudcostwise scan``; the other three read the last scan held in this
 process. Nothing here can change an AWS resource: ``fix_guidance`` returns
 text and never executes it.
+
+Three resources and three prompts sit over the same data (CLO-840). The
+resources are read-only views of the last scan held in this process: reading
+one never starts a scan and never makes an AWS call (Cost Explorer is billed).
+The prompts are text for the user's assistant and never ask it to change AWS.
 """
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ from __future__ import annotations
 import asyncio
 
 from dataclasses import dataclass, field
+import json
+import logging
 from typing import Callable, Dict, Optional
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -44,6 +51,13 @@ INSTRUCTIONS = (
 )
 
 
+RESOURCE_LATEST = "cloudcostwise://scan/latest"
+RESOURCE_SUMMARY = "cloudcostwise://scan/latest/summary"
+RESOURCE_CHECKS = "cloudcostwise://checks"
+NO_SCAN_YET = ("No scan yet in this session. Call the scan tool first; this resource only shows the last "
+               "scan and never starts one.")
+
+
 @dataclass
 class _Session:
     report: Optional[ScanReport] = None
@@ -60,6 +74,56 @@ class _Session:
 
 def _money(x) -> str:
     return f"${float(x or 0):,.2f}"
+
+
+_log = logging.getLogger(__name__)
+
+
+async def _notify_scan_changed(ctx) -> None:
+    """Tell a client its cached resources are stale (CLO-840).
+
+    The context methods reach only ``subscriptions/listen`` subscribers (2026-07-28
+    protocol); the session methods are the legacy path for earlier clients. Each runs
+    alone so one failing never loses the scan result or the others.
+    """
+    steps = [
+        ("context list_changed", lambda: ctx.notify_resources_changed()),
+        ("legacy list_changed", lambda: ctx.session.send_resource_list_changed()),
+    ]
+    for uri in (RESOURCE_LATEST, RESOURCE_SUMMARY):
+        steps.append((f"context updated {uri}", lambda u=uri: ctx.notify_resource_updated(u)))
+        steps.append((f"legacy updated {uri}", lambda u=uri: ctx.session.send_resource_updated(u)))
+    for label, step in steps:
+        try:
+            await step()
+        except Exception as e:
+            _log.debug("notification %s not sent: %s", label, e)
+
+
+def _summary_text(report: ScanReport) -> str:
+    """The one-screen text summary of a scan, from the same render helpers the scan tool uses."""
+    lines = [*render.score_card(report, markdown=True), "",
+             f"Account {report.account_id}, regions {', '.join(report.regions)}: "
+             f"{len(report.findings)} findings, estimated savings "
+             f"{_money(render.counted_total(report))}/month (advisory findings excluded)."]
+    for g in render.groups(report):
+        tag = " (advisory, not counted)" if g.advisory else ""
+        lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
+    lines += render.scope_notes(report)
+    return "\n".join(lines)
+
+
+def _checks_text() -> str:
+    """The free checks and the waste types each can report, read from the shipped detector modules."""
+    out = ["# cloudcostwise checks", "",
+           "Each check below is a service entrypoint of the scan engine, with the waste types it can "
+           "report and each type's validation state from the ledger.", ""]
+    for entrypoint, types in sorted(render._entrypoint_types().items()):
+        out.append(f"## {entrypoint}")
+        for t in sorted(types):
+            out.append(f"- {t}: {render.validation_for(t) or 'unknown'}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
 
 
 def build_server(full: bool = False, upsell: bool = True, share: bool = False, name: str = "cloudcostwise",
@@ -129,6 +193,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             report = transform(report)
         session.report = report
         session.by_id = {str(i.id): i for i in report.findings}
+        await _notify_scan_changed(ctx)
         if share_enabled:
             share_mod.share_from_settings_mcp(report)
         lines = [*render.score_card(report, markdown=True), "",
@@ -149,8 +214,10 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             lines.append(note)
         if refusal:
             lines.append(refusal)
-        if report.warnings:
-            lines.append(f"{len(report.warnings)} data warning(s): those findings are MISSING, not zero.")
+        for note in render.withheld_notes(report):
+            lines.append(f"Left out on purpose: {note}")
+        if render.data_warnings(report):
+            lines.append(f"{len(render.data_warnings(report))} data warning(s): those findings are MISSING, not zero.")
         if report.permission_errors:
             lines.append(f"{len(report.permission_errors)} check(s) were denied access by these credentials: "
                          "their findings are MISSING, not zero.")
@@ -218,6 +285,56 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
         if session.upsell:
             out += ["", f"Safe, approved fixes with rollback are part of the hosted product: {render.HOSTED_URL}"]
         return "\n".join(out) + session.footer_once()
+
+    @server.resource(RESOURCE_LATEST, name="scan-latest", mime_type="application/json",
+                     description="The last scan's findings as JSON, held in this process. Read-only: never "
+                                 "starts a scan or calls AWS.")
+    def scan_latest() -> str:
+        if session.report is None:
+            return json.dumps({"status": "no_scan_yet", "message": NO_SCAN_YET})
+        return render.as_json(session.report)
+
+    @server.resource(RESOURCE_SUMMARY, name="scan-latest-summary", mime_type="text/plain",
+                     description="The one-screen text summary of the last scan. Read-only: never starts a "
+                                 "scan or calls AWS.")
+    def scan_latest_summary() -> str:
+        if session.report is None:
+            return NO_SCAN_YET
+        return _summary_text(session.report)
+
+    @server.resource(RESOURCE_CHECKS, name="checks", mime_type="text/markdown",
+                     description="The free checks and the waste types each can report, read from the shipped "
+                                 "detector code.")
+    def checks() -> str:
+        return _checks_text()
+
+    @server.prompt(name="scan-account", title="Scan my AWS account",
+                   description="Scan the account for waste, then list and summarise the findings.")
+    def scan_account(profile: str = "", regions: str = "") -> str:
+        given = (f"profile {profile}" if profile else "no profile") + ", " + \
+                (f"regions {regions}" if regions else "no regions")
+        return (f"Scan the user's AWS account for waste. Given: {given}. If either is missing, ask the user "
+                "which AWS profile and regions to use. Tell the user that the scan tool's Cost Explorer "
+                "checks are billed by AWS per request and can be skipped with include_cost_explorer=false, "
+                "and wait for their answer. Then run the scan tool, then list_findings, then summarise the "
+                "findings by waste type with the estimated monthly saving. This is read-only: do not change "
+                "anything in AWS.")
+
+    @server.prompt(name="explain-finding", title="Explain a finding",
+                   description="Explain one finding from the last scan.")
+    def explain_finding_prompt(finding_id: str) -> str:
+        return (f"Call explain_finding with finding_id {finding_id!r} and explain the result in plain "
+                "language: what was detected, why it is waste, and the risk of acting. If there is no such "
+                "finding, call list_findings and ask which one the user means. Do not change anything in "
+                "AWS.")
+
+    @server.prompt(name="fix-guidance", title="Fix guidance for a finding",
+                   description="Present the fix guidance for one finding, read-only caveat first.")
+    def fix_guidance_prompt(finding_id: str) -> str:
+        return (f"Call fix_guidance with finding_id {finding_id!r}. Begin by saying that cloudcostwise is "
+                "read-only and only returns text: you will not run any command, and the user reviews and "
+                "runs it themselves. Then present the recommended action, the command and the risk as "
+                "returned.")
 
     if register is not None:
         register(server, lambda: session.report)

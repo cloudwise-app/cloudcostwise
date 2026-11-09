@@ -113,6 +113,9 @@ PROVISIONED_CONCURRENCY_WINDOW_DAYS = 14
 LIGHTSAIL_METRIC_WINDOW_DAYS = 14
 # oversized_workspace: the window get_workspaces_metrics reads by default.
 WORKSPACES_METRIC_WINDOW_DAYS = 14
+# workspaces_pool_overprovisioned_capacity (CLO-918): the window over which
+# get_workspaces_pool_peak_sessions reads a pool's peak active sessions.
+WORKSPACES_POOL_PEAK_WINDOW_DAYS = 14
 
 
 class WasteDataProvider(ABC):
@@ -1340,6 +1343,24 @@ class WasteDataProvider(ABC):
         days: int = WORKSPACES_METRIC_WINDOW_DAYS,
     ) -> Dict[str, WorkspaceMetricsData]:
         """Get CloudWatch metrics for WorkSpaces."""
+        pass
+
+    @abstractmethod
+    async def get_workspaces_pool_peak_sessions(
+        self,
+        pool_ids: List[str],
+        days: int = WORKSPACES_POOL_PEAK_WINDOW_DAYS,
+    ) -> Optional[Dict[str, float]]:
+        """CLO-918: each pool's peak active sessions over ``days`` (the
+        highest hourly Maximum of CloudWatch ActiveUserSessionCapacity).
+
+        Returns a map pool_id -> peak holding only the pools whose peak is
+        known; a pool left out is MISSING (no data, too little of the
+        window, a failed or denied read) and must not be judged. ``None``
+        means this provider has no windowed read at all (the Air-Gapped
+        export does not capture the metric). The detector keeps the
+        export's snapshot only for an offline provider; an online provider
+        with no peak judges nothing."""
         pass
 
     # =========================================================================
