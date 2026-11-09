@@ -25,6 +25,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="replace the account ID and the resource IDs, names and ARNs it recognizes with stable "
                         "placeholders (account-1, resource-1, ...); works with every --format. Anonymizing is "
                         "not complete: review the report before you send it")
+    s.add_argument("--no-exclude", action="store_true",
+                   help="ignore your exclude list (cloudcostwise exclude list) for this run and show every finding")
     s.add_argument("--no-cost-explorer", action="store_true",
                    help="make no Cost Explorer call ($0.01 per request): skips the RI/Savings Plans checks")
     s.add_argument("--parallel", type=int, default=4, metavar="N",
@@ -36,6 +38,18 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--off", action="store_true", help="never share, never ask")
     g.add_argument("--status", action="store_true", help="show the current setting (default)")
     g.add_argument("--reset", action="store_true", help="forget the answer; ask once more in an interactive terminal")
+    ex = sub.add_parser("exclude", help="keep resources out of every scan: a local list that is never sent to CloudWise",
+                        description="A local exclude list (~/.config/cloudcostwise/exclude.json). Every scan leaves out "
+                                    "findings for the resources on it and says how many; `scan --no-exclude` ignores "
+                                    "it for one run. A resource ID and a full ARN match each other. The list is "
+                                    "never sent to CloudWise.")
+    exs = ex.add_subparsers(dest="exclude_action", required=True)
+    ea = exs.add_parser("add", help="leave a resource out of future scans")
+    ea.add_argument("resource_id", metavar="RESOURCE_ID_OR_ARN", help="a resource ID or a full ARN; either form matches both")
+    ea.add_argument("--reason", help="a note to yourself, shown by `exclude list`")
+    exs.add_parser("list", help="show the excluded resources")
+    er = exs.add_parser("remove", help="bring a resource back into scans")
+    er.add_argument("resource_id", metavar="RESOURCE_ID_OR_ARN")
     sub.add_parser("mcp", help="run as an MCP server (stdio) for Claude Code, Codex and other assistants")
     return p
 
@@ -50,6 +64,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         from cloudcostwise import share
 
         return share.command(args)
+
+    if args.command == "exclude":
+        from cloudcostwise import exclude
+
+        return exclude.command(args)
 
     if args.command == "mcp":
         from cloudcostwise.mcp_server import serve
@@ -112,7 +131,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cloudcostwise: stopped, {e}. Please report this: it is a bug.", file=sys.stderr)
         return 3
 
-    # CLO-929: the printed report only. The share offer below keeps the original report.
+    # CLO-931: the exclude list is read from disk now, before anything is shown, totalled or shared.
+    # The share offer below gets this reduced report too: it counts what the user saw.
+    # --anonymize still learns the excluded IDs (to scrub them from warnings) but prints none.
+    if not args.no_exclude:
+        from cloudcostwise import exclude
+
+        report = exclude.apply(report)
+
+    # CLO-929: --anonymize changes the printed report only. The share offer below keeps the un-anonymized
+    # report (it reads four numbers off it and never an identifier).
     shown = report
     if args.anonymize:
         from cloudcostwise.anonymize import anonymize_report
@@ -121,14 +149,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.format == "json":
         print(render.as_json(shown))
     elif args.format == "markdown":
-        print(render.as_markdown(shown, emoji=sys.stdout.isatty()))
+        print(render.as_markdown(shown, emoji=sys.stdout.isatty(), verbose=args.verbose))
     else:
         print(render.as_table(shown, verbose=args.verbose, emoji=sys.stdout.isatty()))
     # CLO-824: after the results are out. Asks only a human at a terminal, or sends only on a
     # setting a human wrote; never raises, never fails the scan.
     from cloudcostwise import share
 
-    share.offer(report)
+    share.offer(report)  # CLO-931: what the user saw (excluded findings are not counted)
     return 0
 
 

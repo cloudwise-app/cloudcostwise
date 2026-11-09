@@ -100,6 +100,17 @@ def data_warnings(report: ScanReport) -> List[str]:
     return [w for w in report.warnings if not _is_withheld_note(w)]
 
 
+def left_out_lines(report: ScanReport, verbose: bool = False) -> List[str]:
+    """Everything under "Left out on purpose": the exclude-list count (with the IDs when ``verbose``;
+    --anonymize empties that list), then the withheld notes."""
+    from cloudcostwise import exclude
+
+    note = exclude.note(report)
+    ids = list(report.excluded_resource_ids) if verbose else []
+    return [*([note] if note else []), *([f"excluded: {', '.join(ids)}"] if note and ids else []),
+            *withheld_notes(report)]
+
+
 def scope_notes(report: ScanReport) -> List[str]:
     return [CE_SKIPPED_NOTE] if report.cost_explorer_skipped else []
 
@@ -223,7 +234,7 @@ def as_table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> 
     adv = advisory_total(report)
     if adv:
         lines.append(f"Advisory (unvalidated, excluded): {_money(adv)}/month")
-    withheld = withheld_notes(report)
+    withheld = left_out_lines(report, verbose)
     if withheld:
         lines += ["", "Left out on purpose:"]
         lines += [f"  - {w}" for w in withheld]
@@ -242,7 +253,7 @@ def as_table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> 
     return "\n".join(lines)
 
 
-def as_markdown(report: ScanReport, emoji: bool = False) -> str:
+def as_markdown(report: ScanReport, emoji: bool = False, verbose: bool = False) -> str:
     out = [f"# AWS waste, account {report.account_id}", "",
            f"Regions: {', '.join(report.regions)}", "",
            "| Waste type | Region | Resource | Monthly |", "|---|---|---|---:|"]
@@ -250,7 +261,7 @@ def as_markdown(report: ScanReport, emoji: bool = False) -> str:
         name = f"{g.waste_type} (advisory)" if g.advisory else g.waste_type
         for i in g.items:
             out.append(f"| {name} | {i.region or '-'} | `{i.resource_id}` | {_money(float(i.monthly_savings or 0))} |")
-    withheld = withheld_notes(report)
+    withheld = left_out_lines(report, verbose)
     if withheld:
         out += ["", "**Left out on purpose:**", "", *[f"- {w}" for w in withheld]]
     out += ["", f"**Estimated savings: {_money(counted_total(report))}/month** (advisory excluded)",
@@ -269,6 +280,9 @@ def as_json(report: ScanReport) -> str:
         "regions": report.regions,
         "estimated_monthly_savings": counted_total(report),
         "advisory_monthly_savings_excluded": advisory_total(report),
+        # CLO-931: findings your exclude list left out (not in the total above); the ids are empty under --anonymize
+        "excluded_by_list_count": int(report.excluded_count or 0),
+        "excluded_by_list_resource_ids": list(report.excluded_resource_ids),
         "findings": [
             {
                 "waste_type": waste_type_name(i),

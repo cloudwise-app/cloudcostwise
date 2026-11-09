@@ -110,6 +110,17 @@ def anonymize_report(report: ScanReport) -> ScanReport:
         literals[rid.lower()] = placeholder
         for name in _id_names(item):
             literals.setdefault(name.lower(), placeholder)
+    # CLO-931: resources the exclude list hid are still known identifiers, so a warning that names one
+    # is scrubbed. They are numbered after the shown ones, and their own list is cleared below.
+    hidden = [str(r) for r in (getattr(report, "excluded_resource_ids", None) or []) if r]
+    for rid in hidden:
+        tail = re.split(r"[/:]", rid)[-1]
+        placeholder = ph.get("resource", tail if tail.lower() in all_ids else rid)
+        literals.setdefault(rid.lower(), placeholder)
+        names = [seg for seg in re.split(r"[/:]", rid) if len(seg) >= MIN_DERIVED_NAME and
+                 (seg == tail or re.search(r"[-_.\d]", seg))]
+        for name in names:
+            literals.setdefault(name.lower(), placeholder)
     # Names the scan recorded that are not part of the ID (a Name tag, a DB identifier) get a placeholder
     # of their own, so two resources sharing one name never read as one resource.
     for item in ordered:
@@ -169,6 +180,7 @@ def anonymize_report(report: ScanReport) -> ScanReport:
     out = copy.copy(report)
     out.account_id = scrub(report.account_id)
     out.findings = findings
+    out.excluded_resource_ids = []  # CLO-931: the count stays, the IDs of what was left out never print
     for attr in ("warnings", "errors", "coverage_notes"):
         setattr(out, attr, [scrub(s) for s in getattr(report, attr)])
     out.permission_errors = [scrub_permission_error(s) for s in report.permission_errors]

@@ -24,6 +24,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from cloudcostwise import __version__, render
+from cloudcostwise import exclude as exclude_mod
 from cloudcostwise import share as share_mod
 from cloudcostwise.runtime import (
     COST_EXPLORER_PRICE_PER_REQUEST,
@@ -110,6 +111,7 @@ def _summary_text(report: ScanReport) -> str:
         tag = " (advisory, not counted)" if g.advisory else ""
         lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
     lines += render.scope_notes(report)
+    lines += [f"Left out on purpose: {n}" for n in render.left_out_lines(report)]
     return "\n".join(lines)
 
 
@@ -131,7 +133,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                  register: Optional[Callable[[MCPServer, Callable[[], Optional[ScanReport]]], None]] = None,
                  transform: Optional[Callable[[ScanReport], ScanReport]] = None,
                  gate: Optional[Callable[[object], Optional[str]]] = None,
-                 spend: bool = True,
+                 spend: bool = True, exclude: bool = True,
                  ) -> MCPServer:
     """The MCP server. The defaults are the free tool.
 
@@ -143,7 +145,8 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
     ``transform`` rewrites each scan before any tool shows it. ``gate(creds)``
     runs after the account is resolved and before any check: it returns None to
     allow the ``full`` checks, or a message that makes this scan run the free
-    checks only (the partner build's single-account licence).
+    checks only (the partner build's single-account licence). ``exclude=False`` ignores the user's
+    personal exclude list (CLO-931; the partner build, like its CLI, never applies it).
     """
     configure_local_runtime()
     session = _Session(upsell=upsell)
@@ -189,6 +192,8 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             return f"Scan stopped: {e}. This is a bug in cloudcostwise; nothing was changed in AWS."
         if refusal:
             report.warnings.append(refusal)
+        if exclude:
+            report = exclude_mod.apply(report)  # CLO-931: the same local list the CLI reads, from disk each scan
         if transform is not None:
             report = transform(report)
         session.report = report
@@ -214,7 +219,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             lines.append(note)
         if refusal:
             lines.append(refusal)
-        for note in render.withheld_notes(report):
+        for note in render.left_out_lines(report):
             lines.append(f"Left out on purpose: {note}")
         if render.data_warnings(report):
             lines.append(f"{len(render.data_warnings(report))} data warning(s): those findings are MISSING, not zero.")

@@ -53,6 +53,9 @@ class ScanReport:
     # not available, the score then falls back to dollars alone) and wall seconds.
     spend_monthly: Optional[float] = None
     seconds: float = 0.0
+    # CLO-931: findings the user's local exclude list left out (set by exclude.apply, not by a scan).
+    excluded_count: int = 0
+    excluded_resource_ids: List[str] = field(default_factory=list)
 
 
 def spend_window(today: Optional[_dt.date] = None):

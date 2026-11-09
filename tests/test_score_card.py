@@ -85,7 +85,8 @@ def test_table_and_markdown_gain_the_card_and_json_gains_two_keys():
     assert "**Cost health score:" in render.as_markdown(r)
     data = json.loads(render.as_json(r))
     assert data["score"] == render.score_for(r).value and data["score_basis"] == "no_spend"
-    without = {k: v for k, v in data.items() if k not in ("score", "score_basis")}
+    without = {k: v for k, v in data.items() if k not in ("score", "score_basis", "excluded_by_list_count",
+                                                            "excluded_by_list_resource_ids")}  # CLO-931 keys
     assert "findings" in without and len(without) == 14
 
 
