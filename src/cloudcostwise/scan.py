@@ -223,8 +223,8 @@ async def run_scan_async(
     ``on_region`` is called as each region finishes (progress). The report
     lists regions and findings in the order requested, whatever order they
     finished in. ``full`` runs all 46 service checks (partner build only).
-    ``with_spend`` adds one Cost Explorer request for the score's spend (CLI and
-    MCP server only; every other caller makes exactly the requests it did before).
+    ``with_spend`` adds one Cost Explorer request for the score's spend (CLI, MCP
+    server and partner build only; every other caller makes exactly the requests it did before).
     """
     import concurrent.futures
     import logging

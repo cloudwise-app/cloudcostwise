@@ -428,11 +428,26 @@ class ComputeOptimizerDetectorsMixin:
                     if not options:
                         continue
                     
-                    best_option = options[0]
+                    # CLO-587: lowest rank, not options[0].
+                    best_option = _best_recommendation_option(options)
                     new_config = best_option.get('configuration', {})
                     recommended_type = new_config.get('volumeType', current_type)
                     recommended_size = new_config.get('volumeSize', current_size)
-                    
+                    # CLO-959: botocore VolumeConfiguration members
+                    # volumeBaselineIOPS / volumeBaselineThroughput (integers,
+                    # throughput in MiB/s). Absent on some volume types.
+                    current_iops = current_config.get('volumeBaselineIOPS')
+                    current_tput = current_config.get('volumeBaselineThroughput')
+                    recommended_iops = new_config.get('volumeBaselineIOPS', current_iops if recommended_type == current_type else None)
+                    recommended_tput = new_config.get('volumeBaselineThroughput', current_tput if recommended_type == current_type else None)
+                    current_label = _ebs_config_label(current_type, current_size, current_iops, current_tput)
+                    recommended_label = _ebs_config_label(recommended_type, recommended_size, recommended_iops, recommended_tput)
+                    changes = _ebs_changes(
+                        current_type, current_size, current_iops, current_tput,
+                        recommended_type, recommended_size, recommended_iops, recommended_tput,
+                    )
+                    readable = bool(changes)
+
                     savings_opportunity = best_option.get('savingsOpportunity', {})
                     estimated_savings = savings_opportunity.get('estimatedMonthlySavings', {})
                     monthly_savings = float(estimated_savings.get('value', 0))
@@ -440,23 +455,53 @@ class ComputeOptimizerDetectorsMixin:
                     if monthly_savings < MIN_SAVINGS_THRESHOLD:
                         continue
                     
+                    if readable:
+                        change_text = _ebs_change_sentence(changes)
+                        description = (
+                            f"Volume {volume_id} ({current_label}) can be optimized to "
+                            f"{recommended_label}: {change_text}. AWS Compute Optimizer analysis."
+                        )
+                        action_command, action, needs_review = _ebs_modify_plan(
+                            volume_id, current_type, current_size, current_iops, current_tput,
+                            recommended_type, recommended_size, recommended_iops, recommended_tput,
+                        )
+                        detection = (
+                            f"AWS Compute Optimizer recommends changing from {current_label} "
+                            f"to {recommended_label} ({change_text})."
+                        )
+                    else:
+                        action_command = None
+                        needs_review = True
+                        description = (
+                            f"Volume {volume_id} ({current_label}): Compute Optimizer recommends a "
+                            f"change we could not read (type, size, IOPS and throughput look the same). "
+                            f"AWS Compute Optimizer analysis."
+                        )
+                        action = (
+                            f"Open the recommendation for {volume_id} in the Compute Optimizer console "
+                            f"to see the exact change before modifying the volume."
+                        )
+                        detection = (
+                            f"AWS Compute Optimizer flagged {volume_id} ({current_label}) with a "
+                            f"${monthly_savings:.0f}/month saving but the recommended option shows no "
+                            f"readable difference."
+                        )
+
                     waste_items.append(WasteItem(
                         id=generate_deterministic_id(volume_id, 'oversized_ebs', data_provider.region),
                         resource_id=volume_id,
                         resource_type=ResourceType.EBS_VOLUME,
                         waste_type=WasteType.OVERSIZED_EBS_OPTIMIZER,
                         title=f"Oversized EBS Volume (Compute Optimizer)",
-                        description=(
-                            f"Volume {volume_id} ({current_type}, {current_size}GB) can be optimized "
-                            f"to {recommended_type}, {recommended_size}GB. AWS Compute Optimizer analysis."
-                        ),
+                        description=description,
                         monthly_savings=monthly_savings,
-                        confidence=ConfidenceLevel.HIGH,
-                        action=f"Modify volume to {recommended_type} with {recommended_size}GB.",
+                        confidence=ConfidenceLevel.MEDIUM if needs_review else ConfidenceLevel.HIGH,
+                        action=action,
+                        action_command=action_command,
                         explanation={
-                            'detection': f"AWS Compute Optimizer recommends changing from {current_type} ({current_size}GB) to {recommended_type} ({recommended_size}GB).",
+                            'detection': detection,
                             'threshold': 'Compute Optimizer flags EBS volumes as NotOptimized when IOPS/throughput usage is consistently below the volume type\'s capacity.',
-                            'pricing': f'Optimization saves ~${monthly_savings:.0f}/month by right-sizing volume type and capacity.',
+                            'pricing': f'Optimization saves ~${monthly_savings:.0f}/month by right-sizing volume type, capacity, IOPS and throughput.',
                             'why_waste': 'An over-provisioned EBS volume pays for IOPS and throughput it does not use.',
                             'risk': 'EBS modify is online and non-disruptive for most changes. Monitor IOPS after modification.',
                         },
@@ -464,8 +509,14 @@ class ComputeOptimizerDetectorsMixin:
                             'volume_id': volume_id,
                             'current_type': current_type,
                             'current_size_gb': current_size,
+                            'current_iops': current_iops,
+                            'current_throughput_mibps': current_tput,
                             'recommended_type': recommended_type,
                             'recommended_size_gb': recommended_size,
+                            'recommended_iops': recommended_iops,
+                            'recommended_throughput_mibps': recommended_tput,
+                            'changes': changes,
+                            'change_readable': readable,
                             'source': 'aws_compute_optimizer',
                             'detection_mode': data_provider.provider_type,
                         }
@@ -731,3 +782,79 @@ class ComputeOptimizerDetectorsMixin:
             logger.warning(f"Error getting RDS Compute Optimizer recommendations: {e}")
 
         return waste_items
+
+
+# CLO-959: EBS change helpers live at the end of the module so the offline-gate
+# line pins in tests/test_online_only_catalog.py do not move.
+def _ebs_config_label(vtype, size, iops, tput) -> str:
+    """CLO-959: 'gp3, 8GB, 4,000 IOPS, 250 MiB/s' (IOPS/throughput only when known)."""
+    parts = [f"{vtype}", f"{size}GB"]
+    if iops is not None:
+        parts.append(f"{iops:,} IOPS")
+    if tput is not None:
+        parts.append(f"{tput:,} MiB/s")
+    return ", ".join(parts)
+
+
+def _ebs_changes(c_type, c_size, c_iops, c_tput, r_type, r_size, r_iops, r_tput) -> Dict[str, Any]:
+    """CLO-959: the fields that differ, as {name: [current, recommended]}.
+
+    A recommended IOPS/throughput that is unknown (None) is not a change we can
+    state, so it is left out; _ebs_modify_plan adds the gp3-default note."""
+    pairs = {
+        'volume_type': (c_type, r_type),
+        'size_gb': (c_size, r_size),
+        'iops': (c_iops, r_iops),
+        'throughput_mibps': (c_tput, r_tput),
+    }
+    return {k: list(v) for k, v in pairs.items() if v[0] != v[1] and v[1] is not None}
+
+
+def _ebs_change_sentence(changes: Dict[str, Any]) -> str:
+    names = {'volume_type': 'type', 'size_gb': 'size (GB)', 'iops': 'IOPS', 'throughput_mibps': 'throughput (MiB/s)'}
+    return "changes " + ", ".join(
+        f"{names[k]} {cur if cur is not None else 'unknown'} -> {rec}"
+        for k, (cur, rec) in changes.items()
+    )
+
+
+def _ebs_modify_plan(volume_id, c_type, c_size, c_iops, c_tput, r_type, r_size, r_iops, r_tput):
+    """CLO-959: (command, prose, needs_review) for the recommended change.
+
+    EBS cannot shrink a volume in place, so ``--size`` is only emitted for a
+    grow; a smaller size needs a new volume and a data copy. ``--iops`` and
+    ``--throughput`` are emitted when they differ or the type changes (AWS resets
+    them to defaults on a type change)."""
+    flags = [f"--volume-id {volume_id}"]
+    notes = []
+    needs_review = False
+    if r_type != c_type:
+        flags.append(f"--volume-type {r_type}")
+    if isinstance(r_size, int) and isinstance(c_size, int) and r_size != c_size:
+        if r_size > c_size:
+            flags.append(f"--size {r_size}")
+        else:
+            needs_review = True
+            notes.append(
+                f"A smaller size ({r_size}GB from {c_size}GB) cannot be done with modify-volume: "
+                f"snapshot the volume, create a smaller volume, and copy the data across."
+            )
+    if r_iops is not None and r_type in ('gp3', 'io1', 'io2') and (r_type != c_type or r_iops != c_iops):
+        flags.append(f"--iops {r_iops}")
+    if r_tput is not None and r_type == 'gp3' and (r_type != c_type or r_tput != c_tput):
+        flags.append(f"--throughput {r_tput}")
+    if r_type != c_type and r_type == 'gp3' and (r_iops is None or r_tput is None):
+        needs_review = True
+        missing = []
+        if r_iops is None:
+            missing.append("3,000 IOPS")
+        if r_tput is None:
+            missing.append("125 MiB/s")
+        notes.append(
+            f"AWS will default the gp3 volume to {' and '.join(missing)}; check that meets the load."
+        )
+    command = f"aws ec2 modify-volume {' '.join(flags)}"
+    prose = f"Modify the volume: {command}." if len(flags) > 1 else "Review the recommendation for this volume."
+    if notes:
+        prose += " " + " ".join(notes)
+    return (command if len(flags) > 1 else None), prose, needs_review

@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://cloudcostwise.io/cli",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "cloudcostwise",
-      "version": "0.1.21",
+      "version": "0.1.22",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "packageArguments": [

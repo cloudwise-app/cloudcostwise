@@ -10476,6 +10476,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                                 resource="Beanstalk Configurations", permission='ec2:DescribeSubnets', error=e,
                             )
                             self._warn_access_denied("Beanstalk Configurations", 'ec2:DescribeSubnets', e)
+                    elif denied in ('ec2:DescribeAccountAttributes', 'ec2:DescribeAvailabilityZones'):
+                        # CLO-833: template 1.37.0 grants both. Named literally for
+                        # the template floor test's AST pin; deduped like the above.
+                        key = ('beanstalk-permission', denied)
+                        if key not in self._warned_swallowed:
+                            self._warned_swallowed.add(key)
+                            self._record_permission_error(
+                                resource="Beanstalk Configurations",
+                                permission=('ec2:DescribeAccountAttributes'
+                                            if denied == 'ec2:DescribeAccountAttributes'
+                                            else 'ec2:DescribeAvailabilityZones'),
+                                error=e,
+                            )
+                            self._warn_access_denied("Beanstalk Configurations", denied, e)
                     elif denied:
                         self._record_beanstalk_denial_once(denied, e)
         except ClientError as e:
