@@ -1802,8 +1802,15 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             enc_rules = enc_config.get('Rules', []) if isinstance(enc_config, dict) else []
             default_encryption_enabled = True  # AWS default since Jan 2023
             encryption_algorithm = None
+            bucket_key_enabled: Optional[bool] = None
             if enc_rules:
                 encryption_algorithm = enc_rules[0].get('ApplyServerSideEncryptionByDefault', {}).get('SSEAlgorithm')
+                # CLO-993: the export keeps get-bucket-encryption whole, so
+                # the rule's own BucketKeyEnabled (a sibling of
+                # ApplyServerSideEncryptionByDefault) is there.
+                flag = enc_rules[0].get('BucketKeyEnabled')
+                if isinstance(flag, bool):
+                    bucket_key_enabled = flag
             elif bucket.get('default_encryption_enabled') is False:
                 default_encryption_enabled = False
             
@@ -1831,6 +1838,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 size_growth_pct_30d=growth_pct,
                 default_encryption_enabled=default_encryption_enabled,
                 encryption_algorithm=encryption_algorithm,
+                bucket_key_enabled=bucket_key_enabled,
                 contents_observed=contents_observed,
                 # CLO-555: absent (None) on an export older than 1.25.0;
                 # the detector falls back to matching the bucket name itself.

@@ -99,7 +99,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(skipped, file=sys.stderr)
 
     if not args.no_cost_explorer and args.format == "table":
-        print("note: the RI/Savings Plans checks call Cost Explorer, which AWS bills at "
+        print("note: the RI/Savings Plans checks (and one KMS spend read, only if an S3 bucket-key finding appears) call Cost Explorer, which AWS bills at "
               f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan). "
               "Add --no-cost-explorer to skip them.", file=sys.stderr)
 

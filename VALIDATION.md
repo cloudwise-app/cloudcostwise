@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 29 at L1, 37 at L2, 23 at L3, 2 at L4.
+Summary for the checks in this repository: 1 at L0, 28 at L1, 38 at L2, 23 at L3, 2 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -43,7 +43,7 @@ proven checks only.
 | `idle_dynamodb` | L2 |  | covered |
 | `idle_ec2` | L2 |  |  |
 | `idle_efs` | L3 |  | partial |
-| `idle_elasticache` | L1 |  |  |
+| `idle_elasticache` | L2 |  | covered |
 | `idle_lightsail` | L2 |  | none |
 | `idle_load_balancer` | L2 |  | partial |
 | `idle_nat_gateway` | L2 |  | covered |
@@ -95,6 +95,7 @@ proven checks only.
 | `ri_opportunity_redshift` | L1 | yes |  |
 | `s3_empty_bucket` | L3 |  | none |
 | `s3_high_request_and_transfer_cost` | L1 | yes |  |
+| `s3_kms_bucket_key_disabled` | L0 |  |  |
 | `s3_no_default_encryption` | L1 | yes |  |
 | `s3_rapid_growth` | L3 |  | partial |
 | `s3_wrong_storage_class` | L3 |  | partial |

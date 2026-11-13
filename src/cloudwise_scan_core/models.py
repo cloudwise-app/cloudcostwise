@@ -125,6 +125,7 @@ class WasteType(str, Enum):
     S3_WRONG_STORAGE_CLASS = "s3_wrong_storage_class"
     S3_EMPTY_BUCKET = "s3_empty_bucket"
     S3_HIGH_REQUEST_AND_TRANSFER_COST = "s3_high_request_and_transfer_cost"
+    S3_KMS_BUCKET_KEY_DISABLED = "s3_kms_bucket_key_disabled"
     
     # DynamoDB Waste Types
     IDLE_DYNAMODB = "idle_dynamodb"
@@ -401,6 +402,9 @@ GOVERNANCE_WASTE_TYPES: frozenset = frozenset({
     WasteType.INCOMPLETE_MULTIPART,         # part sizes need ListMultipartUploadParts
     WasteType.NO_LIFECYCLE_POLICY,          # $0 when s3_wrong_storage_class counts it
     WasteType.ECR_NO_LIFECYCLE_POLICY,      # $0 when old/untagged images count it
+    # CLO-993: the KMS request saving depends on the bucket's request volume,
+    # which no scan reads, so the finding reports $0 rather than a guessed figure.
+    WasteType.S3_KMS_BUCKET_KEY_DISABLED,
     WasteType.BACKUP_COPY_POLICY_OVERREACH, # which copies are unneeded is a DR call
     # CLO-771: planning alerts. CLO-505 set their saving to $0 on purpose, since
     # acting on them costs money or leaves the commitment unchanged.
@@ -612,6 +616,7 @@ WASTE_TYPE_TO_CATEGORY: Dict[str, ServiceCategory] = {
     WasteType.S3_WRONG_STORAGE_CLASS.value: ServiceCategory.STORAGE,
     WasteType.S3_EMPTY_BUCKET.value: ServiceCategory.STORAGE,
     WasteType.S3_HIGH_REQUEST_AND_TRANSFER_COST.value: ServiceCategory.STORAGE,
+    WasteType.S3_KMS_BUCKET_KEY_DISABLED.value: ServiceCategory.STORAGE,
     WasteType.IDLE_EFS.value: ServiceCategory.STORAGE,
     WasteType.NO_LIFECYCLE_EFS.value: ServiceCategory.STORAGE,
     WasteType.IDLE_FSX.value: ServiceCategory.STORAGE,

@@ -274,6 +274,7 @@ OPEN_THRESHOLDS: Mapping[str, Tuple[Threshold, ...]] = {
     "no_lifecycle_efs": (
         _t("min_size_gb", "file systems of at least", f"{_OS}.EFS_LIFECYCLE_MIN_SIZE_GB", "GB", "_detect_efs_waste"),
     ),
+    "s3_kms_bucket_key_disabled": (),  # CLO-993: binary (SSE-KMS and the bucket key not on)
     "s3_empty_bucket": (
         _t("min_age_days", "bucket created at least this long ago", f"{_OS}.S3_EMPTY_BUCKET_MIN_AGE_DAYS", "days",
            "_detect_s3_empty_bucket"),

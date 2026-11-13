@@ -331,6 +331,12 @@ class S3BucketData:
     size_growth_pct_30d: float = 0.0          # Growth percentage over 30 days
     default_encryption_enabled: Optional[bool] = True  # None = not read (CLO-580)
     encryption_algorithm: Optional[str] = None # 'AES256' (SSE-S3) or 'aws:kms'
+    # CLO-993: ServerSideEncryptionRule.BucketKeyEnabled of the same rule
+    # (Rules[0]) the algorithm comes from. It sits beside
+    # ApplyServerSideEncryptionByDefault in the rule, not inside it. None =
+    # not read, or the rule carries no BucketKeyEnabled (botocore marks the
+    # member optional); only a True means the bucket key is on.
+    bucket_key_enabled: Optional[bool] = None
     # CLO-385: Maximum NumberOfObjects over a lookback window, checked only
     # for a bucket that is currently empty AND has a lifecycle expiration
     # rule — evidence it was recently used and self-cleared by design,

@@ -8,7 +8,7 @@
 [![MCP server](https://img.shields.io/badge/MCP-Claude%20Code%20%7C%20Codex-8A2BE2)](#use-it-from-claude-code-codex-or-any-mcp-client)
 ![AWS access: read-only](https://img.shields.io/badge/AWS%20access-read--only-success)
 ![Sharing: opt-in only](https://img.shields.io/badge/sharing-opt--in%20only-success)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/LICENSE.md)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/LICENSE.md)
 
 Find AWS waste from your terminal or your AI assistant. `cloudcostwise` runs CloudWise's free waste
 checks on your own machine, with your own read-only AWS credentials.
@@ -23,14 +23,14 @@ checks on your own machine, with your own read-only AWS credentials.
   turns it off for good; `CLOUDCOSTWISE_SHARE=no` turns it off for that environment. See [Sharing a summary](#sharing-a-summary-optional).
 - **Through an AI assistant (MCP), the findings, including your account ID and resource IDs, go to that
   assistant** like any tool output.
-- **It is not quite free to run.** The RI/Savings Plans checks call Cost Explorer, which AWS bills at
-  $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> a request, about
-  $<!-- fact:costExplorer.perScanUsd -->0.09<!-- /fact --> a scan. `--no-cost-explorer` skips them.
+- **It is not quite free to run.** The RI/Savings Plans checks, and one KMS spend read when the S3 bucket-key check finds a bucket, call Cost Explorer, which AWS bills at
+  $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> a request, and a scan makes up to
+  <!-- fact:costExplorer.requestsPerScan -->10<!-- /fact --> of them. `--no-cost-explorer` skips them.
 - **It stores up to two small files:** your share answer in `~/.config/cloudcostwise/share.json` and, only if you use `cloudcostwise exclude`, your exclude list in `~/.config/cloudcostwise/exclude.json` (it never leaves your machine). No report, cache or credentials are written.
 - **Open source (Apache-2.0).** Read the code: [github.com/cloudwise-app/cloudcostwise](https://github.com/cloudwise-app/cloudcostwise).
 
 Least-privilege IAM policy (<!-- fact:iam.cliPolicyActionCount -->71<!-- /fact --> read-only actions):
-[`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/docs/iam-policy.json). See a real scan first, no credentials needed:
+[`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/docs/iam-policy.json). See a real scan first, no credentials needed:
 [cloudcostwise.io/sample-scan](https://cloudcostwise.io/sample-scan?utm_source=github&utm_medium=referral&utm_campaign=readme).
 
 - **<!-- fact:detectors.free -->20<!-- /fact --> of CloudWise's <!-- fact:detectors.total -->46<!-- /fact --> service checks**: EC2, Lambda, SageMaker, WorkSpaces,
@@ -39,7 +39,7 @@ Least-privilege IAM policy (<!-- fact:iam.cliPolicyActionCount -->71<!-- /fact -
   logs and dashboards, security posture, RI/Savings Plans opportunities, and
   Compute Optimizer.
 
-![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.22/docs/demo.svg)
+![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.23/docs/demo.svg)
 
 ## Install and run
 
@@ -60,7 +60,7 @@ Options:
 | `--format table\|markdown\|json` | Output format |
 | `--anonymize` | Replace the account ID and the resource IDs, names, ARNs and tag values it recognizes with stable placeholders (`account-1`, `resource-1`, ...; the same value always gets the same one). Waste type, region, savings, confidence, action wording, warnings and counts stay. Works with every `--format`; it runs locally and sends nothing. **Anonymizing is not complete:** it replaces the identifiers it recognizes, so review the file before you send it |
 | `--no-exclude` | Ignore your exclude list (see below) for this run and show every finding |
-| `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> per request and a scan makes about <!-- fact:costExplorer.requestsPerScan -->9<!-- /fact -->. Skips the RI/Savings Plans checks and the one request that reads your last 30 days of spend, so the score falls back to "without spend data" |
+| `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> per request and a scan makes up to about <!-- fact:costExplorer.requestsPerScan -->10<!-- /fact -->. Skips the RI/Savings Plans checks, the one KMS spend read and the one request that reads your last 30 days of spend, so the score falls back to "without spend data" |
 | `--parallel N` | Regions scanned at once, each in its own process (default <!-- fact:cli.defaultParallel -->4<!-- /fact -->; `--regions all` takes ~2–3 min instead of ~10) |
 | `--verbose` | Show data warnings (checks that could not read a metric report it as missing, never as zero) |
 
@@ -93,7 +93,7 @@ cloudcostwise scan --no-exclude                                                 
 ## What AWS's free tools don't flag
 
 <!-- aws-gap:start (generated by scripts/aws_gap.py) -->
-This tool has 54 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 12 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
+This tool has 55 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 12 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
 
 | Check | What it finds | Closest AWS check |
 |---|---|---|
@@ -207,7 +207,7 @@ Claude Code, `/mcp__cloudcostwise__fix-guidance` with a finding id from
 ## Permissions
 
 The minimal policy the checks use is
-in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/docs/iam-policy.json). AWS-managed `ReadOnlyAccess` also works, but it is much broader than the scan needs. It was derived from a scan of
+in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/docs/iam-policy.json). AWS-managed `ReadOnlyAccess` also works, but it is much broader than the scan needs. It was derived from a scan of
 an account with most supported resource types; if a check lacks a permission,
 the scan says so in its data warnings instead of failing.
 
@@ -270,9 +270,9 @@ next release.
 
 ## License
 
-Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/LICENSE.md)). 0.1.18 and later are Apache-2.0.
+Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/LICENSE.md)). 0.1.18 and later are Apache-2.0.
 0.1.17 and earlier are FSL-1.1-ALv2 (each becomes Apache-2.0 two years after it ships).
 
 ## How we know it's right
 
-See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.22/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.
+See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.23/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.

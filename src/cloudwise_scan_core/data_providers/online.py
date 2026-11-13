@@ -3150,6 +3150,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                         has_lifecycle_policy=None,
                         default_encryption_enabled=None,  # unread, unknown
                         encryption_algorithm=None,
+                        bucket_key_enabled=None,
                     ))
                     continue
 
@@ -3459,9 +3460,8 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             "S3 bucket recent max object count", "cloudwatch:GetMetricStatistics", e,
                         )
 
-                default_encryption_enabled, encryption_algorithm = (
-                    self._s3_default_encryption(s3, bucket_name)
-                )
+                (default_encryption_enabled, encryption_algorithm,
+                 bucket_key_enabled) = self._s3_default_encryption(s3, bucket_name)
 
                 buckets.append(S3BucketData(
                     bucket_name=bucket_name,
@@ -3480,6 +3480,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     size_growth_pct_30d=growth_pct,
                     default_encryption_enabled=default_encryption_enabled,
                     encryption_algorithm=encryption_algorithm,
+                    bucket_key_enabled=bucket_key_enabled,
                     recent_max_object_count=recent_max_objects,
                     contents_observed=contents_observed,
                 ))
@@ -3530,10 +3531,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return s3.list_buckets().get('Buckets', [])
 
     @staticmethod
-    def _s3_default_encryption(s3, bucket_name: str) -> Tuple[bool, Optional[str]]:
-        """A bucket's default encryption: (enabled, algorithm)."""
+    def _s3_default_encryption(
+        s3, bucket_name: str,
+    ) -> Tuple[bool, Optional[str], Optional[bool]]:
+        """A bucket's default encryption: (enabled, algorithm, bucket_key_enabled).
+
+        CLO-993: ``BucketKeyEnabled`` is a member of the rule itself
+        (``ServerSideEncryptionRule``), a sibling of
+        ``ApplyServerSideEncryptionByDefault`` (botocore s3 2006-03-01), so it
+        is read from the same ``Rules[0]`` as the algorithm. It is None when
+        the rule does not carry it.
+        """
         default_encryption_enabled = True  # AWS default since Jan 2023
         encryption_algorithm = None
+        bucket_key_enabled: Optional[bool] = None
         try:
             enc_resp = s3.get_bucket_encryption(Bucket=bucket_name)
             enc_config = enc_resp.get('ServerSideEncryptionConfiguration', {})
@@ -3544,10 +3555,13 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     encryption_algorithm = default_rule.get(
                         'ApplyServerSideEncryptionByDefault', {}
                     ).get('SSEAlgorithm')
+                    flag = default_rule.get('BucketKeyEnabled')
+                    if isinstance(flag, bool):
+                        bucket_key_enabled = flag
         except ClientError as e:
             if e.response['Error']['Code'] == 'ServerSideEncryptionConfigurationNotFoundError':
                 default_encryption_enabled = False
-        return default_encryption_enabled, encryption_algorithm
+        return default_encryption_enabled, encryption_algorithm, bucket_key_enabled
     
     async def get_s3_cost_breakdown(self) -> Dict[str, S3CostBreakdown]:
         """Query Cost Explorer for per-bucket S3 cost breakdown by usage type.

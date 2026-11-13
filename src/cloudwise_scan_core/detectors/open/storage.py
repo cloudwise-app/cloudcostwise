@@ -394,6 +394,34 @@ def _attached_since(volume) -> Optional[datetime]:
 
 
 
+# CLO-993: shown FIRST in the finding's description, action and risk text, and
+# in the docs. Turning the bucket key on changes the KMS encryption context from
+# the object ARN to the bucket ARN, so a policy that matches the object ARN stops
+# matching and access can break.
+KMS_BUCKET_KEY_CONTEXT_WARNING = (
+    "Review your KMS permissions before changing this: turning on an S3 Bucket Key changes the "
+    "KMS encryption context from the object ARN to the bucket ARN. An IAM or KMS key policy "
+    "that limits access with kms:EncryptionContext:aws:s3:arn on object ARNs stops matching, "
+    "and access to the bucket's objects can break. See \"Changes to note before enabling an "
+    "S3 Bucket Key\" in the AWS S3 User Guide "
+    "(https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)."
+)
+
+
+# CLO-993: every finding says this until a scan-level step that made the one
+# Cost Explorer request (the CLI/MCP scan, never this detector) swaps in the spend.
+KMS_SPEND_UNAVAILABLE_LINE = "Your account's KMS request spend is not available."
+
+
+def kms_spend_line(amount: float, period: str) -> str:
+    """The context line that replaces KMS_SPEND_UNAVAILABLE_LINE. The spend is the
+    whole account's for ``period`` (YYYY-MM); no share is attributed to a bucket."""
+    return (
+        f"Your account's KMS request spend last month ({period}): ${amount:,.2f}. "
+        f"The share caused by this bucket is not known."
+    )
+
+
 class OpenStorageDetectorsMixin:
     """Open detectors from ``StorageDetectorsMixin``."""
 
@@ -842,11 +870,16 @@ class OpenStorageDetectorsMixin:
                 logger.warning(f"S3 cost breakdown unavailable: {e}")
                 s3_cost_breakdowns = {}
 
+            kms_bucket_key_items: List[WasteItem] = []
             for bucket in buckets:
                 # CRITICAL: Filter by region — S3 buckets are global but we scan per-region
                 if bucket.region and bucket.region != data_provider.region:
                     continue
-                
+
+                # CLO-993: reads only the bucket's default encryption rule, so it
+                # runs before the lifecycle gate below, which skips the other checks.
+                kms_bucket_key_items.extend(self._detect_s3_kms_bucket_key(bucket, data_provider))
+
                 # Run sub-detectors per bucket
                 waste_items.extend(self._detect_s3_incomplete_multipart(bucket, settings))
                 if bucket.has_lifecycle_policy is None:
@@ -890,12 +923,126 @@ class OpenStorageDetectorsMixin:
                 )
             )
             
+            waste_items.extend(kms_bucket_key_items)
+
             logger.info(f"S3 detector found {len(waste_items)} waste items")
             return waste_items
             
         except Exception as e:
             logger.error(f"Error in S3 waste detection: {e}")
             raise
+    def _detect_s3_kms_bucket_key(self, bucket, data_provider) -> List[WasteItem]:
+        """Flag an SSE-KMS bucket whose default encryption has the bucket key off (CLO-993).
+
+        Without an S3 Bucket Key, S3 calls KMS on every object upload and
+        download, and KMS bills each call. Fires only for
+        ``SSEAlgorithm == "aws:kms"`` with ``BucketKeyEnabled`` not true. Both
+        come from the same rule (``Rules[0]``) of GetBucketEncryption: botocore's
+        ``ServerSideEncryptionRule`` holds ``BucketKeyEnabled`` beside
+        ``ApplyServerSideEncryptionByDefault``, and the ``ServerSideEncryption``
+        enum is ``AES256 | aws:fsx | aws:kms | aws:kms:dsse``. Silent for
+        ``aws:kms:dsse`` (bucket keys are not supported with DSSE-KMS),
+        ``AES256``, ``aws:fsx``, a bucket key already on, no encryption
+        configuration, and a bucket whose encryption was not read (None).
+
+        No per-bucket saving is sized: it depends on the bucket's request
+        volume, which the scan does not read, so the finding reports $0 (it is
+        in GOVERNANCE_WASTE_TYPES so the $0 finding is still shown).
+        """
+        if bucket.default_encryption_enabled is False:
+            return []  # no encryption configuration: s3_no_default_encryption's finding
+        if bucket.encryption_algorithm != 'aws:kms':
+            return []  # AES256, aws:fsx, aws:kms:dsse, or not read
+        key_flag = getattr(bucket, 'bucket_key_enabled', None)
+        if key_flag is True:
+            return []
+        if key_flag is None and data_provider.provider_type == 'offline':
+            # An export made by a script older than 1.30.1 and anonymized drops
+            # BucketKeyEnabled, so "absent" cannot be told from "on": withheld
+            # and noted, never a finding. Online, S3 leaving the member out
+            # means the bucket key is not set.
+            note = getattr(data_provider, '_note_idle_verdict_missing', None)
+            if callable(note):
+                note('s3 bucket key', bucket.bucket_name,
+                     'BucketKeyEnabled not in the export (anonymized by a script older than 1.30.1)',
+                     verdict='s3-kms-bucket-key-disabled',
+                     evidence='the bucket default encryption rule (s3:GetEncryptionConfiguration)')
+            return []
+
+        name = bucket.bucket_name
+        state = 'is set to false' if key_flag is False else 'is not set'
+        return [WasteItem(
+            id=str(uuid.uuid4()),
+            resource_id=name,
+            resource_type=ResourceType.S3_BUCKET,
+            waste_type=WasteType.S3_KMS_BUCKET_KEY_DISABLED,
+            title="S3 Bucket Key Disabled on SSE-KMS Bucket",
+            description=(
+                f"{KMS_BUCKET_KEY_CONTEXT_WARNING} "
+                f"S3 bucket '{name}' encrypts new objects with SSE-KMS and its "
+                f"S3 Bucket Key is off, so S3 calls KMS on every object upload "
+                f"and download."
+            ),
+            monthly_savings=0.0,
+            confidence=ConfidenceLevel.MEDIUM,
+            action=(
+                "First check that no IAM or KMS key policy limits access with "
+                "kms:EncryptionContext:aws:s3:arn on object ARNs (a bucket key changes the "
+                "encryption context to the bucket ARN). Then turn on the S3 Bucket Key in "
+                "the bucket's default encryption, keeping the same KMS key (the command needs jq). Only new "
+                "objects use it; existing objects switch when copied."
+            ),
+            action_command=(
+                f"aws s3api put-bucket-encryption --bucket {name} "
+                f"--server-side-encryption-configuration "
+                f"\"$(aws s3api get-bucket-encryption --bucket {name} "
+                f"--query ServerSideEncryptionConfiguration --output json "
+                f"| jq '.Rules[0].BucketKeyEnabled = true')\""
+            ),
+            explanation={
+                'detection': (
+                    f"Bucket {name} default encryption is SSE-KMS (aws:kms) and BucketKeyEnabled {state}."
+                ),
+                'threshold': (
+                    'SSEAlgorithm is aws:kms and BucketKeyEnabled is not true. Not flagged: '
+                    'DSSE-KMS (aws:kms:dsse; bucket keys are not supported), SSE-S3, a bucket key '
+                    'already on, or a bucket with no default encryption.'
+                ),
+                'pricing': (
+                    'KMS bills $0.03 per 10,000 requests, and without a bucket key S3 makes a KMS '
+                    'request for each object upload and download. AWS states a bucket key reduces '
+                    'KMS request cost by up to 99%. The saving depends on request volume, which '
+                    'CloudWise does not read per bucket, so none is claimed ($0). Per-bucket request '
+                    'volume not available. ' + KMS_SPEND_UNAVAILABLE_LINE
+                ),
+                'why_waste': (
+                    'Every object request on this bucket triggers a billed KMS request that a bucket '
+                    'key would mostly avoid.'
+                ),
+                'risk': (
+                    f'{KMS_BUCKET_KEY_CONTEXT_WARNING} '
+                    'Keep the same KMS key: put-bucket-encryption replaces the whole configuration, '
+                    'so the command above reads the current one and only sets BucketKeyEnabled (it needs jq). Only new '
+                    'objects use the bucket key; existing objects switch when copied. Each requester role '
+                    'or account gets its own bucket key, so many callers means a smaller saving. '
+                    'CloudTrail KMS events then show the bucket ARN, not each object. Revoking KMS access '
+                    'takes effect when the cached bucket key expires; S3 permissions are still checked '
+                    'on every request.'
+                ),
+            },
+            metadata={
+                'bucket_name': name,
+                'sse_algorithm': bucket.encryption_algorithm,
+                'bucket_key_enabled': key_flag,
+                'savings_basis': 'depends on request volume',
+                'per_bucket_request_volume': 'not available',
+                'account_kms_request_spend_usd': None,
+                'account_kms_request_spend_period': None,
+                'estimated_savings_usd': 0.0,
+                'detection_mode': data_provider.provider_type,
+            },
+        )]
+
     def _detect_s3_incomplete_multipart(
         self,
         bucket,

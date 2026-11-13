@@ -45,7 +45,7 @@ INSTRUCTIONS = (
     "cloudcostwise finds AWS waste with the user's own credentials and cannot modify AWS: non-read "
     "calls are refused, and `fix_guidance` only returns text. Call `scan` first (it takes 30-60 seconds "
     "per region), then `list_findings`, `explain_finding` and `fix_guidance` on its results. Before the "
-    "first `scan`, tell the user two things. The RI/Savings Plans checks call Cost Explorer, which AWS "
+    "first `scan`, tell the user two things. The RI/Savings Plans checks (and one KMS spend read, only if an S3 bucket-key finding appears) call Cost Explorer, which AWS "
     f"bills at ${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and "
     "include_cost_explorer=false skips them. Results, including the account ID and resource IDs, come "
     "back to you, the assistant."
@@ -160,7 +160,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                  description="Scan the user's AWS account for waste with their local credentials (read-only; "
                              "any non-read AWS call is refused). Takes 30-60 s per region; up to 4 regions run "
                              "at once. COST: the RI/Savings Plans checks call Cost Explorer, billed by AWS at "
-                             f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), plus one request for the last 30 days of spend, "
+                             f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), plus one request for the last 30 days of spend and, only when an S3 bucket-key finding exists, one for KMS request spend (one per scan, not per region), "
                              "which scores the result; tell the user before running, and pass "
                              "include_cost_explorer=false to skip them (the score is then labelled \"without spend data\"). regions: comma-separated, or 'all'; "
                              "default us-east-1 plus the profile's region.")

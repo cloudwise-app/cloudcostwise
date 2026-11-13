@@ -10,3 +10,4 @@ def _no_real_spend_lookup(monkeypatch):
     from cloudcostwise import scan
 
     monkeypatch.setattr(scan, "fetch_monthly_spend", lambda creds, report: None)
+    monkeypatch.setattr(scan, "fetch_kms_spend", lambda creds, report: None)

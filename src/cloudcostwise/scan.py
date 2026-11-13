@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Type
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from cloudwise_scan_core.models import WasteDetectionSettings, WasteItem
+from cloudwise_scan_core.detectors.open.storage import KMS_SPEND_UNAVAILABLE_LINE, kms_spend_line
 from cloudwise_scan_core.open_service import OpenWasteDetectionService
 
 from cloudcostwise.runtime import COST_EXPLORER_SERVICE, COST_EXPLORER_SKIP_MARK, Credentials, ReadOnlyViolation, read_only_guard
@@ -20,6 +21,8 @@ from cloudcostwise.runtime import COST_EXPLORER_SERVICE, COST_EXPLORER_SKIP_MARK
 # The one open entrypoint that calls Cost Explorer's billed APIs (RI and
 # Savings Plans recommendations). --no-cost-explorer drops it.
 COST_EXPLORER_DETECTORS = frozenset({"savings_opportunities"})
+# CLO-993: the finding that gets one scan-level Cost Explorer read for the account's KMS spend.
+KMS_WASTE_TYPE = "s3_kms_bucket_key_disabled"
 # A Cost Explorer IAM action ("ce:GetCostAndUsage"), not a longer prefix that
 # merely ends in "ce" ("aws-marketplace:...").
 _COST_EXPLORER_ACTION = re.compile(r"(?<![\w-])ce:")
@@ -95,6 +98,61 @@ def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
     if n:
         report.api_calls[COST_EXPLORER_SERVICE] = report.api_calls.get(COST_EXPLORER_SERVICE, 0) + n
     report.spend_monthly = total if total and total > 0 else None
+
+
+def kms_spend_window(today: Optional[_dt.date] = None):
+    """(start, end) ISO dates for the KMS request spend: the last complete calendar month, end exclusive."""
+    today = today or _dt.datetime.now(_dt.timezone.utc).date()
+    end = today.replace(day=1)
+    return (end - _dt.timedelta(days=1)).replace(day=1).isoformat(), end.isoformat()
+
+
+def fetch_kms_spend(creds: Credentials, report: "ScanReport") -> None:
+    """ONE Cost Explorer GetCostAndUsage request for the whole scan, and only when a finding needs it.
+
+    If any merged finding is ``s3_kms_bucket_key_disabled``, read the account's KMS
+    request spend for last calendar month (service "AWS Key Management Service", MONTHLY,
+    UnblendedCost, grouped by USAGE_TYPE, usage types naming requests summed) and put it on
+    every such finding as context (CLO-993). No finding, no request, however many regions
+    were scanned. It is an optional read: any Cost Explorer or network error keeps the
+    findings, which then say the spend is not available, and adds no warning or permission
+    error to the report. Runs under the read-only guard; the request is counted in
+    ``report.api_calls``. Never attributes a share of the spend to a bucket.
+    """
+    items = [f for f in report.findings
+             if getattr(getattr(f, "waste_type", None), "value", getattr(f, "waste_type", None)) == KMS_WASTE_TYPE]
+    if not items:
+        return
+    start, end = kms_spend_window()
+    result = None
+    with read_only_guard() as guard:
+        try:
+            client = boto3.client("ce", region_name="us-east-1", aws_access_key_id=creds.access_key_id,
+                                  aws_secret_access_key=creds.secret_access_key,
+                                  aws_session_token=creds.session_token)
+            resp = client.get_cost_and_usage(
+                TimePeriod={"Start": start, "End": end}, Granularity="MONTHLY", Metrics=["UnblendedCost"],
+                Filter={"Dimensions": {"Key": "SERVICE", "Values": ["AWS Key Management Service"]}},
+                GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}])
+            total = 0.0
+            for period in resp.get("ResultsByTime", []):
+                for group in period.get("Groups", []):
+                    if "Requests" in (group.get("Keys") or [""])[0]:
+                        total += float(group["Metrics"]["UnblendedCost"]["Amount"])
+            result = round(total, 2)
+        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError):
+            result = None
+    n = guard.calls.get(COST_EXPLORER_SERVICE, 0)
+    if n:
+        report.api_calls[COST_EXPLORER_SERVICE] = report.api_calls.get(COST_EXPLORER_SERVICE, 0) + n
+    if result is None:
+        return
+    period_label = start[:7]
+    for f in items:
+        f.explanation["pricing"] = f.explanation["pricing"].replace(
+            KMS_SPEND_UNAVAILABLE_LINE, kms_spend_line(result, period_label))
+        f.metadata["account_kms_request_spend_usd"] = result
+        f.metadata["account_kms_request_spend_period"] = period_label
 
 
 def full_engine_class() -> Type[OpenWasteDetectionService]:
@@ -272,6 +330,7 @@ async def run_scan_async(
         raise ReadOnlyViolation(f"refused non-read AWS call(s): {', '.join(sorted(set(violations)))}")
     if include_cost_explorer and with_spend:
         await asyncio.to_thread(fetch_monthly_spend, creds, report)
+        await asyncio.to_thread(fetch_kms_spend, creds, report)
     report.seconds = round(time.monotonic() - started, 1)
     return report
 
