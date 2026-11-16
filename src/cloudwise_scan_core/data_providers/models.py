@@ -8,7 +8,7 @@ regardless of data source.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 
 @dataclass
@@ -2067,6 +2067,38 @@ class BeanstalkMetricsData:
     # so an environment whose parts are all newer than the CUR's last day
     # reads "not yet billed", not "$0". An id missing here is unknown.
     billed_created_at: Dict[str, Any] = field(default_factory=dict)
+    # CLO-1012: the network interface (``eni-...``) holding the environment's
+    # public IPv4 address when that address is its EndpointURL (a
+    # SingleInstance environment's Elastic IP). AWS bills a public IPv4
+    # address under its network interface since February 2024
+    # (``...:network-interface/eni-...``, usage type ``PublicIPv4:InUseAddress``);
+    # empty when no instance holds the endpoint address.
+    billed_public_ipv4: str = ''
+    # CLO-1012: the running instances by tag, for the billed ids only, when
+    # they are known but are not the measured set (an Air-Gapped export has
+    # them but no per-instance CPU, so ``instance_ids``, which the checks
+    # count and price, stays empty there). Empty means ``instance_ids``.
+    billed_instance_ids: List[str] = field(default_factory=list)
+
+
+def beanstalk_public_ipv4_interface(instance: Any, endpoint_host: str) -> Tuple[str, Any]:
+    """CLO-1012: ``(network interface id, its AttachTime)`` for the interface
+    of one DescribeInstances ``instance`` whose public IPv4 address equals the
+    environment's EndpointURL host, else ``('', None)``. Only a SingleInstance
+    environment's endpoint is an address (a load-balanced one is the load
+    balancer's DNS name), so only that environment's address is matched; an
+    instance's other auto-assigned addresses are not. Shared by the online and
+    offline providers."""
+    host = (endpoint_host or '').strip().lower().rstrip('.')
+    if not host or not isinstance(instance, dict):
+        return '', None
+    for nic in instance.get('NetworkInterfaces') or []:
+        if not isinstance(nic, dict):
+            continue
+        assoc = nic.get('Association') or {}
+        if str(assoc.get('PublicIp') or '').strip().lower() == host and nic.get('NetworkInterfaceId'):
+            return nic['NetworkInterfaceId'], (nic.get('Attachment') or {}).get('AttachTime')
+    return '', None
 
 
 # CLO-592 follow-up: AWS publishes no AWS/GlobalAccelerator series for an

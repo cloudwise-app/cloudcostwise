@@ -122,7 +122,7 @@ from cloudwise_scan_core.data_providers.models import (
     WorkspacePoolData,
     WorkspaceMetricsData,
     BeanstalkEnvironmentData,
-    BeanstalkConfigData, beanstalk_config_from_settings,
+    BeanstalkConfigData, beanstalk_config_from_settings, beanstalk_public_ipv4_interface,
     BeanstalkMetricsData,
     ApiGatewayRestApiData,
     beanstalk_rds_marks,
@@ -5741,8 +5741,12 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         enhanced health is configured). Only the last can measure traffic:
         request_count_14d is its total when its daily series covers 75% of
         the export's days, else -1 (MISSING). No per-instance CPU or load
-        balancer RequestCount is exported, so avg_cpu_14d is always -1."""
+        balancer RequestCount is exported, so avg_cpu_14d is always -1.
+
+        CLO-1012: the ids AWS bills each environment under, from the export's
+        instances and load balancers (``_beanstalk_billed_parts``)."""
         metrics = {}
+        billed = self._beanstalk_billed_parts(environment_names, endpoint_urls)
         export_days = min(days, self._export_cloudwatch_days())
         need_days = math.ceil(export_days * 0.75)
         for env_name in environment_names:
@@ -5772,6 +5776,8 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     f"enhanced-health requests for {covered_days} of {export_days} days in export; "
                     f"no per-instance CPU in export"
                 )
+            for attr, value in billed.get(env_name, {}).items():
+                setattr(entry, attr, value)
             metrics[env_name] = entry
         return metrics
 
@@ -5923,3 +5929,89 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         """CLO-611: the export carries no cross-cluster connection data, so
         the answer is unknown and idle_opensearch is withheld offline."""
         return None
+
+    def _beanstalk_billed_parts(
+        self,
+        environment_names: List[str],
+        endpoint_urls: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """CLO-1012: the online provider's billed-id fields for each
+        environment, from the export's ``ec2_instances`` and load balancer
+        files (the same answers online reads; no new export file).
+
+        Instances are the running ones tagged
+        ``elasticbeanstalk:environment-name``, with their EBS volumes and
+        LaunchTime/AttachTime; the load balancer is the one whose DNS name is
+        the environment's EndpointURL (elbv2 ARN or Classic name), dropped
+        when several environments resolve to it, as online; the public IPv4
+        interface is the one whose address is the EndpointURL. They are set
+        as ``billed_instance_ids`` (not ``instance_ids``): the export has no
+        per-instance CPU, and the measured count would change what the
+        offline checks price and report, which this does not. An export file
+        that is absent, removed by --anonymize or unreadable gives no ids for
+        that part, so the detector keeps the old match."""
+        names = [n for n in dict.fromkeys(environment_names or []) if n]
+        out: Dict[str, Dict[str, Any]] = {n: {} for n in names}
+        if not names:
+            return out
+        hosts = {
+            n: (url or '').strip().lower().rstrip('.').split('://')[-1]
+            for n, url in (endpoint_urls or {}).items() if n in out and url
+        }
+
+        def _rows(key: str) -> List[Any]:
+            try:
+                return [r for r in self._get_data(key) if isinstance(r, dict)]
+            except ExportFileRemovedError:
+                return []
+
+        for inst in _rows('ec2_instances'):
+            env = self._get_tag_dict(inst.get('Tags', [])).get('elasticbeanstalk:environment-name')
+            state = inst.get('State')
+            state = state.get('Name') if isinstance(state, dict) else state
+            if env not in out or state != 'running' or not inst.get('InstanceId'):
+                continue
+            entry = out[env]
+            entry.setdefault('billed_instance_ids', []).append(inst['InstanceId'])
+            created = entry.setdefault('billed_created_at', {})
+            if inst.get('LaunchTime'):
+                created[inst['InstanceId']] = inst['LaunchTime']
+            for bdm in inst.get('BlockDeviceMappings') or []:
+                ebs = (bdm or {}).get('Ebs') or {}
+                if ebs.get('VolumeId'):
+                    volumes = entry.setdefault('instance_volume_ids', [])
+                    if ebs['VolumeId'] not in volumes:
+                        volumes.append(ebs['VolumeId'])
+                    if ebs.get('AttachTime'):
+                        created[ebs['VolumeId']] = ebs['AttachTime']
+            eni, attached = beanstalk_public_ipv4_interface(inst, hosts.get(env, ''))
+            if eni:
+                entry['billed_public_ipv4'] = eni
+                if attached:
+                    created[eni] = attached
+
+        if any('.elb.' in h for h in hosts.values()):
+            v2 = {(lb.get('DNSName') or '').lower(): lb for lb in _rows('load_balancers')}
+            classic = {(lb.get('DNSName') or '').lower(): lb for lb in _rows('elb_classic')}
+            owners: Dict[str, List[str]] = {}
+            for name, host in hosts.items():
+                lb = v2.get(host)
+                if lb is not None and lb.get('LoadBalancerArn'):
+                    lb_id, kind = lb['LoadBalancerArn'], 'elbv2'
+                elif classic.get(host, {}).get('LoadBalancerName'):
+                    lb = classic[host]
+                    lb_id, kind = lb['LoadBalancerName'], 'classic'
+                else:
+                    continue
+                out[name]['billed_load_balancer'] = lb_id
+                out[name]['billed_load_balancer_kind'] = kind
+                if lb.get('CreatedTime'):
+                    out[name].setdefault('billed_created_at', {})[lb_id] = lb['CreatedTime']
+                owners.setdefault(lb_id, []).append(name)
+            for lb_id, envs in owners.items():
+                if len(envs) > 1:
+                    for name in envs:
+                        out[name].pop('billed_load_balancer', None)
+                        out[name].pop('billed_load_balancer_kind', None)
+                        out[name].get('billed_created_at', {}).pop(lb_id, None)
+        return out

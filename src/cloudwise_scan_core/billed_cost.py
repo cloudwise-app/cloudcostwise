@@ -1464,7 +1464,10 @@ def reconcile_savings(
     4. The finding's name matched several CUR resources and none uniquely →
        labelled, *not* zeroed (CLO-739). We cannot tell which bill is its,
        so we cannot claim it has none.
-    5. Discount line items → labelled. We have no amortized column, so we
+    5. Some of a finding's billed ids have rows and others none (CLO-1012)
+       → labelled "not enough billing history", estimate kept; decided
+       before 5a so a missing part is never labelled discounted.
+    5a. Discount line items → labelled. We have no amortized column, so we
        cannot say by how much the bill disagrees, only that it does.
     6. No rows at all, for a resource younger than the CUR's latest covered
        day (or of a type billed while it exists) → labelled, *not* zeroed:
@@ -1552,23 +1555,26 @@ def reconcile_savings(
 
     rollup = match.rollup
 
-    if rollup is not None and rollup.has_discount_line_items:
-        return ReconciliationOutcome(
-            monthly_savings=estimated_savings,
-            reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
-            billed_cost_observed=rollup.monthly_equivalent(),
-            cost_basis=rollup.cost_basis,
-        )
-
     # CLO-1012: some billed ids have rows and others none. The rows are part
     # of the bill, so neither a cap nor "AWS bills $0" can be read from them:
-    # keep the estimate, labelled, even when the parts found bill $0.
+    # keep the estimate, labelled, even when the parts found bill $0. Decided
+    # before the discount check: a discount line on a part that was found
+    # does not make the missing part discounted, so the label says what is
+    # true ("not enough billing history"), not "covered by a discount".
     if match.missing_parts and rollup is not None:
         return ReconciliationOutcome(
             monthly_savings=estimated_savings,
             reconciliation_status=(
                 ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA
             ),
+            billed_cost_observed=rollup.monthly_equivalent(),
+            cost_basis=rollup.cost_basis,
+        )
+
+    if rollup is not None and rollup.has_discount_line_items:
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
             billed_cost_observed=rollup.monthly_equivalent(),
             cost_basis=rollup.cost_basis,
         )

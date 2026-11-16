@@ -143,7 +143,7 @@ from cloudwise_scan_core.data_providers.models import (
     WorkspacePoolData,
     WorkspaceMetricsData,
     BeanstalkEnvironmentData,
-    BeanstalkConfigData, beanstalk_config_from_settings,
+    BeanstalkConfigData, beanstalk_config_from_settings, beanstalk_public_ipv4_interface,
     BeanstalkMetricsData,
     ApiGatewayRestApiData,
     beanstalk_rds_marks,
@@ -10626,6 +10626,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         # CLO-1012: when each billed part appeared (LaunchTime, AttachTime),
         # from the same response; see BeanstalkMetricsData.billed_created_at.
         created_by_env: Dict[str, Dict[str, Any]] = {}
+        # CLO-1012: a SingleInstance environment's EndpointURL is its public
+        # IPv4 address, which AWS bills (since February 2024) under the
+        # network interface that holds it; found in the same response.
+        endpoint_hosts = {
+            name: (url or '').strip().lower().rstrip('.').split('://')[-1]
+            for name, url in (endpoint_urls or {}).items() if url
+        }
+        ipv4_by_env: Dict[str, str] = {}
         instances_read = True
         try:
             ec2 = self._get_client('ec2')
@@ -10650,6 +10658,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                                         volumes_by_env.setdefault(env, []).append(vol_id)
                                         if ebs.get('AttachTime'):
                                             created_by_env.setdefault(env, {})[vol_id] = ebs['AttachTime']
+                                eni, attached = beanstalk_public_ipv4_interface(inst, endpoint_hosts.get(env, ''))
+                                if eni:
+                                    ipv4_by_env[env] = eni
+                                    if attached:
+                                        created_by_env.setdefault(env, {})[eni] = attached
         except Exception as e:  # noqa: BLE001 - any failure is MISSING, never zero
             self._warn_swallowed("Beanstalk environment instances", "ec2:DescribeInstances", e)
             instances_read = False
@@ -10665,6 +10678,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 list(dict.fromkeys(volumes_by_env.get(name, []))) if ids else []
             )
             metrics[name].billed_created_at = dict(created_by_env.get(name, {})) if ids else {}
+            metrics[name].billed_public_ipv4 = ipv4_by_env.get(name, '') if ids else ''
 
         # ── Load balancers by DNS name ──
         lb_by_env: Dict[str, Tuple[str, str, List[str]]] = {}  # name -> (kind, dimension, target groups)

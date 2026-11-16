@@ -644,7 +644,10 @@ _NON_COVERING_OVERLAP_TYPES = frozenset({
 })
 
 
-def _apply_saving_overlap(items: List[WasteItem]) -> Set[int]:
+def _apply_saving_overlap(
+    items: List[WasteItem],
+    carriers: Optional[Dict[int, List[WasteItem]]] = None,
+) -> Set[int]:
     """Count a finding's saving once when another counted finding already
     claims every resource it claims (CLO-961 for one EBS volume, CLO-1012 for
     every type in ``SAVING_OVERLAP_PRIORITY``).
@@ -673,7 +676,10 @@ def _apply_saving_overlap(items: List[WasteItem]) -> Set[int]:
     reports $0 like a covered one.
 
     Returns ``id()`` of the items whose saving was moved or reduced, so the
-    savings floor can judge them on the figure they had alone.
+    savings floor can judge them on the figure they had alone. ``carriers``,
+    when given, is filled with ``id()`` of each such item -> the findings its
+    text names as counting the saving, so the caller can say so when the
+    floor later drops one of them (CLO-1012).
     """
     candidates: List[Tuple[WasteItem, Set[Tuple[str, ...]]]] = []
     for item in items:
@@ -722,7 +728,7 @@ def _apply_saving_overlap(items: List[WasteItem]) -> Set[int]:
             None,
         )
         if winner is None:
-            _take_off_shared_part(item, keys, kept, moved)
+            _take_off_shared_part(item, keys, kept, moved, carriers)
             kept.append((item, keys))
             continue
         w, wk = winner
@@ -755,6 +761,8 @@ def _apply_saving_overlap(items: List[WasteItem]) -> Set[int]:
         )
         item.monthly_savings = 0.0
         moved.add(id(item))
+        if carriers is not None:
+            carriers[id(item)] = [w]
     return moved
 
 
@@ -763,6 +771,7 @@ def _take_off_shared_part(
     keys: Set[Tuple[str, ...]],
     kept: List[Tuple[WasteItem, Set[Tuple[str, ...]]]],
     moved: Set[int],
+    carriers: Optional[Dict[int, List[WasteItem]]] = None,
 ) -> None:
     """CLO-1012: lower a partly covered finding by the part of its saving the
     findings already counted may count too (see :func:`_shared_part`)."""
@@ -815,6 +824,41 @@ def _take_off_shared_part(
     item.metadata = metadata
     item.monthly_savings = remaining
     moved.add(id(item))
+    if carriers is not None:
+        carriers[id(item)] = list(sharing)
+
+
+def _floored_carrier_note(named, floored: Set[int], floor_usd: float) -> str:
+    """CLO-1012: the sentence a kept finding adds when the savings floor
+    dropped a finding its text names as counting its saving, else "".
+    Counted per type, so two named findings of one type with only one dropped
+    read "1 of the 2 X findings", never "the X finding is not listed" next to
+    an X finding that is listed."""
+    total: Dict[str, int] = {}
+    gone: Dict[str, int] = {}
+    for w in named:
+        wt = _waste_type_value(w.waste_type)
+        total[wt] = total.get(wt, 0) + 1
+        if id(w) in floored:
+            gone[wt] = gone.get(wt, 0) + 1
+    if not gone:
+        return ""
+    parts = []
+    for wt in sorted(gone):
+        g, n = gone[wt], total[wt]
+        if g == n == 1:
+            parts.append(f"the {wt} finding")
+        elif g == n:
+            parts.append(f"the {n} {wt} findings")
+        else:
+            parts.append(f"{g} of the {n} {wt} findings")
+    many = sum(gone.values()) > 1
+    text = " and ".join(parts)
+    return (
+        f"{text[0].upper()}{text[1:]} named here {'are' if many else 'is'} not listed: "
+        f"{'their savings are' if many else 'its saving is'} "
+        f"below the ${float(floor_usd):.2f} savings floor."
+    )
 
 
 # CLO-961's name, kept for callers and tests that use it.
@@ -2088,8 +2132,10 @@ class WasteDetectionServiceBase:
         # saving counts), before the floor (a moved saving is judged on what
         # it had alone). Keyed on ids the detectors know, so it applies with
         # or without resource-level CUR.
-        overlapped = _apply_saving_overlap(staged)
+        carriers: Dict[int, List[WasteItem]] = {}
+        overlapped = _apply_saving_overlap(staged, carriers)
 
+        floored: Set[int] = set()
         for item in staged:
             floor_amount = (
                 item.metadata.get("saving_if_counted_alone", 0.0)
@@ -2108,6 +2154,7 @@ class WasteDetectionServiceBase:
                 # The governance bypass above decides persistence only; the
                 # reconciled figure stands for governance types too (CLO-448).
                 result.reconciled_below_threshold += 1
+                floored.add(id(item))
                 # CLO-430: keep the item, not just the tally. The region
                 # scanner writes these to `below_floor.jsonl.gz` beside
                 # `findings.jsonl.gz`, and the union of the two is the L2
@@ -2116,6 +2163,18 @@ class WasteDetectionServiceBase:
                 # detector that stayed silent from one that fired and was
                 # floored. Appending after the counter keeps the two in step.
                 result.below_floor_items.append(item)
+
+        # CLO-1012: a finding the floor kept (in practice an advisory one,
+        # ordered after every trusted finding whatever its size) can name a
+        # finding as carrying its saving that the floor then dropped. Say
+        # so, rather than point at a finding that is not listed. Nothing is
+        # restored: the saving was never this finding's to count.
+        for item in result.waste_items:
+            note = _floored_carrier_note(
+                carriers.get(id(item), ()), floored, settings.min_waste_threshold_usd,
+            )
+            if note:
+                item.description = f"{item.description} {note}"
 
         if result.reconciled_below_threshold:
             logger.info(
