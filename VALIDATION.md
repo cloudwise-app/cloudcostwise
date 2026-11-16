@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 1 at L0, 28 at L1, 38 at L2, 22 at L3, 3 at L4.
+Summary for the checks in this repository: 1 at L0, 28 at L1, 37 at L2, 23 at L3, 3 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -53,7 +53,7 @@ proven checks only.
 | `idle_workspace` | L1 | yes |  |
 | `incomplete_multipart` | L3 |  | partial |
 | `lambda_arm64_migration` | L2 |  | none |
-| `lambda_excessive_timeout` | L2 |  | partial |
+| `lambda_excessive_timeout` | L3 |  | partial |
 | `lambda_old_runtime` | L2 |  | covered |
 | `lambda_provisioned_concurrency_idle` | L2 |  | none |
 | `lightsail_idle_database` | L2 |  |  |
