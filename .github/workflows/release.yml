@@ -1,6 +1,7 @@
 name: release
 # Tag vX.Y.Z (pushed with the export) -> build -> PyPI (trusted publishing,
-# no stored token) -> MCP registry (GitHub OIDC, no stored token).
+# no stored token) -> MCP registry (GitHub OIDC, no stored token) -> the GitHub
+# release entry for the tag, with the notes the export wrote.
 on:
   push:
     tags: ["v*"]
@@ -51,3 +52,21 @@ jobs:
         run: |
           ./mcp-publisher login github-oidc
           for i in 1 2 3 4 5; do ./mcp-publisher publish && exit 0; sleep 60; done; exit 1
+  github-release:
+    # After PyPI, so the entry never names a version nobody can install. A failure here
+    # leaves PyPI and the registry published; rerun this job or create the entry by hand.
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release entry for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; leaving it as it is"; exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "cloudcostwise $version" --notes-file .github/release-notes.md --latest --verify-tag

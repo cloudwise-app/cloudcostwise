@@ -1,6 +1,6 @@
 {
   "name": "cloudcostwise",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "A skill that scans your own AWS account for waste with the free, open-source cloudcostwise CLI, on your machine with your own read-only credentials, and explains the findings. Nothing is sent to CloudWise unless you choose to share a summary yourself.",
   "author": { "name": "CloudWise", "url": "https://cloudcostwise.io" },
   "homepage": "https://cloudcostwise.io/cli",

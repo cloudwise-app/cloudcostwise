@@ -1,11 +1,11 @@
 {
   "name": "cloudcostwise",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Find AWS waste, including kinds AWS's tools miss. Local, read-only. Nothing sent unless you opt in.",
   "mcpServers": {
     "cloudcostwise": {
       "command": "uvx",
-      "args": ["cloudcostwise==0.1.26", "mcp"]
+      "args": ["cloudcostwise==0.1.27", "mcp"]
     }
   },
   "settings": [

@@ -1,0 +1,4 @@
+- **The Claude Code plugin keeps its environment when the plugin updates.** The plugin's Python environment now lives in the plugin's data folder (`${CLAUDE_PLUGIN_DATA}/venv`), not inside the plugin folder, so an update no longer rebuilds it from nothing.
+- **The build tool is pinned too.** `uv.lock` already fixed the runtime dependencies. The plugin's first start now also builds with a fixed `setuptools` and `wheel`, so a new setuptools release cannot stop a new install from starting.
+- **The licence is declared in the current form** (`license = "Apache-2.0"`). The old table form and the licence classifier stop working in setuptools on 2027-02-18.
+- The scan itself is unchanged.
