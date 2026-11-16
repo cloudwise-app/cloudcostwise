@@ -499,7 +499,7 @@ class SavingsOpportunitiesDetectorsMixin:
                     ),
                     'why_waste': (
                         'Running On-Demand ElastiCache nodes with stable baseline usage '
-                        'costs up to 40-55% more than equivalent Reserved Nodes.'
+                        'costs more than equivalent Reserved Nodes (the saving above is the Cost Explorer estimate for this fleet).'
                     ),
                     'risk': (
                         'Reserved Nodes are a commitment — engine, node type, and region specific. '

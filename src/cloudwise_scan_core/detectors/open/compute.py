@@ -12,8 +12,8 @@ import re
 import uuid
 from datetime import date, datetime, timezone
 from typing import Dict, Any, List, TYPE_CHECKING
-from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, get_ec2_monthly_cost, _region_price_multiplier
-from cloudwise_scan_core.aws_pricing_service import lightsail_bundle_monthly_price, workspaces_pool_slot_monthly_price
+from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, get_ec2_monthly_cost, _region_price_multiplier, note_price_unknown, us_east_1_prices, WORKSPACES_ALWAYS_ON_MONTHLY, WORKSPACES_AUTOSTOP_HOURLY, WORKSPACES_AUTOSTOP_MONTHLY_BASE
+from cloudwise_scan_core.aws_pricing_service import lightsail_bundle_monthly_price, lightsail_database_bundle_monthly_price, workspaces_pool_slot_monthly_price
 from cloudwise_scan_core.data_providers.base import WORKSPACES_POOL_PEAK_WINDOW_DAYS
 from cloudwise_scan_core.cpu_sizing import EC2_IDLE_MAX_CPU_THRESHOLD, EC2_IDLE_P95_AVG_CPU_THRESHOLD, EC2_IDLE_P95_MAX_CPU_THRESHOLD, is_as_old_as_window
 if TYPE_CHECKING:
@@ -332,7 +332,7 @@ class OpenComputeDetectorsMixin:
                                 evidence='attached EBS volume sizes',
                             )
                             continue
-                        estimated_cost, volume_lines, kept_on_terminate = priced
+                        estimated_cost, volume_lines, kept_on_terminate, by_volume = priced
                         waste_items.append(WasteItem(
                             id=str(uuid.uuid4()),
                             resource_id=instance.instance_id,
@@ -377,6 +377,17 @@ class OpenComputeDetectorsMixin:
                                 'ebs_monthly_cost': round(estimated_cost, 2),
                                 'volumes_kept_on_terminate': kept_on_terminate,
                                 'detection_mode': data_provider.provider_type,
+                                # CLO-1012: the saving is the volumes' storage,
+                                # which the CUR bills under each volume id (a
+                                # stopped instance has no compute rows). The
+                                # pricing above read every one of them.
+                                'cur_billed_ids': [
+                                    ((m or {}).get('Ebs') or {}).get('VolumeId')
+                                    for m in instance.block_device_mappings or []
+                                ],
+                                # Each volume's part of the saving, so an EBS
+                                # check on one of them gives up only that part.
+                                'saving_by_billed_id': by_volume,
                             }
                         ))
                     continue
@@ -465,9 +476,10 @@ class OpenComputeDetectorsMixin:
             return {}
     @staticmethod
     def _price_stopped_instance_volumes(instance, volumes_by_id, region):
-        """``(monthly cost, per-volume lines, volume ids kept on terminate)``
-        for a stopped instance's attached EBS volumes, or None when any
-        attached volume is not in ``volumes_by_id`` (MISSING, not $0).
+        """``(monthly cost, per-volume lines, volume ids kept on terminate,
+        volume id -> its monthly cost)`` for a stopped instance's attached
+        EBS volumes, or None when any attached volume is not in
+        ``volumes_by_id`` (MISSING, not $0).
 
         Storage at the region-scaled per-GB rate plus io1/io2 provisioned
         IOPS (``get_ebs_monthly_cost``); gp3 IOPS/throughput above the free
@@ -476,6 +488,7 @@ class OpenComputeDetectorsMixin:
         total = 0.0
         lines: List[str] = []
         kept: List[str] = []
+        by_volume: Dict[str, float] = {}
         for mapping in instance.block_device_mappings or []:
             ebs = (mapping or {}).get('Ebs') or {}
             volume_id = ebs.get('VolumeId')
@@ -486,10 +499,11 @@ class OpenComputeDetectorsMixin:
                 volume.volume_type, volume.size_gb, iops=volume.iops or 0, region=region,
             )
             total += cost
+            by_volume[volume_id] = round(by_volume.get(volume_id, 0.0) + cost, 4)
             lines.append(f'{volume_id} {volume.size_gb} GB {volume.volume_type} ${cost:.2f}')
             if ebs.get('DeleteOnTermination') is False:
                 kept.append(volume_id)
-        return total, lines, kept
+        return total, lines, kept, by_volume
     # ── Lambda constants ────────────────────────────────────────────────
     # ARM64-compatible runtimes (natively supported by AWS Graviton2)
     ARM64_COMPATIBLE_RUNTIMES = {
@@ -674,11 +688,15 @@ class OpenComputeDetectorsMixin:
                                 * (memory_mb / 1024)
                                 * 0.0000166667
                             )
-                            # Monthly exposure: per-stuck cost × invocations × 1% stuck rate
-                            # Minimum $0.01 — this is primarily a risk/best-practice finding
+                            # Monthly exposure: per-stuck cost × invocations × 1% stuck rate.
+                            # CLO-962: an exposure is what a hang COULD cost, not a recurring
+                            # saving, and a shorter timeout lowers no bill on its own. It goes
+                            # in metadata (like Glue's max_stuck_run_cost_usd), the finding
+                            # reports $0, and the type is in GOVERNANCE_WASTE_TYPES so the $0
+                            # finding is still shown. Nothing here is a saving to count.
                             stuck_rate = 0.01
                             monthly_exposure = waste_per_stuck * metrics.invocations_total * stuck_rate
-                            monthly_savings = max(0.01, round(monthly_exposure, 2))
+                            exposure_shown = max(0.01, round(monthly_exposure, 2))
                             
                             waste_items.append(WasteItem(
                                 id=str(uuid.uuid4()),
@@ -692,7 +710,7 @@ class OpenComputeDetectorsMixin:
                                     f"({timeout_ratio:.0f}× ratio). "
                                     f"Recommended: {recommended_timeout}s."
                                 ),
-                                monthly_savings=monthly_savings,
+                                monthly_savings=0.0,
                                 confidence=ConfidenceLevel.MEDIUM,
                                 action=(
                                     f"Reduce timeout from {func.timeout_seconds}s to "
@@ -706,7 +724,7 @@ class OpenComputeDetectorsMixin:
                                 explanation={
                                     'detection': f'Timeout is {func.timeout_seconds}s but average execution is {metrics.duration_avg_ms:.0f}ms ({timeout_ratio:.0f}× ratio)',
                                     'threshold': 'Timeout ≥ 10× average duration and ≥ 60s, and 3× the longest observed invocation is below the current timeout',
-                                    'pricing': f'Risk exposure: ${monthly_savings:.2f}/month if 1% of invocations hang to full timeout',
+                                    'pricing': f'Risk exposure: ${exposure_shown:.2f}/month if 1% of invocations hang to full timeout (not a saving, not counted in the total)',
                                     'why_waste': f'An excessive timeout means a stuck invocation burns Lambda compute for {func.timeout_seconds}s instead of failing fast. This is a cost-risk and operational-reliability finding.',
                                     'risk': (
                                         f'The longest invocation in the last 30 days took {metrics.duration_max_ms:.0f}ms; '
@@ -722,6 +740,11 @@ class OpenComputeDetectorsMixin:
                                     'timeout_ratio': round(timeout_ratio, 1),
                                     'recommended_timeout_seconds': recommended_timeout,
                                     'invocations_total': metrics.invocations_total,
+                                    # CLO-962: exposure, not a saving. The partner report reads
+                                    # max_stuck_run_cost_usd (one hung run) as the exposure figure.
+                                    'max_stuck_run_cost_usd': round(waste_per_stuck, 4),
+                                    'monthly_exposure_usd': round(monthly_exposure, 2),
+                                    'assumed_stuck_rate': stuck_rate,
                                     'detection_mode': data_provider.provider_type,
                                 },
                             ))
@@ -963,6 +986,7 @@ class OpenComputeDetectorsMixin:
     SAGEMAKER_NOTEBOOK_STORAGE_PER_GB = 0.14
     def _sagemaker_notebook_storage_rate(self, region: str) -> float:
         return self.SAGEMAKER_NOTEBOOK_STORAGE_PER_GB * _region_price_multiplier(region)
+    @us_east_1_prices(skip=(WasteType.STOPPED_SAGEMAKER_NOTEBOOK_STORAGE,))
     async def _detect_sagemaker_waste(
         self,
         data_provider: "WasteDataProvider",
@@ -1355,20 +1379,17 @@ class OpenComputeDetectorsMixin:
             workspaces = await data_provider.get_workspaces()
 
             # ── Bundle pricing maps ───────────────────────────────────
-            price_map = {
-                'VALUE': 21, 'STANDARD': 35, 'PERFORMANCE': 60,
-                'POWER': 78, 'POWERPRO': 127, 'GRAPHICS': 50, 'GRAPHICSPRO': 85
-            }
-            autostop_hourly_rates = {
-                'VALUE': 0.17, 'STANDARD': 0.40, 'PERFORMANCE': 0.57,
-                'POWER': 0.82, 'POWERPRO': 1.53, 'GRAPHICS': 1.75, 'GRAPHICSPRO': 3.18
-            }
-            autostop_base = 7.25
+            # CLO-975 item 7: one table, models.WORKSPACES_ALWAYS_ON_MONTHLY
+            # (list prices, us-east-1). A compute type with no price (the
+            # legacy GRAPHICS bundle, a new bundle) is skipped, not priced at
+            # the $35 and $0.40/hr defaults this used.
+            price_map = WORKSPACES_ALWAYS_ON_MONTHLY
+            autostop_hourly_rates = WORKSPACES_AUTOSTOP_HOURLY
             downgrade_map = {
                 'POWERPRO': 'POWER',
                 'POWER': 'PERFORMANCE',
                 'PERFORMANCE': 'STANDARD',
-                'GRAPHICSPRO': 'GRAPHICS',
+                # GRAPHICSPRO -> GRAPHICS is not suggested: the legacy Graphics bundle has no list price.
             }
 
             # Enrich compute types from bundles if online
@@ -1410,10 +1431,13 @@ class OpenComputeDetectorsMixin:
                     days_idle = (datetime.now(timezone.utc) - last_ts).days
 
                     compute_type = w.compute_type or bundle_compute_types.get(w.bundle_id, 'STANDARD')
-                    monthly_cost = price_map.get(compute_type, 35)
+                    monthly_cost = price_map.get(compute_type)
 
                     # ── Detector A: Idle WorkSpace (>30 days disconnected) ──
                     if days_idle > WORKSPACES_IDLE_DAYS:
+                        if monthly_cost is None:
+                            note_price_unknown(data_provider, 'workspaces', w.workspace_id)
+                            continue
                         waste_items.append(WasteItem(
                             id=str(uuid.uuid4()),
                             resource_id=w.workspace_id,
@@ -1441,7 +1465,11 @@ class OpenComputeDetectorsMixin:
 
                     # ── Detector B: AutoStop Opportunity (AlwaysOn low-usage) ──
                     elif days_idle > WORKSPACES_AUTOSTOP_MIN_IDLE_DAYS and w.running_mode == 'ALWAYS_ON':
-                        hourly_rate = autostop_hourly_rates.get(compute_type, 0.40)
+                        hourly_rate = autostop_hourly_rates.get(compute_type)
+                        autostop_base = WORKSPACES_AUTOSTOP_MONTHLY_BASE.get(compute_type)
+                        if monthly_cost is None or hourly_rate is None or autostop_base is None:
+                            note_price_unknown(data_provider, 'workspaces', w.workspace_id)
+                            continue
                         estimated_usage_hours = 20
                         estimated_autostop_cost = autostop_base + (hourly_rate * estimated_usage_hours)
                         savings = monthly_cost - estimated_autostop_cost
@@ -1518,8 +1546,11 @@ class OpenComputeDetectorsMixin:
                     if not target_type:
                         continue
 
-                    current_price = price_map.get(compute_type, 35)
-                    target_price = price_map.get(target_type, 35)
+                    current_price = price_map.get(compute_type)
+                    target_price = price_map.get(target_type)
+                    if current_price is None or target_price is None:
+                        note_price_unknown(data_provider, 'workspaces', w.workspace_id)
+                        continue
                     potential_savings = current_price - target_price
 
                     if potential_savings < max(settings.min_waste_threshold_usd, WORKSPACES_DOWNGRADE_MIN_SAVINGS_USD):
@@ -1811,12 +1842,6 @@ class OpenComputeDetectorsMixin:
         except Exception as e:
             logger.debug(f"WorkSpaces detection error: {e}")
             return waste_items
-    LIGHTSAIL_DB_PRICING = {
-        'micro_2_0': 15.00,   # 1 vCPU, 1 GB RAM, 40 GB SSD
-        'small_2_0': 30.00,   # 1 vCPU, 2 GB RAM, 80 GB SSD
-        'medium_2_0': 60.00,  # 2 vCPU, 4 GB RAM, 120 GB SSD
-        'large_2_0': 115.00,  # 2 vCPU, 8 GB RAM, 240 GB SSD
-    }
     async def _detect_lightsail_waste(
         self,
         data_provider: "WasteDataProvider",
@@ -2153,18 +2178,20 @@ class OpenComputeDetectorsMixin:
             databases = await data_provider.get_lightsail_databases()
             for db in databases:
                 bundle = db.bundle_id
-                bundle_lower = bundle.lower()
-                monthly_cost = 15.00  # Default to micro
-                for key, price in self.LIGHTSAIL_DB_PRICING.items():
-                    if key in bundle_lower:
-                        monthly_cost = price
-                        break
-
-                # HA doubles the price
-                if db.secondary_availability_zone:
+                # CLO-975: exact bundle id, one table (aws_pricing_service). The
+                # substring match priced xlarge/2xlarge as large and any unknown
+                # bundle at $15. An HA bundle id (`micro_ha_2_0`) is already
+                # priced as HA; a standard bundle id on a database with a
+                # secondary zone is still doubled, as before.
+                monthly_cost = lightsail_database_bundle_monthly_price(bundle)
+                if (monthly_cost is not None and db.secondary_availability_zone
+                        and '_ha_' not in bundle.lower()):
                     monthly_cost *= 2
 
                 if db.state == 'stopped':
+                    if monthly_cost is None:
+                        note_price_unknown(data_provider, 'lightsail', db.name)
+                        continue
                     waste_items.append(WasteItem(
                         id=str(uuid.uuid4()),
                         resource_id=db.name,
@@ -2199,6 +2226,9 @@ class OpenComputeDetectorsMixin:
                         if (metrics.avg_cpu is not None and metrics.avg_cpu < LIGHTSAIL_IDLE_CPU_PCT
                                 and metrics.avg_connections is not None
                                 and metrics.avg_connections < LIGHTSAIL_DB_IDLE_MAX_CONNECTIONS):
+                            if monthly_cost is None:
+                                note_price_unknown(data_provider, 'lightsail', db.name)
+                                continue
                             waste_items.append(WasteItem(
                                 id=str(uuid.uuid4()),
                                 resource_id=db.name,

@@ -1,7 +1,7 @@
 {
   "name": "cloudcostwise",
-  "version": "0.1.23",
-  "description": "Find AWS waste from Claude Code with your own read-only credentials. Runs locally. Nothing is sent to CloudWise unless you choose to share a summary at the end.",
+  "version": "0.1.24",
+  "description": "Find AWS waste from Claude Code, including kinds AWS's own tools don't flag, with your own read-only credentials. Runs locally. Nothing is sent to CloudWise unless you choose to share a summary at the end.",
   "author": { "name": "CloudWise", "url": "https://cloudcostwise.io" },
   "homepage": "https://cloudcostwise.io/cli",
   "repository": "https://github.com/cloudwise-app/cloudcostwise",
@@ -18,7 +18,7 @@
   "mcpServers": {
     "cloudcostwise": {
       "command": "uvx",
-      "args": ["cloudcostwise", "mcp"],
+      "args": ["cloudcostwise==0.1.24", "mcp"],
       "env": { "AWS_PROFILE": "${user_config.aws_profile}" }
     }
   }

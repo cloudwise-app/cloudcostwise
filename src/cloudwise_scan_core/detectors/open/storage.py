@@ -16,29 +16,18 @@ import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, _region_price_multiplier, S3_STANDARD_PER_GB, S3_IT_MONITORING_PER_1K, S3_STANDARD_IA_PER_GB, S3_IT_MIN_TIERABLE_BYTES, S3_TIER2_REQUEST_PRICE
+from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_ebs_monthly_cost, _region_price_multiplier, GP3_FREE_IOPS, GP3_IOPS_PRICE, IO1_IOPS_PRICE, IO2_IOPS_TIERS, provisioned_iops_monthly_cost, EFS_STANDARD_PER_GB, EFS_IA_PER_GB, efs_ia_per_gb, S3_STANDARD_PER_GB, S3_IT_MONITORING_PER_1K, S3_STANDARD_IA_PER_GB, S3_IT_MIN_TIERABLE_BYTES, S3_TIER2_REQUEST_PRICE
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
     from cloudwise_scan_core.data_providers.models import S3CostBreakdown
 
 logger = logging.getLogger(__name__)
 
-# CLO-516: over_provisioned_iops. Provisioned-IOPS list prices (us-east-1,
-# per IOPS-month). gp3 includes 3,000 IOPS free; io1 bills every IOPS; io2
-# bills in tiers (first 32,000, 32,001-64,000, above 64,000).
+# CLO-516: over_provisioned_iops. The provisioned-IOPS list prices
+# (GP3_FREE_IOPS, GP3_IOPS_PRICE, IO1_IOPS_PRICE, IO2_IOPS_TIERS) and
+# provisioned_iops_monthly_cost live in models.py since CLO-975 and are
+# imported above, so get_ebs_monthly_cost prices IOPS the same way.
 OVER_PROVISIONED_IOPS_DAYS = 14
-
-
-GP3_FREE_IOPS = 3000
-
-
-GP3_IOPS_PRICE = 0.005
-
-
-IO1_IOPS_PRICE = 0.065
-
-
-IO2_IOPS_TIERS = ((32000, 0.065), (64000, 0.0455), (None, 0.032))
 
 
 # The lowest IOPS a volume may be set to: gp3's included 3,000, io1/io2's 100.
@@ -323,26 +312,6 @@ def _note_ebs_snapshots_newest(data_provider, withheld: List[tuple]) -> None:
     ))
 
 
-def provisioned_iops_monthly_cost(volume_type: str, iops: int) -> float:
-    """Monthly list price of ``iops`` provisioned IOPS on ``volume_type``."""
-    iops = max(int(iops or 0), 0)
-    if volume_type == 'gp3':
-        return max(iops - GP3_FREE_IOPS, 0) * GP3_IOPS_PRICE
-    if volume_type == 'io1':
-        return iops * IO1_IOPS_PRICE
-    if volume_type == 'io2':
-        cost, floor = 0.0, 0
-        for ceiling, price in IO2_IOPS_TIERS:
-            top = iops if ceiling is None else min(iops, ceiling)
-            if top > floor:
-                cost += (top - floor) * price
-            if ceiling is None or iops <= ceiling:
-                break
-            floor = ceiling
-        return cost
-    return 0.0
-
-
 def min_provisioned_iops(volume) -> int:
     """The lowest IOPS ``volume`` can be set to. io1/io2: 100. gp3: the
     included 3,000, or more when its provisioned throughput needs it (AWS
@@ -465,9 +434,18 @@ class OpenStorageDetectorsMixin:
                 # CLO-359: region-scaled — this table is us-east-1 flat rates
                 # otherwise, so an unattached volume outside us-east-1 always
                 # understated its saving.
-                monthly_cost = get_ebs_monthly_cost(
+                # CLO-975 item 2: an io1/io2 volume also bills its
+                # provisioned IOPS while it sits unattached; the saving left
+                # that charge out. get_ebs_monthly_cost adds it for io1/io2
+                # only (gp3 IOPS above the included 3,000 are not counted).
+                storage_cost = get_ebs_monthly_cost(
                     volume.volume_type, volume.size_gb, region=data_provider.region
                 )
+                monthly_cost = get_ebs_monthly_cost(
+                    volume.volume_type, volume.size_gb,
+                    iops=int(volume.iops or 0), region=data_provider.region,
+                )
+                iops_cost = monthly_cost - storage_cost
                 
                 # Check 1: Unattached volumes
                 if volume.state == 'available':
@@ -488,7 +466,12 @@ class OpenStorageDetectorsMixin:
                             'pricing': (
                                 f'{volume.volume_type}: {volume.size_gb} GB × '
                                 f'${get_ebs_monthly_cost(volume.volume_type, 1, region=data_provider.region):.3f}/GB '
-                                f'= ${monthly_cost:.2f}/month'
+                                + (
+                                    f'(${storage_cost:.2f}) + {int(volume.iops or 0):,} provisioned IOPS '
+                                    f'(${iops_cost:.2f}) '
+                                    if iops_cost > 0 else ''
+                                )
+                                + f'= ${monthly_cost:.2f}/month'
                             ),
                             'why_waste': f'This volume is not attached to any instance. It was likely left behind after an instance was terminated or a snapshot was restored.',
                             'risk': 'Verify no data on this volume is needed before deleting. Consider creating a snapshot first as a safety net.',
@@ -2086,7 +2069,7 @@ class OpenStorageDetectorsMixin:
             
             for fs in filesystems:
                 size_gb = (fs.size_bytes or 0) / (1024 ** 3)
-                monthly_cost = size_gb * 0.30
+                monthly_cost = size_gb * EFS_STANDARD_PER_GB
                 
                 if not fs.has_mount_targets and monthly_cost >= settings.min_waste_threshold_usd:
                     waste_items.append(WasteItem(
@@ -2103,7 +2086,7 @@ class OpenStorageDetectorsMixin:
                         explanation={
                             'detection': f'EFS filesystem has no mount targets (not mounted anywhere)',
                             'threshold': 'Zero mount targets with size > $0 cost',
-                            'pricing': f'{size_gb:.1f} GB × $0.30/GB/month = ${monthly_cost:.2f}/month',
+                            'pricing': f'{size_gb:.1f} GB × ${EFS_STANDARD_PER_GB:.2f}/GB/month = ${monthly_cost:.2f}/month',
                             'why_waste': f'Without mount targets, no EC2 instance or container can access this filesystem. It\'s paying for storage that cannot be read or written.',
                             'risk': 'Verify the filesystem is not in the process of being set up. Back up data with AWS Backup or DataSync before deleting.',
                         },
@@ -2133,11 +2116,24 @@ class OpenStorageDetectorsMixin:
                 )
 
                 if not has_ia_transition and size_gb >= EFS_LIFECYCLE_MIN_SIZE_GB:
-                    # EFS Standard = $0.30/GB/month, IA = $0.025/GB/month
+                    # EFS_STANDARD_PER_GB and efs_ia_per_gb (models.py, CLO-975).
+                    # IA is priced by ThroughputMode: elastic 0.016, bursting /
+                    # provisioned 0.025. A missing or unknown mode (both
+                    # providers read a missing one as 'bursting') takes 0.025,
+                    # the higher price, so the saving is the smaller one.
+                    throughput_mode = (getattr(fs, 'throughput_mode', None) or '').strip().lower()
+                    ia_price = efs_ia_per_gb(throughput_mode)
+                    ia_price_basis = (
+                        'Infrequent Access with Elastic Throughput' if ia_price != EFS_IA_PER_GB
+                        else 'Standard-Infrequent Access (bursting or provisioned throughput)'
+                        if throughput_mode in ('bursting', 'provisioned')
+                        else f"Standard-Infrequent Access (throughput mode '{throughput_mode or 'unknown'}' "
+                             "not recognised: the higher IA price, so the smaller saving)"
+                    )
                     # Typical IA-eligible data: ~80% of files older than 30 days
                     ia_eligible_pct = 0.80
-                    standard_cost = size_gb * 0.30
-                    ia_cost = size_gb * ia_eligible_pct * 0.025 + size_gb * (1 - ia_eligible_pct) * 0.30
+                    standard_cost = size_gb * EFS_STANDARD_PER_GB
+                    ia_cost = size_gb * ia_eligible_pct * ia_price + size_gb * (1 - ia_eligible_pct) * EFS_STANDARD_PER_GB
                     estimated_savings = standard_cost - ia_cost
                     
                     if estimated_savings >= settings.min_waste_threshold_usd:
@@ -2162,12 +2158,13 @@ class OpenStorageDetectorsMixin:
                                 'detection': f'EFS filesystem has no lifecycle policy configured. All {size_gb:.1f} GB stored at Standard tier pricing.',
                                 'threshold': 'EFS filesystems ≥ 1 GB without lifecycle policy',
                                 'pricing': (
-                                    f'Standard: {size_gb:.1f} GB × $0.30/GB = ${standard_cost:.2f}/month. '
-                                    f'With IA (~80% eligible): ${ia_cost:.2f}/month. '
+                                    f'Standard: {size_gb:.1f} GB × ${EFS_STANDARD_PER_GB:.2f}/GB = ${standard_cost:.2f}/month. '
+                                    f'With IA (~80% eligible, ${ia_price:.3f}/GB, {ia_price_basis}): ${ia_cost:.2f}/month. '
                                     f'Savings: ${estimated_savings:.2f}/month.'
                                 ),
                                 'why_waste': (
-                                    'EFS Standard costs $0.30/GB/month vs $0.025/GB/month for Infrequent Access. '
+                                    f'EFS Standard costs ${EFS_STANDARD_PER_GB:.2f}/GB/month vs ${ia_price:.3f}/GB/month for Infrequent Access '
+                                    f'at this file system\'s throughput mode. '
                                     'Without a lifecycle policy, all data stays in Standard regardless of access patterns.'
                                 ),
                                 'risk': (
@@ -2181,6 +2178,9 @@ class OpenStorageDetectorsMixin:
                                 'size_gb': round(size_gb, 2),
                                 'standard_cost': round(standard_cost, 2),
                                 'estimated_ia_cost': round(ia_cost, 2),
+                                'throughput_mode': throughput_mode or None,
+                                'ia_price_per_gb': ia_price,
+                                'ia_price_basis': ia_price_basis,
                                 'detection_mode': data_provider.provider_type,
                             }
                         ))

@@ -901,13 +901,16 @@ class SavingsRecommendationsCacheService:
             total = response.get('Total', {})
             utilization = total.get('Utilization', {})
             amortized = total.get('AmortizedCommitment', {})
+            # CLO-788: NetSavings is under Total.Savings (real response, 2026-11-06),
+            # not Total.Utilization, so it was always cached as 0.
+            savings = total.get('Savings', {})
 
             results.append({
                 'utilization_percentage': float(utilization.get('UtilizationPercentage', '100')),
                 'total_commitment': float(amortized.get('TotalAmortizedCommitment', '0')),
                 'used_commitment': float(utilization.get('UsedCommitment', '0')),
                 'unused_commitment': float(utilization.get('UnusedCommitment', '0')),
-                'net_savings': float(utilization.get('NetSavings', '0')),
+                'net_savings': float(savings.get('NetSavings', '0')),
             })
             return results
         except ClientError as e:

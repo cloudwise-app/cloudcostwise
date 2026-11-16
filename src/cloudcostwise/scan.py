@@ -59,6 +59,9 @@ class ScanReport:
     # CLO-931: findings the user's local exclude list left out (set by exclude.apply, not by a scan).
     excluded_count: int = 0
     excluded_resource_ids: List[str] = field(default_factory=list)
+    # CLO-1057: True only on the recorded sample (demo.py). Every output marks it as sample data and
+    # share.py refuses it on every path. A real scan never sets it.
+    demo: bool = False
 
 
 def spend_window(today: Optional[_dt.date] = None):
@@ -73,10 +76,27 @@ def spend_window(today: Optional[_dt.date] = None):
     return (today - _dt.timedelta(days=30)).isoformat(), today.isoformat()
 
 
+# CLO-962: the spend the score and the partner report compare savings with is the SCANNED ACCOUNT's
+# usage cost, not the organization's and not net of credits. Dimension and record-type names are
+# Cost Explorer's own (botocore ``Dimension``: LINKED_ACCOUNT, RECORD_TYPE).
+SPEND_EXCLUDED_RECORD_TYPES = ["Credit", "Refund"]
+
+
+def spend_filter(account_id: str) -> dict:
+    """The Cost Explorer filter for the spend figure: this account only, credits and refunds left out."""
+    return {"And": [
+        {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [account_id]}},
+        {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": list(SPEND_EXCLUDED_RECORD_TYPES)}}},
+    ]}
+
+
 def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
     """One Cost Explorer GetCostAndUsage request: the last 30 complete days, DAILY, UnblendedCost, no grouping.
 
-    Sets ``report.spend_monthly`` and counts the request in ``report.api_calls``.
+    The request is filtered to the scanned account (LINKED_ACCOUNT) with Credit and Refund record types
+    excluded (CLO-962), so on a management account it is not the whole organization's bill and credits do
+    not net it down. It still covers every region. An unknown account id sends no request and leaves
+    ``spend_monthly`` None. Sets ``report.spend_monthly`` and counts the request in ``report.api_calls``.
     Runs under the read-only guard (GetCostAndUsage is a read; any other
     operation raises ReadOnlyViolation, which is deliberately not caught). Any
     Cost Explorer or network error leaves ``spend_monthly`` None: the score
@@ -84,13 +104,17 @@ def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
     """
     start, end = spend_window()
     total: Optional[float] = None
+    account_id = str(getattr(report, "account_id", "") or "")
+    if not account_id:
+        report.spend_monthly = None
+        return
     with read_only_guard() as guard:
         try:
             client = boto3.client("ce", region_name="us-east-1", aws_access_key_id=creds.access_key_id,
                                   aws_secret_access_key=creds.secret_access_key,
                                   aws_session_token=creds.session_token)
             resp = client.get_cost_and_usage(TimePeriod={"Start": start, "End": end}, Granularity="DAILY",
-                                             Metrics=["UnblendedCost"])
+                                             Metrics=["UnblendedCost"], Filter=spend_filter(account_id))
             total = sum(float(r["Total"]["UnblendedCost"]["Amount"]) for r in resp.get("ResultsByTime", []))
         except (ClientError, BotoCoreError, KeyError, TypeError, ValueError):
             total = None
@@ -170,12 +194,16 @@ def full_engine_class() -> Type[OpenWasteDetectionService]:
 
 def service_class(include_cost_explorer: bool = True, full: bool = False) -> Type[OpenWasteDetectionService]:
     base = full_engine_class() if full else OpenWasteDetectionService
+    # CLO-1002: a local scan runs on the user's own credentials (CLI --profile, the
+    # MCP server, the partner build), so the Price List is read with them first.
+    local = {"PRICE_WITH_SCAN_CREDENTIALS": True}
     if include_cost_explorer:
-        return base
+        return type(base.__name__, (base,), local)
     return type(
         f"{base.__name__}NoCE",
         (base,),
         {
+            **local,
             "DETECTOR_METHODS": {k: v for k, v in base.DETECTOR_METHODS.items() if k not in COST_EXPLORER_DETECTORS},
             "ALWAYS_RUN_DETECTORS": base.ALWAYS_RUN_DETECTORS - COST_EXPLORER_DETECTORS,
             "GLOBAL_SERVICE_DETECTORS": base.GLOBAL_SERVICE_DETECTORS - COST_EXPLORER_DETECTORS,

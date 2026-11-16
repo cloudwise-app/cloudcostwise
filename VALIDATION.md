@@ -14,7 +14,7 @@ ledger, which records how far each one has been proven:
 **Advisory** waste types could not be proven at L2 within our test budget. They are
 shown, labelled, and never added to a savings total.
 
-Summary for the checks in this repository: 1 at L0, 28 at L1, 38 at L2, 23 at L3, 2 at L4.
+Summary for the checks in this repository: 1 at L0, 28 at L1, 38 at L2, 22 at L3, 3 at L4.
 
 This code was written with AI assistance and is validated against real AWS
 resources as described above; the levels below are the evidence.
@@ -104,7 +104,7 @@ proven checks only.
 | `sp_opportunity_sagemaker` | L1 | yes |  |
 | `stopped_ec2_with_ebs` | L3 |  | covered |
 | `stopped_sagemaker_notebook_storage` | L3 |  | none |
-| `unattached_ebs` | L3 |  | covered |
+| `unattached_ebs` | L4 |  | covered |
 | `unattached_eip` | L4 |  | covered |
 | `unencrypted_documentdb_cluster` | L2 |  | covered |
 | `unencrypted_ebs_volume` | L3 |  | covered |

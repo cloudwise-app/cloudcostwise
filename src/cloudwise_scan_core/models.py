@@ -5,10 +5,12 @@ Defines the data structures for waste detection results, settings, and configura
 These models are used throughout the waste detection service.
 """
 
+import functools
 import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 from typing import Dict, Any, Optional, List
 
@@ -411,6 +413,9 @@ GOVERNANCE_WASTE_TYPES: frozenset = frozenset({
     WasteType.EXPIRING_RESERVED_INSTANCE,
     WasteType.EXPIRING_SAVINGS_PLAN,
     WasteType.CONVERTIBLE_RI_EXCHANGE_OPPORTUNITY,
+    # CLO-962: a stuck-invocation exposure is not a recurring saving, so the
+    # finding reports $0 (the exposure sits in metadata) and is still shown.
+    WasteType.LAMBDA_EXCESSIVE_TIMEOUT,
 })
 
 # Membership buys VISIBILITY only, never a savings figure (CLO-448). The floor
@@ -1494,10 +1499,145 @@ EC2_PRICING = {
 }
 
 EBS_PRICING = {
-    # Per GB-month pricing (US East)
+    # Per GB-month pricing (US East). CLO-975: the only EBS per-GB table;
+    # AWSPricingService.FALLBACK_EBS_PRICING and
+    # WasteDetectionService._estimate_ebs_monthly_cost read it. sc1 is $0.015
+    # per GB-month ("Cold HDD (sc1) provisioned storage - US East (Northern
+    # Virginia)"; AWS Price List API, AmazonEC2, us-east-1, read 2026-11-13).
+    # It was 0.025 here, which overstated an sc1 volume by two thirds.
     "gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125,
-    "st1": 0.045, "sc1": 0.025, "standard": 0.05,
+    "st1": 0.045, "sc1": 0.015, "standard": 0.05,
 }
+
+# Provisioned-IOPS list prices (us-east-1, per IOPS-month). gp3 includes
+# 3,000 IOPS; io1 bills every IOPS; io2 bills in tiers (first 32,000,
+# 32,001-64,000, above 64,000). CLO-516 put these in
+# detectors/open/storage.py; CLO-975 moved them here so
+# get_ebs_monthly_cost and the over-provisioned-IOPS check price IOPS the
+# same way (storage.py re-exports them). io2 above 64,000 IOPS is
+# $0.03185 (AWS Price List API, AmazonEC2 us-east-1 offer, SKU
+# AX8G343U7JZBRKJB, usage type EBS:VolumeP-IOPS.io2.tier3, effective
+# 2026-11-01; AWS's description text rounds it to $0.032).
+GP3_FREE_IOPS = 3000
+GP3_IOPS_PRICE = 0.005
+IO1_IOPS_PRICE = 0.065
+IO2_IOPS_TIERS = ((32000, 0.065), (64000, 0.0455), (None, 0.03185))
+
+
+def provisioned_iops_monthly_cost(volume_type: str, iops: int) -> float:
+    """Monthly list price of ``iops`` provisioned IOPS on ``volume_type``."""
+    iops = max(int(iops or 0), 0)
+    if volume_type == 'gp3':
+        return max(iops - GP3_FREE_IOPS, 0) * GP3_IOPS_PRICE
+    if volume_type == 'io1':
+        return iops * IO1_IOPS_PRICE
+    if volume_type == 'io2':
+        cost, floor = 0.0, 0
+        for ceiling, price in IO2_IOPS_TIERS:
+            top = iops if ceiling is None else min(iops, ceiling)
+            if top > floor:
+                cost += (top - floor) * price
+            if ceiling is None or iops <= ceiling:
+                break
+            floor = ceiling
+        return cost
+    return 0.0
+
+PRICE_UNKNOWN_REASON = "price unknown, saving not estimated"
+
+
+def price_note_service(service: str) -> str:
+    """The note-channel service key for a price-unknown note ("<svc> price")."""
+    return f"{service} price"
+
+
+def note_price_unknown(data_provider, service: str, resource_id: str, what: str = "list price") -> None:
+    """Withhold a finding whose saving needs a price CloudWise does not have.
+
+    CLO-975: an unknown instance class, node type or bundle used to be priced
+    at an invented default ($0.10, $0.15, $1.00, $0.20 an hour, $15 a month).
+    The finding is now skipped and the scan's data warnings say "price
+    unknown, saving not estimated" for the resource (MISSING, not zero). A
+    test double without the provider's note channel is skipped."""
+    note = getattr(data_provider, '_note_idle_verdict_missing', None)
+    if callable(note):
+        # The note state is keyed by service only, and the idle-metric notes of
+        # the same services (workspaces, redshift, opensearch, lightsail,
+        # beanstalk) use the bare name: a price note under it would be deduped
+        # away or relabel earlier ids. Same pattern as KINESIS_EFO_NOTE_SERVICE.
+        note(price_note_service(service), resource_id, PRICE_UNKNOWN_REASON,
+             verdict='saving', evidence=f"{what}s")
+
+
+# CLO-975 item 7: WorkSpaces, one table. AWS Price List, AmazonWorkSpaces,
+# us-east-1 (location US East (N. Virginia)), read 2026-11-14. Basis: Windows,
+# license included, Basic utilities (usage types USE1-AW-HW-*), at each bundle's
+# smallest volume configuration (the lowest price, so the smaller saving), per
+# month. Keyed by the API's ComputeType name. The price depends on the bundle's
+# root and user volumes (Power $70 at 80+10 GB to $78 at 175+100 GB, PowerPro
+# $127 to $140); a WorkSpace with larger volumes costs more, so a saving built
+# from this table can only be understated. The legacy GRAPHICS bundle has no
+# price in the list, so it is absent: no saving is estimated for it.
+WORKSPACES_ALWAYS_ON_MONTHLY = {
+    "VALUE": 25.0,               # USE1-AW-HW-5   (Value, 80 GB root + 10 GB user)
+    "STANDARD": 33.0,            # USE1-AW-HW-1-0 (Standard, 80 + 10)
+    "PERFORMANCE": 45.0,         # USE1-AW-HW-3-0 (Performance, 80 + 10)
+    "POWER": 70.0,               # USE1-AW-HW-8-0 (Power, 80 + 10)
+    "POWERPRO": 127.0,           # USE1-AW-HW-10-0 (PowerPro, 80 + 10)
+    "GRAPHICSPRO": 999.0,        # USE1-AW-HW-12  (GraphicsPro, 100 + 100)
+    "GRAPHICS_G4DN": 537.0,      # USE1-AW-HW-GFX-G4DN (100 + 100)
+    "GRAPHICSPRO_G4DN": 959.0,   # USE1-AW-HW-GFXPRO-G4DN (100 + 100)
+}
+
+# AutoStop billing, same basis: the per-hour usage rate (USE1-AW-HW-*-AutoStop-
+# Usage) and the monthly fee per WorkSpace (USE1-AW-HW-*-AutoStop-User; $7.25
+# at 80 + 10 GB on the Value to PowerPro bundles, $66 on GraphicsPro).
+WORKSPACES_AUTOSTOP_HOURLY = {
+    "VALUE": 0.22, "STANDARD": 0.30, "PERFORMANCE": 0.47, "POWER": 0.68,
+    "POWERPRO": 1.53, "GRAPHICSPRO": 11.62, "GRAPHICS_G4DN": 1.54,
+    "GRAPHICSPRO_G4DN": 11.16,
+}
+WORKSPACES_AUTOSTOP_MONTHLY_BASE = {
+    "VALUE": 7.25, "STANDARD": 7.25, "PERFORMANCE": 7.25, "POWER": 7.25,
+    "POWERPRO": 7.25, "GRAPHICSPRO": 66.0, "GRAPHICS_G4DN": 22.0,
+    "GRAPHICSPRO_G4DN": 66.0,
+}
+
+US_EAST_1_PRICES_NOTE = (
+    "Prices are us-east-1 list prices; they are not adjusted for the region "
+    "the resource runs in."
+)
+
+
+def us_east_1_prices(skip=()):
+    """Decorator for an async detector whose prices are built-in us-east-1 list
+    prices with no region scaling (SageMaker, Redshift, OpenSearch, Neptune,
+    EMR: CLO-975 item 9, owner decision "accept for now, but say so").
+
+    Appends ``US_EAST_1_PRICES_NOTE`` to every returned finding's
+    ``explanation['pricing']``, except findings whose waste type value is in
+    ``skip`` (a price in that detector that IS region-scaled)."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def inner(*args, **kwargs):
+            items = await fn(*args, **kwargs)
+            for item in items or []:
+                if getattr(item, "waste_type", None) in skip:
+                    continue
+                explanation = getattr(item, "explanation", None)
+                if isinstance(explanation, dict):
+                    current = explanation.get("pricing")
+                    if US_EAST_1_PRICES_NOTE not in str(current or ""):
+                        explanation["pricing"] = (
+                            f"{current} {US_EAST_1_PRICES_NOTE}" if current else US_EAST_1_PRICES_NOTE
+                        )
+            return items
+
+        return inner
+
+    return wrap
+
 
 RDS_PRICING = {
     # On-Demand hourly pricing (US East) - monthly = hourly * 730
@@ -1512,17 +1652,154 @@ RDS_PRICING = {
     "db.m5.large": 0.171, "db.m5.xlarge": 0.342, "db.m5.2xlarge": 0.684,
     "db.m6i.large": 0.171, "db.m6i.xlarge": 0.342, "db.m6i.2xlarge": 0.684,
     "db.r5.large": 0.24, "db.r5.xlarge": 0.48, "db.r5.2xlarge": 0.96,
+    # CLO-975 item 5: the rows below were missing, so db.r6g/db.r7g (common
+    # Aurora and RDS classes) priced at an invented $0.10/hr. All are RDS for
+    # MySQL, Single-AZ, license model "No license required" (not "License
+    # included"), On-Demand, us-east-1: AWS Price List API, AmazonRDS, productFamily "Database Instance", deploymentOption
+    # Single-AZ, databaseEngine MySQL, read 2026-11-14 (publication
+    # 2026-11-13T21:52:33Z). The same basis as every row above (r5.large
+    # 0.24 is the MySQL rate). Aurora and PostgreSQL list their own, higher
+    # rates (r6g.large Aurora MySQL 0.26, PostgreSQL 0.225).
+    "db.m5.4xlarge": 1.368,
+    "db.r5.4xlarge": 1.92, "db.r5.8xlarge": 3.84, "db.r5.12xlarge": 5.76,
+    "db.r5.16xlarge": 7.68, "db.r5.24xlarge": 11.52,
+    "db.r6g.large": 0.215, "db.r6g.xlarge": 0.43, "db.r6g.2xlarge": 0.859,
+    "db.r6g.4xlarge": 1.718, "db.r6g.8xlarge": 3.437, "db.r6g.12xlarge": 5.155,
+    "db.r6g.16xlarge": 6.874,
+    "db.r6i.large": 0.24, "db.r6i.xlarge": 0.48, "db.r6i.2xlarge": 0.96,
+    "db.r6i.4xlarge": 1.92, "db.r6i.8xlarge": 3.84, "db.r6i.12xlarge": 5.76,
+    "db.r6i.16xlarge": 7.68, "db.r6i.24xlarge": 11.52, "db.r6i.32xlarge": 15.36,
+    "db.r7g.large": 0.239, "db.r7g.xlarge": 0.478, "db.r7g.2xlarge": 0.956,
+    "db.r7g.4xlarge": 1.913, "db.r7g.8xlarge": 3.825, "db.r7g.12xlarge": 5.738,
+    "db.r7g.16xlarge": 7.65,
+    # CLO-975 review (N1): more common classes, same basis and same price
+    # file (AmazonRDS, us-east-1, publication 2026-11-13T21:52:33Z): RDS for
+    # MySQL, Single-AZ, On-Demand, license model "No license required". Without
+    # a row a class has no price, and Idle RDS withholds its finding.
+    "db.m6g.large": 0.152, "db.m6g.xlarge": 0.304, "db.m6g.2xlarge": 0.608,
+    "db.m6g.4xlarge": 1.216, "db.m6g.8xlarge": 2.432, "db.m6g.12xlarge": 3.648,
+    "db.m6g.16xlarge": 4.864,
+    "db.m7g.large": 0.168, "db.m7g.xlarge": 0.337, "db.m7g.2xlarge": 0.674,
+    "db.m7g.4xlarge": 1.348, "db.m7g.8xlarge": 2.696, "db.m7g.12xlarge": 4.044,
+    "db.m7g.16xlarge": 5.392,
+    "db.m7i.large": 0.178, "db.m7i.xlarge": 0.356, "db.m7i.2xlarge": 0.712,
+    "db.m7i.4xlarge": 1.424, "db.m7i.8xlarge": 2.848, "db.m7i.12xlarge": 4.272,
+    "db.m7i.16xlarge": 5.696, "db.m7i.24xlarge": 8.544, "db.m7i.48xlarge": 17.088,
+    "db.m8g.large": 0.168, "db.m8g.xlarge": 0.336, "db.m8g.2xlarge": 0.672,
+    "db.m8g.4xlarge": 1.344, "db.m8g.8xlarge": 2.688, "db.m8g.12xlarge": 4.032,
+    "db.m8g.16xlarge": 5.376, "db.m8g.24xlarge": 8.064, "db.m8g.48xlarge": 16.128,
+    "db.r7i.large": 0.25, "db.r7i.xlarge": 0.5, "db.r7i.2xlarge": 1, "db.r7i.4xlarge": 2,
+    "db.r7i.8xlarge": 4, "db.r7i.12xlarge": 6, "db.r7i.16xlarge": 8, "db.r7i.24xlarge": 12,
+    "db.r7i.48xlarge": 24,
+    "db.r8g.large": 0.239, "db.r8g.xlarge": 0.478, "db.r8g.2xlarge": 0.956,
+    "db.r8g.4xlarge": 1.912, "db.r8g.8xlarge": 3.824, "db.r8g.12xlarge": 5.736,
+    "db.r8g.16xlarge": 7.648, "db.r8g.24xlarge": 11.472, "db.r8g.48xlarge": 22.944,
+    "db.r5b.large": 0.296, "db.r5b.xlarge": 0.592, "db.r5b.2xlarge": 1.184,
+    "db.r5b.4xlarge": 2.368, "db.r5b.8xlarge": 4.736, "db.r5b.12xlarge": 7.104,
+    "db.r5b.16xlarge": 9.472, "db.r5b.24xlarge": 14.208,
+    "db.r5d.large": 0.286, "db.r5d.xlarge": 0.571, "db.r5d.2xlarge": 1.143,
+    "db.r5d.4xlarge": 2.286, "db.r5d.8xlarge": 4.571, "db.r5d.12xlarge": 6.857,
+    "db.r5d.16xlarge": 9.143, "db.r5d.24xlarge": 13.714,
+    "db.m5d.large": 0.21, "db.m5d.xlarge": 0.419, "db.m5d.2xlarge": 0.838,
+    "db.m5d.4xlarge": 1.676, "db.m5d.8xlarge": 3.352, "db.m5d.12xlarge": 5.028,
+    "db.m5d.16xlarge": 6.705, "db.m5d.24xlarge": 10.057,
+    "db.m4.large": 0.175, "db.m4.xlarge": 0.35, "db.m4.2xlarge": 0.7, "db.m4.4xlarge": 1.401,
+    "db.m4.10xlarge": 3.502, "db.m4.16xlarge": 5.6,
+    "db.r4.large": 0.24, "db.r4.xlarge": 0.48, "db.r4.2xlarge": 0.96, "db.r4.4xlarge": 1.92,
+    "db.r4.8xlarge": 3.84, "db.r4.16xlarge": 7.68,
+    "db.t2.micro": 0.017, "db.t2.small": 0.034, "db.t2.medium": 0.068, "db.t2.large": 0.136,
+    "db.t2.xlarge": 0.272, "db.t2.2xlarge": 0.544,
+    "db.x2g.large": 0.326, "db.x2g.xlarge": 0.652, "db.x2g.2xlarge": 1.304,
+    "db.x2g.4xlarge": 2.608, "db.x2g.8xlarge": 5.216, "db.x2g.12xlarge": 7.824,
+    "db.x2g.16xlarge": 10.432,
 }
 
-# Fixed monthly costs
-EIP_MONTHLY_COST = 3.65  # Unattached EIP
-NAT_GATEWAY_MONTHLY_BASE = 32.40  # NAT Gateway base cost (+ data transfer)
-ALB_MONTHLY_BASE = 16.20  # ALB base cost (+ LCU hours)
-NLB_MONTHLY_BASE = 16.20  # NLB base cost (+ LCU hours)
-CLB_MONTHLY_BASE = 18.25  # Classic LB base cost ($0.025/hr × 730 hrs)
+# Fixed monthly costs. CLO-975: every monthly figure below is an hourly
+# us-east-1 list price × HOURS_PER_MONTH (730, the basis AWS's own pricing
+# pages and calculator use), rounded half-up to the cent. Until CLO-975 NAT
+# Gateway and ALB/NLB used 720 hours (32.40, 16.20) while EIP and Classic LB
+# used 730, so the Classic-to-ALB saving subtracted one basis from the other.
+# AWSPricingService.FALLBACK_*_HOURLY read the hourly rates from here.
+HOURS_PER_MONTH = 730
+
+
+def monthly_from_hourly(hourly: float) -> float:
+    """``hourly`` × 730, rounded half-up to the cent (0.0225 → 16.43).
+
+    Decimal arithmetic, so a product on a half cent (16.425) always rounds
+    up instead of following the float's binary representation.
+    """
+    return float(
+        (Decimal(str(hourly)) * HOURS_PER_MONTH).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
+
+
+EIP_IDLE_HOURLY = 0.005               # Public IPv4 address, per hour
+NAT_GATEWAY_HOURLY = 0.045            # NAT Gateway, per hour (+ data processing)
+ALB_HOURLY = 0.0225                   # Application Load Balancer, per hour (+ LCU)
+NLB_HOURLY = 0.0225                   # Network Load Balancer, per hour (+ NLCU)
+CLB_HOURLY = 0.025                    # Classic Load Balancer, per hour
+VPC_INTERFACE_ENDPOINT_AZ_HOURLY = 0.01   # Interface endpoint, per AZ per hour
+TRANSFER_PROTOCOL_HOURLY = 0.30       # Transfer Family server, per enabled protocol per hour
+TRANSFER_WEB_APP_UNIT_HOURLY = 0.50   # Transfer Family web app, per unit per hour
+
+EIP_MONTHLY_COST = monthly_from_hourly(EIP_IDLE_HOURLY)              # 3.65
+NAT_GATEWAY_MONTHLY_BASE = monthly_from_hourly(NAT_GATEWAY_HOURLY)   # 32.85 (+ data transfer)
+ALB_MONTHLY_BASE = monthly_from_hourly(ALB_HOURLY)                   # 16.43 (+ LCU hours)
+NLB_MONTHLY_BASE = monthly_from_hourly(NLB_HOURLY)                   # 16.43 (+ LCU hours)
+CLB_MONTHLY_BASE = monthly_from_hourly(CLB_HOURLY)                   # 18.25
 ALB_LCU_HOURLY = 0.008    # ALB LCU-hour rate (us-east-1)
 NLB_NLCU_HOURLY = 0.006   # NLB NLCU-hour rate (us-east-1)
-VPC_ENDPOINT_MONTHLY = 7.20  # Per AZ per month
+# CLO-975: replaces VPC_ENDPOINT_MONTHLY = 7.20, which nothing used and which
+# disagreed with the 7.30 the unused-endpoint check typed inline.
+VPC_INTERFACE_ENDPOINT_AZ_MONTHLY = monthly_from_hourly(VPC_INTERFACE_ENDPOINT_AZ_HOURLY)  # 7.30
+TRANSFER_PROTOCOL_MONTHLY = monthly_from_hourly(TRANSFER_PROTOCOL_HOURLY)            # 219.00
+TRANSFER_WEB_APP_UNIT_MONTHLY = monthly_from_hourly(TRANSFER_WEB_APP_UNIT_HOURLY)    # 365.00
+# CLO-975: Kinesis Data Streams provisioned shard-hour, us-east-1 (AWS Price List,
+# AmazonKinesis, usage type Storage-ShardHour, $0.015 per provisioned shard-hour,
+# read 2026-11-14). The detector typed "$11" per shard-month twice, three ways
+# with this rate (0.015 x 730 = 10.95).
+KINESIS_SHARD_HOURLY = 0.015
+# CLO-975: MSK broker storage, us-east-1 (AWS Price List, AmazonMSK, usage type
+# USE1-Kafka.Storage.GP2, $0.10 per GB-month, publication 2026-11-11T00:23:59Z).
+# Billed per GB of EBS volume provisioned on each broker.
+MSK_STORAGE_PER_GB_MONTH = 0.10
+KINESIS_SHARD_MONTHLY = monthly_from_hourly(KINESIS_SHARD_HOURLY)    # 10.95
+# Kinesis enhanced fan-out: the consumer-shard-hour charge. This is a different
+# usage type from the provisioned shard-hour above; the rate happens to be the
+# same number (0.015), so it has its own constant and must not reuse
+# KINESIS_SHARD_HOURLY. Verified against the AWS Price List (AmazonKinesis,
+# us-east-1, publication 2026-11-10T16:19:53Z): usage type EnhancedFanoutHour,
+# unit ConsumerShardHour, $0.015 per enhanced fan-out consumer-shard hour.
+KINESIS_EFO_CONSUMER_SHARD_HOURLY = 0.015
+KINESIS_EFO_CONSUMER_SHARD_MONTHLY = monthly_from_hourly(KINESIS_EFO_CONSUMER_SHARD_HOURLY)  # 10.95 per shard
+
+# EFS list prices (us-east-1, per GB-month; AWS Price List API, AmazonEFS,
+# us-east-1, read 2026-11-13). CLO-975: the only EFS table; the EFS checks
+# and AWSPricingService.FALLBACK_EFS_PRICING read these. Infrequent Access
+# has two prices by the file system's ThroughputMode: Standard-Infrequent
+# Access (USE1-IATimedStorage-ByteHrs, bursting or provisioned throughput)
+# $0.025, and Infrequent Access with Elastic Throughput
+# (USE1-IATimedStorage-ET-ByteHrs) $0.016. The detector used 0.025 for every
+# file system and the pricing service 0.016; neither was simply wrong.
+# These are Regional (multi-AZ) prices; One Zone file systems ($0.16 and
+# $0.0133) are not told apart yet (no AvailabilityZoneName in
+# EFSFilesystemData).
+EFS_STANDARD_PER_GB = 0.30
+EFS_IA_PER_GB = 0.025            # bursting / provisioned throughput
+EFS_IA_ELASTIC_PER_GB = 0.016    # elastic throughput
+
+
+def efs_ia_per_gb(throughput_mode: Optional[str]) -> float:
+    """EFS Infrequent Access price for a file system's ThroughputMode.
+
+    ``elastic`` -> 0.016; ``bursting``, ``provisioned`` and anything unknown or
+    missing -> 0.025, the higher price, so an unread mode gives the smaller
+    (conservative) lifecycle saving.
+    """
+    if (throughput_mode or "").strip().lower() == "elastic":
+        return EFS_IA_ELASTIC_PER_GB
+    return EFS_IA_PER_GB
 
 # S3 pricing constants (us-east-1, first 50 TB tier). Confirmed 2026-10-14
 # against the AWS Price List API offer file (pricing.us-east-1.amazonaws.com/
@@ -1595,18 +1872,33 @@ def get_ebs_monthly_cost(
     mult = _region_price_multiplier(region)
     base_cost = EBS_PRICING.get(volume_type, 0.10) * mult * size_gb
 
-    # Add IOPS cost for io1/io2
+    # Add IOPS cost for io1/io2 (CLO-975: io2 in its tiers, as the
+    # over-provisioned-IOPS check prices it; it was a flat 0.065 here)
     if volume_type in ("io1", "io2") and iops > 0:
-        base_cost += iops * 0.065 * mult  # Per provisioned IOPS-month
+        base_cost += provisioned_iops_monthly_cost(volume_type, iops) * mult
 
     return base_cost
 
 
+def rds_hourly_price(instance_class: Optional[str]) -> Optional[float]:
+    """us-east-1 on-demand hourly price of an RDS instance class, or None.
+
+    CLO-975 item 5: an unknown class has no price. It used to read as $0.10
+    an hour ($73 a month), which is wrong for nearly every class a database
+    actually runs on; callers now skip the saving and say the price is unknown.
+    """
+    return RDS_PRICING.get(instance_class or "")
+
+
 def get_rds_monthly_cost(
     instance_class: str, multi_az: bool = False, region: Optional[str] = None
-) -> float:
-    """Get estimated monthly cost for an RDS instance, region-scaled (CLO-359)."""
-    hourly = RDS_PRICING.get(instance_class, 0.10)  # Default to $0.10/hr
+) -> Optional[float]:
+    """Estimated monthly cost for an RDS instance, region-scaled (CLO-359), or
+    None when the instance class is not in ``RDS_PRICING`` (CLO-975: price
+    unknown, saving not estimated; there is no default price)."""
+    hourly = rds_hourly_price(instance_class)
+    if hourly is None:
+        return None
     hourly *= _region_price_multiplier(region)
     monthly = hourly * 730
 
@@ -1617,5 +1909,22 @@ def get_rds_monthly_cost(
 
 
 def get_eip_monthly_cost(region: Optional[str] = None) -> float:
-    """Get estimated monthly cost for an idle/unattached Elastic IP, region-scaled (CLO-359)."""
-    return EIP_MONTHLY_COST * _region_price_multiplier(region)
+    """Monthly cost of one public IPv4 address (CLO-1036 item 1).
+
+    The same in every commercial region: the AWS Price List (AmazonVPC,
+    PublicIPv4:IdleAddress and :InUseAddress, publication 2026-11-05) lists
+    $0.005 an hour in us-east-1, eu-west-1, sa-east-1 and ap-southeast-2, and
+    (read 2026-11-15, per-region index files, same publication) in every
+    opt-in commercial region: af-south-1, ap-east-1, ap-east-2, ap-south-2,
+    ap-southeast-3, -4, -5 and -7, ca-west-1, eu-central-2, eu-south-1,
+    eu-south-2, il-central-1, me-central-1, me-south-1 and mx-central-1, plus
+    us-gov-east-1 and us-gov-west-1. The public file has no China region
+    (cn-north-1, cn-northwest-1; China bills in CNY). A hosted scan cannot
+    reach GovCloud or China: the role ARN must start ``arn:aws:iam::``
+    (backend/app/models/aws.py, models/user.py, endpoints/aws_accounts.py), and
+    GovCloud and China role ARNs start ``arn:aws-us-gov:`` and ``arn:aws-cn:``.
+    It used to be scaled by the region multiplier (CLO-359), which overstated the
+    saving outside the US ($5.29 in sa-east-1). ``region`` is accepted for
+    callers' sake and ignored.
+    """
+    return EIP_MONTHLY_COST

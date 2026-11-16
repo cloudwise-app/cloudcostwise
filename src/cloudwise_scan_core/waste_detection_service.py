@@ -52,12 +52,14 @@ from cloudwise_scan_core.models import (
     generate_deterministic_id,
     GOVERNANCE_WASTE_TYPES,
     COMMITMENT_WASTE_TYPES,
+    EBS_PRICING,
 )
 from cloudwise_scan_core.cloudwatch_metrics_service import (
     get_cloudwatch_metrics_service,
 )
 from cloudwise_scan_core.aws_pricing_service import (
     get_pricing_service,
+    run_with_scan_pricing_session,
 )
 from cloudwise_scan_core.data_providers import (
     WasteDataProvider,
@@ -420,6 +422,405 @@ NO_DETECTOR_SERVICE_SUFFIXES: Tuple[str, ...] = (
 )
 
 
+# CLO-961: three trusted types can name the same EBS volume (a gp2 -> gp3
+# migration, an IOPS reduction, and a Compute Optimizer recommendation that
+# covers both), and every surface sums ``monthly_savings``. Order is the tie
+# break: the Compute Optimizer finding is the broadest, so it counts on a tie.
+EBS_OVERLAP_PRIORITY: Tuple[str, ...] = (
+    WasteType.OVERSIZED_EBS_OPTIMIZER.value,
+    WasteType.OVER_PROVISIONED_IOPS.value,
+    WasteType.GP2_MIGRATION.value,
+)
+
+# CLO-1012: the same rule across every type whose saving is billed under ids
+# another type also claims. A Beanstalk environment's checks claim its
+# instances, root volumes and load balancer; the load balancer checks claim
+# that same ``awseb-`` load balancer; ``stopped_ec2_with_ebs`` claims its
+# volumes, which the EBS volume checks name too. Order is the tie break,
+# broadest first: a finding that removes the whole environment or instance
+# beats one that changes part of it, and a Beanstalk finding beats a load
+# balancer check on the same load balancer, because deleting an ``awseb-``
+# load balancer by hand breaks the environment that manages it. The EBS
+# types keep their CLO-961 order relative to each other.
+SAVING_OVERLAP_PRIORITY: Tuple[str, ...] = (
+    WasteType.IDLE_BEANSTALK.value,
+    WasteType.BEANSTALK_IDLE_TRAFFIC.value,
+    WasteType.STOPPED_EC2_WITH_EBS.value,
+    WasteType.BEANSTALK_UNNECESSARY_ALB.value,
+    *EBS_OVERLAP_PRIORITY,
+    WasteType.BEANSTALK_OVER_PROVISIONED.value,
+    WasteType.BEANSTALK_PREVIOUS_GEN_INSTANCES.value,
+    WasteType.IDLE_LOAD_BALANCER.value,
+    WasteType.LOW_TRAFFIC_ALB.value,
+    WasteType.HIGH_LCU_COST_ALB.value,
+)
+
+_BEANSTALK_OVERLAP_TYPES = frozenset({
+    WasteType.IDLE_BEANSTALK.value,
+    WasteType.BEANSTALK_IDLE_TRAFFIC.value,
+    WasteType.BEANSTALK_UNNECESSARY_ALB.value,
+    WasteType.BEANSTALK_OVER_PROVISIONED.value,
+    WasteType.BEANSTALK_PREVIOUS_GEN_INSTANCES.value,
+})
+
+# Claim kinds. Hyphenated so they can never read as an AWS field name
+# (scripts/generate_export_keep_fields.py scans this module).
+_CLAIM_LB = "claim-load-balancer"
+_CLAIM_VOLUME = "claim-ebs-volume"
+_CLAIM_INSTANCE = "claim-ec2-instance"
+_OVERLAP_NOUN = {_CLAIM_LB: "load balancer", _CLAIM_VOLUME: "volume", _CLAIM_INSTANCE: "instances"}
+
+
+def _waste_type_value(waste_type: Any) -> str:
+    return waste_type.value if isinstance(waste_type, WasteType) else str(waste_type)
+
+
+def _lb_claim_key(value: str, kind: str = "") -> Optional[Tuple[str, str, str]]:
+    """``(_CLAIM_LB, namespace, name)`` for a load balancer ARN or name.
+
+    ALB and NLB names share one namespace (elbv2); Classic names are separate.
+    """
+    value = str(value or "")
+    if value.startswith("arn:") and ":loadbalancer/" in value:
+        tail = value.split(":loadbalancer/", 1)[1]
+        parts = tail.split("/")
+        if len(parts) >= 3 and parts[0] in ("app", "net", "gwy"):
+            return (_CLAIM_LB, "elbv2", parts[1])
+        if len(parts) == 1 and parts[0]:
+            return (_CLAIM_LB, "classic", parts[0])
+        return None
+    if not value:
+        return None
+    return (_CLAIM_LB, "classic" if str(kind).lower() in ("classic", "elb") else "elbv2", value)
+
+
+def _overlap_claim_keys(item: WasteItem) -> Set[Tuple[str, ...]]:
+    """The billed resources a finding's saving claims, from ids the detector
+    already knows (never from CUR matches, so the rule also holds on accounts
+    without resource-level CUR). Empty for types outside the rule."""
+    wt = _waste_type_value(item.waste_type)
+    meta = item.metadata if isinstance(item.metadata, dict) else {}
+    keys: Set[Tuple[str, ...]] = set()
+    if wt in EBS_OVERLAP_PRIORITY:
+        if item.resource_id:
+            keys.add((_CLAIM_VOLUME, item.resource_id))
+    elif wt == WasteType.STOPPED_EC2_WITH_EBS.value:
+        for b in meta.get("cur_billed_ids") or ():
+            if str(b).startswith("vol-"):
+                keys.add((_CLAIM_VOLUME, str(b)))
+    elif wt in _BEANSTALK_OVERLAP_TYPES:
+        for b in meta.get("cur_billed_ids") or ():
+            b = str(b)
+            if b.startswith("vol-"):
+                keys.add((_CLAIM_VOLUME, b))
+            elif b.startswith("i-"):
+                keys.add((_CLAIM_INSTANCE, b))
+            elif b.startswith("arn:"):
+                lb = _lb_claim_key(b)
+                if lb:
+                    keys.add(lb)
+        lb_name = meta.get("load_balancer_name")
+        if lb_name:
+            lb = _lb_claim_key(lb_name, meta.get("load_balancer_kind", ""))
+            if lb:
+                keys.add(lb)
+    elif wt in (WasteType.LOW_TRAFFIC_ALB.value, WasteType.HIGH_LCU_COST_ALB.value):
+        lb = _lb_claim_key(item.resource_id, "application")
+        if lb:
+            keys.add(lb)
+    elif wt == WasteType.IDLE_LOAD_BALANCER.value:
+        lb = _lb_claim_key(item.resource_id, meta.get("lb_type", ""))
+        if lb:
+            keys.add(lb)
+    return keys
+
+
+def _billed_id_claim_key(item: WasteItem, billed_id: str) -> Optional[Tuple[str, ...]]:
+    """The claim key one of a finding's ``cur_billed_ids`` maps to, the same
+    way :func:`_overlap_claim_keys` maps it, or ``None``."""
+    b = str(billed_id or "")
+    if b.startswith("vol-"):
+        return (_CLAIM_VOLUME, b)
+    if b.startswith("i-"):
+        return (_CLAIM_INSTANCE, b)
+    if b.startswith("arn:"):
+        return _lb_claim_key(b)
+    meta = item.metadata if isinstance(item.metadata, dict) else {}
+    if b and b == meta.get("load_balancer_name"):
+        return _lb_claim_key(b, meta.get("load_balancer_kind", ""))
+    return None
+
+
+def _overlap_claim_shares(item: WasteItem, keys: Set[Tuple[str, ...]]) -> Dict[Tuple[str, ...], float]:
+    """The most of the finding's counted saving that can sit on each resource
+    it claims (CLO-1012).
+
+    A detector that knows its saving's parts gives them as
+    ``metadata['saving_by_billed_id']`` (billed id -> upper bound, in the
+    estimate's own arithmetic). Every claim without a part, and every claim
+    of a finding whose saving reconciliation lowered (the bill may then put
+    more of the smaller figure on one part than the estimate did), is
+    bounded by the whole saving. No part is ever above the whole saving.
+    """
+    total = max(float(item.monthly_savings or 0.0), 0.0)
+    shares = {k: total for k in keys}
+    meta = item.metadata if isinstance(item.metadata, dict) else {}
+    parts = meta.get("saving_by_billed_id")
+    listed = item.estimated_savings_list_price
+    lowered = listed is not None and total < float(listed) - 1e-9
+    if not isinstance(parts, dict) or lowered:
+        return shares
+    for billed_id, amount in parts.items():
+        key = _billed_id_claim_key(item, billed_id)
+        if key is None:
+            continue
+        key = (item.region or "",) + key
+        if key in shares:
+            try:
+                shares[key] = min(total, max(float(amount), 0.0))
+            except (TypeError, ValueError):
+                continue
+    return shares
+
+
+def _overlap_picks(item: WasteItem) -> Dict[str, int]:
+    """Claim kind -> how many of the finding's claims of that kind its saving
+    can sit on (CLO-1012). An over-provisioned environment removes
+    ``current_count - recommended_count`` of its instances, not all of them,
+    so it counts at most that many instances' worth on any finding it shares
+    instances with. Empty when every claim can carry the saving."""
+    if _waste_type_value(item.waste_type) != WasteType.BEANSTALK_OVER_PROVISIONED.value:
+        return {}
+    meta = item.metadata if isinstance(item.metadata, dict) else {}
+    try:
+        excess = int(meta.get("current_count")) - int(meta.get("recommended_count"))
+    except (TypeError, ValueError):
+        return {}
+    return {_CLAIM_INSTANCE: max(excess, 0)}
+
+
+def _shared_part(
+    item: WasteItem,
+    keys: Set[Tuple[str, ...]],
+    counted: WasteItem,
+    counted_keys: Set[Tuple[str, ...]],
+) -> float:
+    """The most of ``item``'s saving that ``counted`` already counts.
+
+    On each shared resource two savings can overlap by at most the smaller
+    of their parts there: whichever of the two changes it, the other's part
+    there no longer saves anything more (deleting a volume moots its gp3
+    migration; removing an instance moots its price-generation delta). Where
+    a finding counts only some of its claims of a kind (``_overlap_picks``),
+    only that many of the largest overlaps of that kind are added. The sum
+    is never more than what ``counted`` counts. A bound, not an exact split:
+    when unsure, the smaller headline.
+    """
+    shared = keys & counted_keys
+    if not shared:
+        return 0.0
+    mine = _overlap_claim_shares(item, keys)
+    theirs = _overlap_claim_shares(counted, counted_keys)
+    picks_a, picks_b = _overlap_picks(item), _overlap_picks(counted)
+    by_kind: Dict[str, List[float]] = {}
+    for k in shared:
+        by_kind.setdefault(k[1], []).append(min(mine[k], theirs[k]))
+    total = 0.0
+    for kind, overlaps in by_kind.items():
+        limit = min(picks_a.get(kind, len(overlaps)), picks_b.get(kind, len(overlaps)))
+        total += sum(sorted(overlaps, reverse=True)[:limit])
+    return min(total, max(float(counted.monthly_savings or 0.0), 0.0))
+
+
+# Types whose saving is a part of the named resources' cost that is not tied
+# to any one of them: an over-provisioned environment saves the full cost of
+# SOME of its instances (which ones is the customer's choice), a
+# previous-generation environment saves a price delta on each. Such a finding
+# can be covered by another, but never covers one: a finding inside its
+# claim may save dollars it does not count.
+_NON_COVERING_OVERLAP_TYPES = frozenset({
+    WasteType.BEANSTALK_OVER_PROVISIONED.value,
+    WasteType.BEANSTALK_PREVIOUS_GEN_INSTANCES.value,
+})
+
+
+def _apply_saving_overlap(items: List[WasteItem]) -> Set[int]:
+    """Count a finding's saving once when another counted finding already
+    claims every resource it claims (CLO-961 for one EBS volume, CLO-1012 for
+    every type in ``SAVING_OVERLAP_PRIORITY``).
+
+    The rule. Every finding stays visible. Findings are taken in a total
+    order: trusted and unvalidated before advisory (an advisory saving never
+    reaches a headline, so a saving it took would count zero times), larger
+    reconciled saving first, then ``SAVING_OVERLAP_PRIORITY``, then region,
+    resource id and claim keys, so the result never depends on the order the
+    detectors returned them in. A finding gives up its saving only when ALL
+    the resources it claims (``_overlap_claim_keys``, per region) are claimed
+    by ONE finding that already counts and that may cover others (not a type
+    in ``_NON_COVERING_OVERLAP_TYPES``). It then reports $0 (the same shape as
+    ``no_lifecycle_policy`` when another finding counts it), names that
+    finding, and keeps what it would have saved alone in
+    ``metadata['saving_if_counted_alone']``.
+
+    A finding that shares only part of its resources with findings that
+    already count (or shares them with one that never covers others) keeps
+    the rest of its saving: the part those findings may already count
+    (:func:`_shared_part`) is taken off, so no dollar on a shared resource
+    counts twice (CLO-1012; it used to count in both). What it would have
+    saved alone stays in ``metadata['saving_if_counted_alone']``, the part
+    taken off in ``metadata['saving_shared_part']``, the findings it shares
+    with in ``metadata['saving_shared_with']``. A finding left with nothing
+    reports $0 like a covered one.
+
+    Returns ``id()`` of the items whose saving was moved or reduced, so the
+    savings floor can judge them on the figure they had alone.
+    """
+    candidates: List[Tuple[WasteItem, Set[Tuple[str, ...]]]] = []
+    for item in items:
+        # Already moved by an earlier pass: its saving is 0 now and its
+        # ``saving_if_counted_alone`` must not be overwritten with that 0.
+        if (item.metadata or {}).get("counted_in_headline") is False:
+            continue
+        keys = _overlap_claim_keys(item)
+        if keys:
+            candidates.append(
+                (item, {(item.region or "",) + k for k in keys})
+            )
+
+    # Only findings that share a claim with another one take part.
+    seen: Dict[Tuple[str, ...], int] = {}
+    for _, keys in candidates:
+        for k in keys:
+            seen[k] = seen.get(k, 0) + 1
+    candidates = [(i, ks) for i, ks in candidates if any(seen[k] > 1 for k in ks)]
+
+    from cloudwise_scan_core.advisory_types import ADVISORY_WASTE_TYPES
+
+    candidates.sort(
+        key=lambda c: (
+            _waste_type_value(c[0].waste_type) in ADVISORY_WASTE_TYPES,
+            -float(c[0].monthly_savings or 0.0),
+            SAVING_OVERLAP_PRIORITY.index(_waste_type_value(c[0].waste_type)),
+            c[0].region or "",
+            str(c[0].resource_id or ""),
+            tuple(sorted(c[1])),
+        )
+    )
+
+    kept: List[Tuple[WasteItem, Set[Tuple[str, ...]]]] = []
+    moved: Set[int] = set()
+    for item, keys in candidates:
+        winner = next(
+            (
+                (w, wk) for w, wk in kept
+                if keys <= wk
+                and _waste_type_value(w.waste_type) not in _NON_COVERING_OVERLAP_TYPES
+                # A finding left with $0 by the shared-part rule carries
+                # nothing, so it cannot carry another's saving either.
+                and float(w.monthly_savings or 0.0) > 0
+            ),
+            None,
+        )
+        if winner is None:
+            _take_off_shared_part(item, keys, kept, moved)
+            kept.append((item, keys))
+            continue
+        w, wk = winner
+        winner_type = _waste_type_value(w.waste_type)
+        kinds = {k[1] for k in keys}
+        noun = next(
+            (_OVERLAP_NOUN[kind] for kind in (_CLAIM_LB, _CLAIM_VOLUME, _CLAIM_INSTANCE) if kind in kinds),
+            "resource",
+        )
+        if len(kinds) > 1:
+            noun = "resources"
+        same = "these same" if noun in ("instances", "resources") else "this same"
+        w.metadata = {
+            **(w.metadata or {}),
+            "also_flagged_as": sorted(
+                set((w.metadata or {}).get("also_flagged_as") or ())
+                | {_waste_type_value(item.waste_type)}
+            ),
+        }
+        alone = float(item.monthly_savings or 0.0)
+        item.metadata = {
+            **(item.metadata or {}),
+            "counted_in_headline": False,
+            "saving_counted_on": winner_type,
+            "saving_if_counted_alone": alone,
+        }
+        item.description = (
+            f"{item.description} Not added to the total: the {winner_type} finding "
+            f"on {same} {noun} carries the saving (${float(w.monthly_savings or 0.0):.2f}/month)."
+        )
+        item.monthly_savings = 0.0
+        moved.add(id(item))
+    return moved
+
+
+def _take_off_shared_part(
+    item: WasteItem,
+    keys: Set[Tuple[str, ...]],
+    kept: List[Tuple[WasteItem, Set[Tuple[str, ...]]]],
+    moved: Set[int],
+) -> None:
+    """CLO-1012: lower a partly covered finding by the part of its saving the
+    findings already counted may count too (see :func:`_shared_part`)."""
+    alone = max(float(item.monthly_savings or 0.0), 0.0)
+    # Already lowered by an earlier pass: taking the part off again would
+    # count it out twice and overwrite the figure it had alone.
+    if alone <= 0 or "saving_shared_part" in (item.metadata or {}):
+        return
+    parts: Dict[str, float] = {}
+    sharing: List[WasteItem] = []
+    for w, wk in kept:
+        part = _shared_part(item, keys, w, wk)
+        if part > 1e-9:
+            wt = _waste_type_value(w.waste_type)
+            parts[wt] = parts.get(wt, 0.0) + part
+            sharing.append(w)
+    if not parts:
+        return
+    taken = min(alone, sum(parts.values()))
+    remaining = round(alone - taken, 6)
+    if remaining < 1e-6:
+        remaining = 0.0
+    largest = max(sorted(parts), key=lambda t: parts[t])
+    metadata = {
+        **(item.metadata or {}),
+        "saving_if_counted_alone": alone,
+        "saving_shared_part": round(taken, 6),
+        "saving_shared_with": sorted(parts),
+    }
+    for w in sharing:
+        w.metadata = {
+            **(w.metadata or {}),
+            "also_flagged_as": sorted(
+                set((w.metadata or {}).get("also_flagged_as") or ())
+                | {_waste_type_value(item.waste_type)}
+            ),
+        }
+    if remaining == 0.0:
+        metadata.update({"counted_in_headline": False, "saving_counted_on": largest})
+        item.description = (
+            f"{item.description} Not added to the total: the {', '.join(sorted(parts))} "
+            f"finding{'s' if len(parts) > 1 else ''} on the same resources may already count it."
+        )
+    else:
+        item.description = (
+            f"{item.description} ${taken:.2f}/month of this saving is not added to the total: "
+            f"the {', '.join(sorted(parts))} finding{'s' if len(parts) > 1 else ''} on some of "
+            f"the same resources may already count it."
+        )
+    item.metadata = metadata
+    item.monthly_savings = remaining
+    moved.add(id(item))
+
+
+# CLO-961's name, kept for callers and tests that use it.
+_apply_ebs_volume_overlap = _apply_saving_overlap
+
+
 def is_expected_unmapped_service(service_name: str) -> bool:
     """Whether a CUR service name having no detector is expected, not a gap."""
     if service_name in NO_DETECTOR_SERVICES:
@@ -690,6 +1091,14 @@ class WasteDetectionServiceBase:
     # the 45s default (32.3s → 35.4s → 43.3s over 09-25..27). It makes two
     # serial GetMetricStatistics calls per function; the real fix is batching.
     HEAVY_DETECTORS = frozenset({"s3", "security_posture", "lightsail", "lambda"})
+
+    # CLO-1002: read the AWS Price List with the scan's own credentials first. Off
+    # here, so a hosted scan prices through the platform's default credentials only
+    # and never calls pricing:GetProducts with the customer's role (the role
+    # template withholds it on purpose, CLO-527; a denied call would show in the
+    # customer's CloudTrail). The local CLI, MCP server and partner build run on
+    # the user's own credentials and turn it on (cloudcostwise.scan.service_class).
+    PRICE_WITH_SCAN_CREDENTIALS = False
     
     def __init__(self, aws_factory=None, cloudwatch_service=None, pricing_service=None, cache_service=None):
         """
@@ -1371,26 +1780,12 @@ class WasteDetectionServiceBase:
         return cost_map.get(instance_type, 73.0)  # Default ~$73/month
     
     def _estimate_ebs_monthly_cost(self, size_gb: int, volume_type: str) -> float:
-        """Estimate monthly cost for an EBS volume."""
-        cost_per_gb = {
-            'gp2': 0.10, 'gp3': 0.08,
-            'io1': 0.125, 'io2': 0.125,
-            'st1': 0.045, 'sc1': 0.015,
-            'standard': 0.05,
-        }
-        return size_gb * cost_per_gb.get(volume_type, 0.10)
-    
-    def _estimate_rds_monthly_cost(self, db_class: str, multi_az: bool) -> float:
-        """Estimate monthly cost for an RDS instance."""
-        base_costs = {
-            'db.t3.micro': 12.41, 'db.t3.small': 24.82, 'db.t3.medium': 49.64,
-            'db.m5.large': 124.83, 'db.m5.xlarge': 249.66,
-            'db.r5.large': 175.20, 'db.r5.xlarge': 350.40,
-        }
-        cost = base_costs.get(db_class, 150.0)
-        if multi_az:
-            cost *= 2
-        return cost
+        """Estimate monthly cost for an EBS volume (us-east-1, storage only).
+
+        CLO-975: reads models.EBS_PRICING; this method kept its own copy,
+        whose sc1 (0.015) disagreed with the detectors' 0.025.
+        """
+        return size_gb * EBS_PRICING.get(volume_type, 0.10)
     
     def _estimate_redshift_hourly_cost(self, node_type: str) -> float:
         """Estimate Redshift hourly cost."""
@@ -1546,7 +1941,19 @@ class WasteDetectionServiceBase:
                     lookup = port.get_billed_costs(
                         user_id=user_id,
                         account_id=account_id,
-                        resource_ids=[i.resource_id for i in staged],
+                        # CLO-1012: the ids a finding's saving is billed
+                        # under, when the detector knows them. The adapters
+                        # read the whole account window anyway.
+                        resource_ids=list(dict.fromkeys(
+                            [i.resource_id for i in staged]
+                            + [
+                                str(b)
+                                for i in staged
+                                if isinstance(i.metadata, dict)
+                                for b in (i.metadata.get("cur_billed_ids") or ())
+                                if b
+                            ]
+                        )),
                         start_date=start_date,
                         end_date=end_date,
                     )
@@ -1557,6 +1964,20 @@ class WasteDetectionServiceBase:
                     f"'{ReconciliationStatus.UNRECONCILED_NO_CUR}'."
                 )
                 lookup = None
+
+        # CLO-1012: findings that draw on one regional no-resource-id charge
+        # (every duplicate trail homed in a region bills that region's
+        # paid-events pool). Each is capped at an equal part of the pool, so
+        # their sum cannot exceed it. All of a home region's duplicates come
+        # from that region's own scan, so ``staged`` holds them all.
+        from cloudwise_scan_core.billed_cost import CUR_REGIONAL_USAGE_WASTE_TYPES
+
+        regional_counts: Dict[Tuple[str, str], int] = {}
+        for item in staged:
+            wt = _waste_type_value(item.waste_type)
+            if wt in CUR_REGIONAL_USAGE_WASTE_TYPES:
+                key = (wt, item.region or "")
+                regional_counts[key] = regional_counts.get(key, 0) + 1
 
         for item in staged:
             estimate = item.monthly_savings
@@ -1620,6 +2041,15 @@ class WasteDetectionServiceBase:
                         if isinstance(item.metadata, dict)
                         else None
                     ),
+                    # CLO-1012: the ids AWS bills the saving under when that
+                    # is not the finding's own id (a Beanstalk environment's
+                    # instances, volumes and load balancer; a stopped
+                    # instance's volumes). Summed; authoritative when given.
+                    billed_ids=(
+                        item.metadata.get("cur_billed_ids")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
                     # A resource with no CUR rows that is younger than the
                     # CUR's latest covered day has not been billed yet, not
                     # billed $0: it keeps its estimate, labelled
@@ -1638,6 +2068,9 @@ class WasteDetectionServiceBase:
                         if isinstance(item.metadata, dict)
                         else None
                     ),
+                    regional_share=regional_counts.get(
+                        (_waste_type_value(item.waste_type), item.region or "")
+                    ),
                 )
 
             item.estimated_savings_list_price = estimate
@@ -1651,8 +2084,20 @@ class WasteDetectionServiceBase:
                 + 1
             )
 
+        # CLO-961, CLO-1012: after reconciliation (the larger RECONCILED
+        # saving counts), before the floor (a moved saving is judged on what
+        # it had alone). Keyed on ids the detectors know, so it applies with
+        # or without resource-level CUR.
+        overlapped = _apply_saving_overlap(staged)
+
+        for item in staged:
+            floor_amount = (
+                item.metadata.get("saving_if_counted_alone", 0.0)
+                if id(item) in overlapped
+                else item.monthly_savings
+            )
             if (
-                item.monthly_savings >= settings.min_waste_threshold_usd
+                floor_amount >= settings.min_waste_threshold_usd
                 or item.waste_type in GOVERNANCE_WASTE_TYPES
             ):
                 result.waste_items.append(item)
@@ -1939,7 +2384,11 @@ class WasteDetectionServiceBase:
                     # timeout stops waiting; it cannot force-kill the work"
                     # semantics.
                     loop = asyncio.get_running_loop()
-                    coro = detector_method(data_provider, settings)
+                    # CLO-1002: opt-in (local scans only); otherwise the default chain.
+                    coro = run_with_scan_pricing_session(
+                        detector_method(data_provider, settings),
+                        data_provider if self.PRICE_WITH_SCAN_CREDENTIALS else None,
+                    )
                     return await asyncio.wait_for(
                         loop.run_in_executor(
                             _get_detector_thread_pool(),

@@ -193,20 +193,21 @@ def test_the_payload_shown_is_the_payload_sent():
 # --- network: failure and timeout never fail or slow the scan --------------------------------
 
 def test_network_failure_returns_false_and_does_not_raise():
-    with patch("cloudcostwise.share.urllib.request.urlopen", side_effect=OSError("down")):
-        assert share.send({"a": 1}, url="https://example.invalid/x") is False
+    with patch("cloudcostwise.share._open", side_effect=OSError("down")) as u:
+        assert share.send({"a": 1}) is False
+    u.assert_called_once()  # it really tried (the production URL is allowed), then swallowed the error
 
 
 def test_timeout_is_bounded():
-    with patch("cloudcostwise.share.urllib.request.urlopen", side_effect=lambda *a, **k: time.sleep(5)):
+    with patch("cloudcostwise.share._open", side_effect=lambda *a, **k: time.sleep(5)):
         t = time.monotonic()
-        assert share.send({"a": 1}, url="https://example.invalid/x", timeout=0.2) is False
+        assert share.send({"a": 1}, timeout=0.2) is False
         assert time.monotonic() - t < 1.5
     assert share.TIMEOUT_SECONDS <= 3.0
 
 
 def test_non_https_url_is_refused():
-    with patch("cloudcostwise.share.urllib.request.urlopen") as u:
+    with patch("cloudcostwise.share._open") as u:
         assert share.send({}, url="http://example.com/x") is False
         u.assert_not_called()
 
@@ -215,7 +216,7 @@ def test_a_failed_or_crashing_send_does_not_fail_the_offer():
     err = io.StringIO()
     r = share.offer(REPORT, stdin=Tty(), stdout=Tty(), stderr=err, env={share.ENV_SHARE: "yes"},
                     sender=lambda p: False)
-    assert r == "failed" and "may not have been received" in err.getvalue()
+    assert r == "failed" and "did not confirm the summary arrived" in err.getvalue()
     assert "nothing was shared" not in err.getvalue()
 
     def boom(p):
@@ -231,7 +232,7 @@ def test_cli_scan_prints_before_sharing_and_returns_zero(capsys):
          patch("cloudcostwise.runtime.resolve_regions", return_value=["us-east-1"]), \
          patch("cloudcostwise.runtime.configure_local_runtime"), \
          patch("cloudcostwise.scan.run_scan", return_value=REPORT), \
-         patch("cloudcostwise.share.offer", side_effect=lambda r: seen.append(capsys.readouterr().out)):
+         patch("cloudcostwise.share.offer", side_effect=lambda r, **k: seen.append(capsys.readouterr().out)):
         assert cli.main(["scan", "--format", "json"]) == 0
     assert '"estimated_monthly_savings"' in seen[0]
 
@@ -254,7 +255,9 @@ def test_share_on_off_status_reset():
 
 def test_share_on_refuses_without_a_terminal():
     code, _, err = _run(["--on"], tty=False)
-    assert code == 2 and "interactive terminal" in err and not share.config_path().exists()
+    assert code == 2 and err.strip() == share.ON_NO_TERMINAL and not share.config_path().exists()
+    # CLO-1055: the refusal no longer tells a reader (an assistant with a shell) how to opt in without one.
+    assert share.ENV_SHARE not in err and "share.json" not in err and "=yes" not in err
     assert _run(["--off"], tty=False)[0] == 0   # turning it off needs no terminal
 
 
@@ -271,12 +274,12 @@ def test_mcp_tools_have_no_share_like_parameter():
             assert not any(b in prop.lower() for b in banned), (name, prop)
 
 
-@pytest.mark.parametrize("env,expect", [({}, False), ({share.ENV_SHARE: "no"}, False),
-                                        ({share.ENV_SHARE: "yes"}, True)])
+@pytest.mark.parametrize("env,expect", [({}, "not_on"), ({share.ENV_SHARE: "no"}, "not_on"),
+                                        ({share.ENV_SHARE: "yes"}, "sent")])
 def test_mcp_never_prompts_and_sends_only_on_a_yes_setting(env, expect):
     calls = []
-    assert share.share_from_settings_mcp(REPORT, env=env, sender=lambda p: calls.append(p)) is expect
-    assert bool(calls) is expect
+    assert share.share_from_settings_mcp(REPORT, env=env, sender=lambda p: calls.append(p) or True) == expect
+    assert bool(calls) is (expect == "sent")
     if calls:
         assert calls[0]["source"] == "mcp" and set(calls[0]) <= share.PAYLOAD_KEYS
 
@@ -298,13 +301,15 @@ def test_mcp_scan_shares_only_when_the_server_enables_it_and_a_setting_says_yes(
                 await c.call_tool("scan", {})
 
     monkeypatch.setenv(share.ENV_SHARE, "yes")
-    with patch.object(share, "send_in_background") as bg:
+    # CLO-1055: the MCP server now waits for the capped send itself (share.send), so it can say what happened.
+    with patch.object(share, "send", return_value=True) as bg:
         asyncio.run(run(False))
         bg.assert_not_called()          # default build and the partner build: never
         asyncio.run(run(True))
         bg.assert_called_once()
+        assert bg.call_args.kwargs["url"] == share.SHARE_URL
     monkeypatch.delenv(share.ENV_SHARE)
-    with patch.object(share, "send_in_background") as bg:
+    with patch.object(share, "send", return_value=True) as bg:
         asyncio.run(run(True))
         bg.assert_not_called()          # no setting: nothing sent
 

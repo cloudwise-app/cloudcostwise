@@ -144,6 +144,22 @@ def test_no_cost_explorer_drops_only_the_cost_explorer_entrypoint():
     assert len(full.DETECTOR_METHODS) == 20
 
 
+def test_every_local_engine_prices_with_the_scan_credentials_first():
+    # CLO-1002: the CLI, the MCP server and the partner build all build their engine
+    # here. The hosted engine does not (it must never call the Price List as the customer).
+    from cloudwise_scan_core.waste_detection_service import WasteDetectionServiceBase
+
+    assert WasteDetectionServiceBase.PRICE_WITH_SCAN_CREDENTIALS is False
+    for ce in (True, False):
+        assert service_class(ce).PRICE_WITH_SCAN_CREDENTIALS is True
+    pytest.importorskip("cloudwise_scan_core.hosted_service")
+    from cloudwise_scan_core.hosted_service import WasteDetectionService
+
+    assert WasteDetectionService.PRICE_WITH_SCAN_CREDENTIALS is False
+    for ce in (True, False):
+        assert service_class(ce, full=True).PRICE_WITH_SCAN_CREDENTIALS is True
+
+
 def test_full_engine_runs_all_46_service_checks_where_the_partner_build_is_installed():
     # The public repo has only the 20 open checks: there this is skipped.
     pytest.importorskip("cloudwise_scan_core.hosted_service")

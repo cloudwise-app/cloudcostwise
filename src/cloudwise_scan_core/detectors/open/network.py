@@ -10,7 +10,7 @@ import logging
 import re
 import uuid
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
-from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_eip_monthly_cost, NAT_GATEWAY_MONTHLY_BASE, ALB_MONTHLY_BASE, NLB_MONTHLY_BASE, CLB_MONTHLY_BASE, ALB_LCU_HOURLY
+from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_eip_monthly_cost, NAT_GATEWAY_MONTHLY_BASE, ALB_MONTHLY_BASE, NLB_MONTHLY_BASE, CLB_MONTHLY_BASE, ALB_LCU_HOURLY, VPC_INTERFACE_ENDPOINT_AZ_MONTHLY
 from cloudwise_scan_core.cpu_sizing import is_as_old_as_window
 if TYPE_CHECKING:
     from cloudwise_scan_core.data_providers.base import WasteDataProvider
@@ -89,8 +89,8 @@ class OpenNetworkDetectorsMixin:
             # Get Elastic IPs from data provider
             eips = await data_provider.get_elastic_ips()
 
-            # CLO-359: region-scaled — EIP_MONTHLY_COST is a flat us-east-1
-            # rate otherwise, understating the saving everywhere else.
+            # CLO-1036: a public IPv4 address costs the same in every
+            # commercial region (Price List, AmazonVPC), so no region scaling.
             eip_monthly_cost = get_eip_monthly_cost(data_provider.region)
 
             # Track EIPs per instance for duplicate detection
@@ -527,7 +527,7 @@ class OpenNetworkDetectorsMixin:
         Criteria:
         - LB type is 'application' (LCU is ALB-specific; NLB uses NLCU)
         - Average LCUs consumed per hour over 7 days -> estimated monthly LCU cost
-        - Estimated LCU cost > 2x ALB base cost ($32.40)
+        - Estimated LCU cost > 2x ALB base cost (2 × ALB_MONTHLY_BASE = $32.86)
 
         `consumed_lcus_avg` is LCUs per *hour* (total LCU-hours ÷ window hours),
         which is the basis ALB_LCU_HOURLY multiplies. See CLO-228 — this used to
@@ -561,7 +561,7 @@ class OpenNetworkDetectorsMixin:
                         f"ALB '{lb.load_balancer_name}' has estimated LCU cost of "
                         f"${monthly_lcu_cost:.2f}/month ({metrics.consumed_lcus_avg:.3f} avg LCUs/hour), "
                         f"which is {monthly_lcu_cost / ALB_MONTHLY_BASE:.1f}\u00d7 the base fee "
-                        f"(${ALB_MONTHLY_BASE}/month). Total estimated: ${total_monthly:.2f}/month. "
+                        f"(${ALB_MONTHLY_BASE:.2f}/month). Total estimated: ${total_monthly:.2f}/month. "
                         f"Consider NLB migration or architecture review."
                     ),
                     monthly_savings=monthly_lcu_cost * 0.3,  # Conservative 30% potential savings
@@ -573,8 +573,8 @@ class OpenNetworkDetectorsMixin:
                     ),
                     explanation={
                         'detection': f'Average ConsumedLCUs: {metrics.consumed_lcus_avg:.3f} LCUs/hour (total LCU-hours ÷ window hours). Estimated monthly LCU cost: ${monthly_lcu_cost:.2f} ({monthly_lcu_cost / ALB_MONTHLY_BASE:.1f}× base fee)',
-                        'threshold': f'LCU cost > 2× ALB base cost (${ALB_MONTHLY_BASE}/month)',
-                        'pricing': f'Base: ${ALB_MONTHLY_BASE}/month + LCU: ${monthly_lcu_cost:.2f}/month = ${total_monthly:.2f}/month total',
+                        'threshold': f'LCU cost > 2× ALB base cost (${ALB_MONTHLY_BASE:.2f}/month)',
+                        'pricing': f'Base: ${ALB_MONTHLY_BASE:.2f}/month + LCU: ${monthly_lcu_cost:.2f}/month = ${total_monthly:.2f}/month total',
                         'why_waste': f'High LCU charges often indicate inefficient routing rules, many active connections, or high data throughput. Architectural optimization can reduce LCU consumption.',
                         'risk': 'Analyze which LCU dimension is dominant before making changes. Consolidating listener rules and target groups reduces rule-evaluation LCUs.',
                     },
@@ -608,8 +608,11 @@ class OpenNetworkDetectorsMixin:
             if lb.type != 'classic':
                 continue
 
-            # Calculate base savings from CLB -> ALB migration
-            base_savings = max(0.01, CLB_MONTHLY_BASE - ALB_MONTHLY_BASE)
+            # Calculate base savings from CLB -> ALB migration. CLO-975: both
+            # bases are now hourly × 730 (it was 18.25 at 730 hours minus
+            # 16.20 at 720, $2.05); rounded so the stored float is the cent
+            # figure shown ($1.82), not 1.8200000000000003.
+            base_savings = max(0.01, round(CLB_MONTHLY_BASE - ALB_MONTHLY_BASE, 2))
 
             waste_items.append(WasteItem(
                 id=str(uuid.uuid4()),
@@ -655,7 +658,8 @@ class OpenNetworkDetectorsMixin:
         """
         Detect unused VPC Interface Endpoints.
 
-        Cost: $7.30/AZ/month per Interface Endpoint + $0.01/GB data processed.
+        Cost: VPC_INTERFACE_ENDPOINT_AZ_MONTHLY ($0.01/hr × 730 = $7.30) per AZ per
+        Interface Endpoint + $0.01/GB data processed (not counted).
         Gateway Endpoints (S3, DynamoDB) are free and skipped.
 
         Detection:
@@ -677,7 +681,7 @@ class OpenNetworkDetectorsMixin:
                     continue
 
                 az_count = len(ep.subnet_ids) if ep.subnet_ids else 1
-                monthly_cost = az_count * 7.30  # $0.01/hr × 730 hrs ≈ $7.30/AZ/month
+                monthly_cost = az_count * VPC_INTERFACE_ENDPOINT_AZ_MONTHLY  # $0.01/hr × 730 hrs = $7.30/AZ/month
 
                 if monthly_cost < settings.min_waste_threshold_usd:
                     continue
@@ -747,7 +751,7 @@ class OpenNetworkDetectorsMixin:
                                 )
                             ),
                             'threshold': 'Zero data processed for 14 days',
-                            'pricing': f'Interface Endpoint: ${7.30}/AZ/month × {az_count} AZ(s) = ${monthly_cost:.2f}/month',
+                            'pricing': f'Interface Endpoint: ${VPC_INTERFACE_ENDPOINT_AZ_MONTHLY:.2f}/AZ/month × {az_count} AZ(s) = ${monthly_cost:.2f}/month',
                             'why_waste': (
                                 'VPC Interface Endpoints incur a fixed hourly charge per AZ '
                                 'regardless of data flow. This endpoint has had no traffic, '

@@ -18,6 +18,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"cloudcostwise {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("scan", help="scan an AWS account for waste")
+    s.add_argument("--demo", action="store_true",
+                   help="print a recorded scan of a CloudWise test account (sample data, every identifier a "
+                        "placeholder) instead of scanning: no AWS call, no credentials, no network, never shared. "
+                        "Works with every --format and --anonymize; --profile and --regions are refused with it; "
+                        "--no-cost-explorer, --no-exclude and --parallel have nothing to change and are ignored")
     s.add_argument("--profile", help="AWS profile (default: the standard credential chain)")
     s.add_argument("--regions", help="comma-separated regions, or 'all' (default: us-east-1 plus your profile's region)")
     s.add_argument("--format", choices=["table", "markdown", "json"], default="table")
@@ -38,6 +43,9 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--off", action="store_true", help="never share, never ask")
     g.add_argument("--status", action="store_true", help="show the current setting (default)")
     g.add_argument("--reset", action="store_true", help="forget the answer; ask once more in an interactive terminal")
+    g.add_argument("--last", action="store_true",
+                   help="show the summary of your last scan (CLI or MCP) and send it only if you type y; "
+                        "runs only in a terminal where you can type")
     ex = sub.add_parser("exclude", help="keep resources out of every scan: a local list that is never sent to CloudWise",
                         description="A local exclude list (~/.config/cloudcostwise/exclude.json). Every scan leaves out "
                                     "findings for the resources on it and says how many; `scan --no-exclude` ignores "
@@ -52,6 +60,24 @@ def _parser() -> argparse.ArgumentParser:
     er.add_argument("resource_id", metavar="RESOURCE_ID_OR_ARN")
     sub.add_parser("mcp", help="run as an MCP server (stdio) for Claude Code, Codex and other assistants")
     return p
+
+
+def _demo(args, render) -> int:
+    """CLO-1057: print the recording. No credentials, no AWS, no network, no exclude list, no share offer."""
+    from cloudcostwise import demo
+
+    report = demo.load_report()
+    if args.anonymize:
+        from cloudcostwise.anonymize import anonymize_report
+
+        report = anonymize_report(report)
+    if args.format == "json":
+        print(render.as_json(report))
+    elif args.format == "markdown":
+        print(render.as_markdown(report, emoji=sys.stdout.isatty(), verbose=args.verbose))
+    else:
+        print(render.as_table(report, verbose=args.verbose, emoji=sys.stdout.isatty()))
+    return 0  # never share.offer: a demo result is never offered for sharing
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -77,6 +103,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     from cloudcostwise import render
+
+    if args.demo:
+        if args.profile or args.regions:
+            print("cloudcostwise: --demo shows a recording and scans nothing, so --profile and --regions do not "
+                  "apply. Drop them, or drop --demo to scan your account.", file=sys.stderr)
+            return 2
+        return _demo(args, render)
+
     from cloudcostwise.runtime import (
         COST_EXPLORER_PRICE_PER_REQUEST, CredentialsError, ReadOnlyViolation, configure_local_runtime,
         resolve_credentials, resolve_regions,
@@ -156,7 +190,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # setting a human wrote; never raises, never fails the scan.
     from cloudcostwise import share
 
-    share.offer(report)  # CLO-931: what the user saw (excluded findings are not counted)
+    # CLO-1055: the summary numbers, kept locally for `share --last` (never sent by themselves). Saved
+    # first, so a send below can mark it; the send marks this scan's record only (by saved_at), never a
+    # later scan's. The same reduced, un-anonymized report as the offer.
+    saved_at = share.save_last_summary(report, "cli")
+    share.offer(report, saved_at=saved_at)  # CLO-931: what the user saw (excluded findings are not counted)
     return 0
 
 

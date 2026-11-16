@@ -84,6 +84,13 @@ def footer(report: ScanReport) -> str:
             f"{FEEDBACK_NOTE}")
 
 
+def mcp_footer(report: ScanReport) -> str:
+    """CLO-1055: footer() for MCP tool output. AI directories reject tools whose output promotes a
+    product, so the hosted-product line and its link stay in the terminal only; the plain count of the
+    checks that ran locally and the feedback note stay."""
+    return f"{OPEN_ENTRYPOINTS} of {TOTAL_ENTRYPOINTS} service checks run locally.\n{FEEDBACK_NOTE}"
+
+
 def _is_withheld_note(warning: str) -> bool:
     """CLO-848: a deliberate skip (keep tag, newest snapshot), not lost data.
     Scan notes carry a region prefix ("us-east-1: ebs_snapshot_keep: ...")."""
@@ -112,7 +119,8 @@ def left_out_lines(report: ScanReport, verbose: bool = False) -> List[str]:
 
 
 def scope_notes(report: ScanReport) -> List[str]:
-    return [CE_SKIPPED_NOTE] if report.cost_explorer_skipped else []
+    # A demo recording was made with Cost Explorer off; the user passed no flag, so say nothing (CLO-1057).
+    return [CE_SKIPPED_NOTE] if report.cost_explorer_skipped and not report.demo else []
 
 
 def _money(x: float) -> str:
@@ -121,7 +129,7 @@ def _money(x: float) -> str:
 
 # --- CLO-858: score card and share grid ---------------------------------
 
-BASIS_LABEL = {"spend": "of your last 30 days of spend", "no_spend": "without spend data"}
+BASIS_LABEL = {"spend": "of this account's last 30 days of spend", "no_spend": "without spend data"}
 TONE_WORD = {"celebratory": "healthy", "neutral": "room to improve", "urgent": "leaking money"}
 GRID_ROW = 10
 _PLAIN_GLYPHS = {"fired": "X", "clean": ".", "skipped": "-"}
@@ -209,9 +217,13 @@ def score_card(report: ScanReport, markdown: bool = False, emoji: bool = False) 
     legend = f"{glyphs['fired']} fired  {glyphs['clean']} clean  {glyphs['skipped']} skipped"
     head = f"Cost health score: {score.value}/100 ({BASIS_LABEL[score.basis]}), {TONE_WORD[score.tone]}"
     facts = (f"{_money(counted_total(report))}/month found | {ran.count('fired')} of {len(ran)} checks fired | "
-             f"{len(report.regions)} region(s) | {report.seconds:.1f}s")
+             f"{len(report.regions)} region(s)" + ("" if report.demo else f" | {report.seconds:.1f}s"))  # a recording has no run time
     names = fired_types(report)
-    body = [f"cloudcostwise {score.value}/100 ({BASIS_LABEL[score.basis]})", *share_grid(report, emoji), legend]
+    if report.demo:
+        from cloudcostwise.demo import CARD_MARK
+
+        head = f"{CARD_MARK} {head}"
+    body = [*([CARD_MARK] if report.demo else []), f"cloudcostwise {score.value}/100 ({BASIS_LABEL[score.basis]})", *share_grid(report, emoji), legend]
     if names:
         body.append("Found: " + ", ".join(names))
     body.append("Advisory findings are listed, not counted in the score.")
@@ -220,7 +232,22 @@ def score_card(report: ScanReport, markdown: bool = False, emoji: bool = False) 
     return [head, facts, "", *body]
 
 
+def _demo_wrap(report: ScanReport, text: str, markdown: bool = False) -> str:
+    """CLO-1057: the first and last line of a demo (sample data) report say so."""
+    if not report.demo:
+        return text
+    from cloudcostwise.demo import BANNER_BOTTOM, BANNER_TOP
+
+    if markdown:
+        return f"> **{BANNER_TOP}**\n\n{text.rstrip()}\n\n> **{BANNER_BOTTOM}**"
+    return f"{BANNER_TOP}\n\n{text.rstrip()}\n\n{BANNER_BOTTOM}"
+
+
 def as_table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> str:
+    return _demo_wrap(report, _table(report, verbose, emoji))
+
+
+def _table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> str:
     lines = [f"AWS account {report.account_id} | regions: {', '.join(report.regions)}", ""]
     gs = groups(report)
     if not gs:
@@ -254,6 +281,10 @@ def as_table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> 
 
 
 def as_markdown(report: ScanReport, emoji: bool = False, verbose: bool = False) -> str:
+    return _demo_wrap(report, _markdown(report, emoji, verbose), markdown=True)
+
+
+def _markdown(report: ScanReport, emoji: bool = False, verbose: bool = False) -> str:
     out = [f"# AWS waste, account {report.account_id}", "",
            f"Regions: {', '.join(report.regions)}", "",
            "| Waste type | Region | Resource | Monthly |", "|---|---|---|---:|"]
@@ -275,7 +306,10 @@ def as_markdown(report: ScanReport, emoji: bool = False, verbose: bool = False) 
 
 def as_json(report: ScanReport) -> str:
     score = score_for(report)
+    from cloudcostwise.demo import JSON_NOTE
+
     return json.dumps({
+        **({"demo": True, "demo_note": JSON_NOTE} if report.demo else {}),
         "account_id": report.account_id,
         "regions": report.regions,
         "estimated_monthly_savings": counted_total(report),

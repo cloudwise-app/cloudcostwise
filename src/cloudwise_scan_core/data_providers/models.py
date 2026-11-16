@@ -1028,6 +1028,18 @@ class MSKClusterData:
     cluster_type: str = 'PROVISIONED'  # 'PROVISIONED' or 'SERVERLESS'
     state: str = 'ACTIVE'
     tags: Dict[str, str] = field(default_factory=dict)
+    # CLO-975: EBS volume per broker in GiB (BrokerNodeGroupInfo.StorageInfo.
+    # EbsStorageInfo.VolumeSize). None = the source did not report it (an older
+    # or anonymized export): storage is then left out of a saving, never priced
+    # at an assumed size.
+    broker_volume_gb: Optional[int] = None
+
+    @staticmethod
+    def volume_gb_from(broker_node_group_info) -> Optional[int]:
+        """EBS volume size per broker from a BrokerNodeGroupInfo dict, or None."""
+        size = (((broker_node_group_info or {}).get('StorageInfo') or {})
+                .get('EbsStorageInfo') or {}).get('VolumeSize')
+        return size if isinstance(size, int) and size > 0 else None
     # CLO-457: ListClusters' ClusterInfo.CreationTime. AWS/Kafka keys its
     # metrics on "Cluster Name", a reusable name. None = unknown.
     creation_time: Optional[datetime] = None
@@ -1298,7 +1310,11 @@ class StepFunctionRetryMetricsData:
     state_machine_arn: str
     total_transitions: int = 0
     estimated_retry_transitions: int = 0
-    retry_ratio: float = 0.0       # retries / total transitions
+    # CLO-975: an ESTIMATE, not a retry count. CloudWatch has no per-retry
+    # metric, so both providers set estimated_retry_transitions = transitions x
+    # failure_rate, which makes this ratio equal to failure_rate by construction
+    # (the share of transitions assumed to sit in failed or timed-out executions).
+    retry_ratio: float = 0.0
     failure_rate: float = 0.0      # failed / total executions
     period_days: int = 14
 
@@ -1909,6 +1925,10 @@ class BeanstalkConfigData:
     rds_instance_type: str = ''
     ebs_volume_type: str = 'gp3'
     ebs_volume_size: int = 10                  # GB
+    # CLO-1012: aws:elasticbeanstalk:environment LoadBalancerIsShared, from the
+    # same DescribeConfigurationSettings read. A shared load balancer is billed
+    # once for every environment on it, so no one environment's saving owns it.
+    load_balancer_is_shared: bool = False
 
 
 _BEANSTALK_REQUIRED_OPTIONS = (
@@ -1955,6 +1975,9 @@ def beanstalk_config_from_settings(env_id: str, settings: Any) -> Optional[Beans
         instance_type=values['instance_type'],
         environment_type=values['environment_type'],
         load_balancer_type=options.get(('aws:elasticbeanstalk:environment', 'LoadBalancerType')) or '',
+        load_balancer_is_shared=str(
+            options.get(('aws:elasticbeanstalk:environment', 'LoadBalancerIsShared')) or ''
+        ).strip().lower() == 'true',
         min_size=values['min_size'],
         max_size=values['max_size'],
         rds_endpoint=options.get(('aws:rds:dbinstance', 'DBEngine')) or '',
@@ -2027,6 +2050,23 @@ class BeanstalkMetricsData:
     instance_ids: List[str] = field(default_factory=list)  # running instances, by tag
     load_balancer: str = ''             # ALB dimension value or Classic ELB name
     missing_reason: str = ''            # why a measurement is MISSING, when it is
+    # CLO-1012: the ids AWS bills the environment under, from the reads above
+    # (no extra call). The CUR bills each instance, its EBS volumes (by
+    # BlockDeviceMappings) and the load balancer under their own ids, never
+    # under the environment id. ``billed_load_balancer`` is the elbv2 ARN, or
+    # the Classic name (Classic DescribeLoadBalancers returns no ARN; the CUR
+    # row ``...:loadbalancer/<name>`` aliases to it), set whether or not the
+    # load balancer's metrics covered the window. Left empty when more than one
+    # environment resolves to the same load balancer (a shared one).
+    instance_volume_ids: List[str] = field(default_factory=list)
+    billed_load_balancer: str = ''
+    billed_load_balancer_kind: str = ''  # 'elbv2' or 'classic'
+    # CLO-1012: billed id -> when that part appeared, from the same reads:
+    # an instance's LaunchTime, a volume's AttachTime, a load balancer's
+    # CreatedTime. Read by the Beanstalk detector's ``resource_created_at``,
+    # so an environment whose parts are all newer than the CUR's last day
+    # reads "not yet billed", not "$0". An id missing here is unknown.
+    billed_created_at: Dict[str, Any] = field(default_factory=dict)
 
 
 # CLO-592 follow-up: AWS publishes no AWS/GlobalAccelerator series for an

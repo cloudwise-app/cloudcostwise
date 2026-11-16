@@ -125,7 +125,7 @@ def _run_cli(monkeypatch, capsys, argv):
                         lambda profile: runtime.Credentials("AKIATEST", "s", None, ACCT, "us-east-1"))
     monkeypatch.setattr(runtime, "resolve_regions", lambda regions, creds: ["us-east-1", "eu-west-1"])
     monkeypatch.setattr(scan, "run_scan", lambda *a, **k: _report())
-    monkeypatch.setattr("cloudcostwise.share.offer", lambda report: "skipped")
+    monkeypatch.setattr("cloudcostwise.share.offer", lambda report, **k: "skipped")
     assert cli.main(argv) == 0
     return capsys.readouterr().out
 

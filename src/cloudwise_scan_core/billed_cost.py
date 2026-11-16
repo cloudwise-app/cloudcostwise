@@ -214,6 +214,26 @@ CUR_NOT_ATTRIBUTABLE_WASTE_TYPES = frozenset(
 CUR_ACCOUNT_WIDE_WASTE_TYPES = frozenset({"ecs_container_insights_waste"})
 
 
+#: CLO-1012: waste types whose saving AWS bills per region with no resource
+#: id, mapped to the ``lineItem/UsageType`` suffix of that charge. CloudTrail
+#: bills each further copy of a management event as
+#: ``<region code>-PaidEventsRecorded`` with an empty resource id (the
+#: fixture account's November CUR export, 2026-11-14), so a duplicate trail's
+#: ARN is in no row and the finding used to read ``CONFIRMED_ZERO_BILLED``.
+#: Its saving is capped instead at that region's paid-events bill, split
+#: evenly between the region's duplicate findings (see ``regional_share`` on
+#: :func:`reconcile_savings`). ``evidence_suffix`` rows (the free first copy,
+#: ``FreeEventsRecorded``) show the service is billed in the region at all:
+#: with them and no paid rows, AWS bills no further copy, which is $0.
+#: Matched on the value, like ``CUR_ACCOUNT_WIDE_WASTE_TYPES``.
+CUR_REGIONAL_USAGE_WASTE_TYPES = {
+    "duplicate_cloudtrail": {
+        "usage_suffix": "PaidEventsRecorded",
+        "evidence_suffix": "EventsRecorded",
+    },
+}
+
+
 class CostBasis:
     """Which CUR cost column a rollup was computed from.
 
@@ -248,11 +268,17 @@ class BilledCostRollup:
     days_covered: int
     cost_basis: str = CostBasis.CUR_COST
     has_discount_line_items: bool = False
+    #: CLO-1012: the monthly figure of a sum of several resources' rollups,
+    #: each scaled to a month on its own days (see
+    #: ``BilledCostLookup._billed_ids_match``). ``None`` for one resource.
+    monthly_override: Optional[float] = None
 
     def monthly_equivalent(self) -> Optional[float]:
         """Normalise the windowed total to a month, or ``None`` if no coverage."""
         if self.days_covered <= 0:
             return None
+        if self.monthly_override is not None:
+            return self.monthly_override
         return self.billed_total * _DAYS_PER_MONTH / self.days_covered
 
 
@@ -630,6 +656,9 @@ class BilledCostMatch:
     #: for it. That is positive evidence of a $0 bill, so the not-yet-billed
     #: rule (:func:`_not_yet_billed`) never applies to it.
     zero_billed_candidates: bool = False
+    #: CLO-1012: some billed ids had CUR rows and others had none, so the
+    #: rollup is part of the bill (see ``BilledCostLookup._billed_ids_match``).
+    missing_parts: bool = False
 
 
 @dataclass(frozen=True)
@@ -698,6 +727,18 @@ class BilledCostLookup:
     #: after narrowing to the finding's region.
     by_typed_rollup: Mapping[str, Mapping[str, tuple]] = field(default_factory=dict)
 
+    #: CLO-1012: the CUR rows with no resource id (stored as
+    #: ``NO_RESOURCE_ID``), summed per ``(region, usage type)``. Only
+    #: ``cur_file`` rows: a Cost Explorer row for the same date would count
+    #: the charge twice. Kept apart from ``by_resource`` so these keys never
+    #: join alias matching; read only for ``CUR_REGIONAL_USAGE_WASTE_TYPES``.
+    by_region_usage: Mapping[tuple, BilledCostRollup] = field(default_factory=dict)
+
+    #: True when the adapter read those rows (it projected the region and
+    #: usage type). False keeps a regional finding at its estimate, labelled:
+    #: no rows there would be absence of the read, not a $0 bill.
+    region_usage_read: bool = False
+
     @classmethod
     def build(
         cls,
@@ -706,8 +747,18 @@ class BilledCostLookup:
         resource_ids_present: bool,
         account_days_covered: int = 0,
         latest_usage_date: Optional[date] = None,
+        region_usage=None,
     ) -> "BilledCostLookup":
-        """Index rollups by resource id AND by unambiguous alias."""
+        """Index rollups by resource id AND by unambiguous alias.
+
+        ``region_usage`` (CLO-1012): the account's no-resource-id CUR rows as
+        rollups keyed ``(region, usage type)``, or ``None`` when the adapter
+        did not read them. See :attr:`by_region_usage`.
+        """
+        by_region_usage = {
+            (str(k[0] or ""), str(k[1] or "")): v
+            for k, v in dict(region_usage or {}).items()
+        }
         by_resource = {r.resource_id: r for r in rollups}
 
         alias_hits: dict = {}
@@ -783,6 +834,8 @@ class BilledCostLookup:
             ambiguous_secret_names=ambiguous_secret_names,
             by_typed_name=by_typed_name,
             by_typed_rollup=by_typed_rollup,
+            by_region_usage=by_region_usage,
+            region_usage_read=region_usage is not None,
         )
 
     def _typed_name_match(
@@ -896,6 +949,100 @@ class BilledCostLookup:
             rollup=_sum_rollups(resource_id, list(found.values()))
         )
 
+    def _billed_ids_match(
+        self,
+        resource_id: str,
+        billed_ids: Sequence[str],
+        region: Optional[str],
+    ) -> BilledCostMatch:
+        """The summed bill of the ids AWS bills this finding's saving under
+        (CLO-1012), when they are not the finding's own id: a Beanstalk
+        environment is billed as its instances, root volumes and load
+        balancer; a stopped instance's saving is its volumes' storage.
+
+        Each id is found the way a finding's own id is: exactly, then by an
+        unambiguous alias in either direction (a Classic load balancer's
+        bare name reaches its ``...:loadbalancer/<name>`` row). An alias that
+        names several CUR resources is narrowed to the finding's region; if
+        more than one is left the whole match is ambiguous, as in
+        :meth:`_member_match`.
+
+        Authoritative, like ``cur_resource_id``: when no id has CUR rows the
+        resource is absent, and the finding's own id is never tried, since the
+        CUR never bills an environment id and a hit could only be another
+        resource.
+
+        The parts can cover different numbers of days (an instance launched
+        mid-window), so each part is scaled to a month on its own days and
+        the monthly figures are summed (``monthly_override``). Summing the
+        totals and dividing by one part's days would overstate the bill when
+        that part is the shortest and understate it when it is the longest.
+        The sum's ``days_covered`` is the shortest part's, so a part with
+        fewer than the minimum days makes :func:`reconcile_savings` keep the
+        estimate (``unreconciled_insufficient_data``). When some ids have rows
+        and others have none (an instance replaced since, or not billed yet)
+        the rollup is only part of the bill: ``missing_parts`` is set and
+        :func:`reconcile_savings` keeps the estimate the same way, even when
+        the parts it found bill $0.
+        """
+        found: dict = {}
+        ambiguous: set = set()
+        missing = 0
+        for raw in billed_ids:
+            bid = str(raw or "")
+            if not bid:
+                continue
+            hit = self.by_resource.get(bid)
+            if hit is None:
+                aliased = self.by_alias.get(bid)
+                if aliased is not None:
+                    hit = self.by_resource.get(aliased)
+            if hit is None:
+                for alias in resource_id_aliases(bid):
+                    hit = self.by_resource.get(alias)
+                    if hit is not None:
+                        break
+            if hit is not None:
+                found[hit.resource_id] = hit
+                continue
+            candidates = set(self.ambiguous_aliases.get(bid, ()))
+            if region and region != "global":
+                candidates = {
+                    rid for rid in candidates if _arn_region(rid) in ("", region)
+                }
+            if len(candidates) == 1:
+                rid = next(iter(candidates))
+                if rid in self.by_resource:
+                    found[rid] = self.by_resource[rid]
+                else:
+                    missing += 1
+            elif candidates:
+                ambiguous.update(candidates)
+            else:
+                missing += 1
+        if ambiguous:
+            return BilledCostMatch(
+                ambiguous=True, candidates=tuple(sorted(ambiguous))
+            )
+        parts = list(found.values())
+        if not parts:
+            return BilledCostMatch()
+        bases = {p.cost_basis for p in parts}
+        days = min(p.days_covered for p in parts)
+        return BilledCostMatch(
+            rollup=BilledCostRollup(
+                resource_id=resource_id,
+                billed_total=sum(p.billed_total for p in parts),
+                days_covered=days,
+                cost_basis=bases.pop() if len(bases) == 1 else CostBasis.UNKNOWN,
+                has_discount_line_items=any(p.has_discount_line_items for p in parts),
+                monthly_override=(
+                    sum(p.monthly_equivalent() or 0.0 for p in parts) if days > 0 else None
+                ),
+            ),
+            missing_parts=missing > 0,
+        )
+
     def rollup_for(
         self,
         resource_id: str,
@@ -906,6 +1053,7 @@ class BilledCostLookup:
         lb_type: Optional[str] = None,
         cur_resource_id: Optional[str] = None,
         member_ids: Optional[Sequence[str]] = None,
+        billed_ids: Optional[Sequence[str]] = None,
     ) -> Optional[BilledCostRollup]:
         """The one CUR rollup this finding matches, or ``None``.
 
@@ -920,6 +1068,7 @@ class BilledCostLookup:
             lb_type=lb_type,
             cur_resource_id=cur_resource_id,
             member_ids=member_ids,
+            billed_ids=billed_ids,
         ).rollup
 
     def match_for(
@@ -932,6 +1081,7 @@ class BilledCostLookup:
         lb_type: Optional[str] = None,
         cur_resource_id: Optional[str] = None,
         member_ids: Optional[Sequence[str]] = None,
+        billed_ids: Optional[Sequence[str]] = None,
     ) -> BilledCostMatch:
         """Exact match first, then unambiguous alias in either direction.
 
@@ -975,9 +1125,22 @@ class BilledCostLookup:
         (CLO-810) names its member instances as ``db:<instance id>`` and its
         storage/I/O as ``cluster:<DbClusterResourceId>``, whichever its saving
         comes out of (:func:`_rds_cluster_bill_key`).
+
+        ``billed_ids`` (CLO-1012, the detectors' ``metadata["cur_billed_ids"]``):
+        the ids AWS bills this finding's saving under when that is not the
+        finding's own id (a Beanstalk environment: its instances, volumes and
+        load balancer; a stopped instance: its volumes). Their bills are
+        summed; see :meth:`_billed_ids_match`. Authoritative like
+        ``cur_resource_id``; an empty list means the detector gave none.
+        Separate from ``member_ids``, which only the name-indexed types read.
         """
         if cur_resource_id:
             return BilledCostMatch(rollup=self.by_resource.get(cur_resource_id))
+
+        if isinstance(billed_ids, str):
+            billed_ids = [billed_ids]
+        if billed_ids and any(billed_ids):
+            return self._billed_ids_match(resource_id, billed_ids, region)
 
         direct = self.by_resource.get(resource_id)
         if direct is not None:
@@ -1166,6 +1329,87 @@ class ReconciliationOutcome:
         return self.reconciliation_status not in ReconciliationStatus.UNRECONCILED
 
 
+def _reconcile_region_usage(
+    *,
+    estimated_savings: float,
+    lookup: "BilledCostLookup",
+    region: Optional[str],
+    usage_suffix: str,
+    evidence_suffix: str,
+    share: Optional[int],
+) -> ReconciliationOutcome:
+    """Cap a saving AWS bills per region without a resource id (CLO-1012).
+
+    The finding's region's no-resource-id rows whose usage type ends with
+    ``usage_suffix`` are summed (``USE1-PaidEventsRecorded`` for a duplicate
+    CloudTrail trail). The sum is scaled to a month on the ACCOUNT's covered
+    days, not on the days the rows appear: the charge is a pool that exists
+    every day, and a day with no row billed nothing. Scaling on fewer days
+    would overstate it. ``share`` is the number of findings drawing on the
+    same pool (the region's duplicate trails, counted by the caller); each is
+    capped at an equal part, so their sum never exceeds the bill. That split
+    is a bound, not each trail's real cost, which no row reports.
+
+    - The adapter did not read those rows, or the finding has no real region,
+      or the region has no row for the service at all (no ``evidence_suffix``
+      row either) → estimate kept, ``UNRECONCILED_INSUFFICIENT_DATA``: an
+      absent read is not a $0 bill.
+    - A discount line among the rows → ``UNRECONCILED_DISCOUNTED``.
+    - Rows for the service but none (or $0) for the usage type →
+      ``CONFIRMED_ZERO_BILLED``: AWS bills no further copy.
+    - Otherwise ``RECONCILED``, capped at ``min(estimate, share of the
+      monthly bill)``.
+
+    A payer account's report can hold its members' rows for the same usage
+    type (the ingest merges them per day), which makes the pool larger than
+    this account's own and the cap looser, never tighter than the truth.
+    """
+    if not lookup.region_usage_read or not region or region == "global":
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA,
+        )
+    billed = [
+        v for (reg, usage_type), v in lookup.by_region_usage.items()
+        if reg == region and usage_type.endswith(usage_suffix)
+    ]
+    evidence = [
+        v for (reg, usage_type), v in lookup.by_region_usage.items()
+        if reg == region and usage_type.endswith(evidence_suffix)
+    ]
+    if not billed and not evidence:
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA,
+        )
+    if any(v.has_discount_line_items for v in billed):
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
+        )
+    total = sum(v.billed_total for v in billed)
+    if total <= 0:
+        return ReconciliationOutcome(
+            monthly_savings=0.0,
+            reconciliation_status=ReconciliationStatus.CONFIRMED_ZERO_BILLED,
+            billed_cost_observed=0.0,
+            cost_basis=CostBasis.CUR_COST,
+        )
+    days = max(
+        int(lookup.account_days_covered or 0),
+        max((v.days_covered for v in billed), default=0),
+    )
+    parts = share if isinstance(share, int) and not isinstance(share, bool) and share > 1 else 1
+    monthly_share = total * _DAYS_PER_MONTH / days / parts
+    bases = {v.cost_basis for v in billed}
+    return ReconciliationOutcome(
+        monthly_savings=min(estimated_savings, monthly_share),
+        reconciliation_status=ReconciliationStatus.RECONCILED,
+        billed_cost_observed=monthly_share,
+        cost_basis=bases.pop() if len(bases) == 1 else CostBasis.UNKNOWN,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The reconciliation decision (pure — no I/O, fully unit-testable)
 # ---------------------------------------------------------------------------
@@ -1186,13 +1430,17 @@ def reconcile_savings(
     member_ids: Optional[Sequence[str]] = None,
     resource_created_at=None,
     running_tasks=None,
+    billed_ids: Optional[Sequence[str]] = None,
+    regional_share: Optional[int] = None,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
 
     ``secretsmanager_secret``, ``resource_type``, ``region``, ``lb_type``,
-    ``cur_resource_id``, ``member_ids``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
+    ``cur_resource_id``, ``member_ids``, ``billed_ids``: see :meth:`BilledCostLookup.match_for`. ``waste_type``
     with ``resource_type``: see ``CUR_NOT_ATTRIBUTABLE_WASTE_TYPES``.
     ``running_tasks`` with ``waste_type``: see ``CUR_ACCOUNT_WIDE_WASTE_TYPES``.
+    ``regional_share`` with ``waste_type``: see
+    ``CUR_REGIONAL_USAGE_WASTE_TYPES`` and :func:`_reconcile_region_usage`.
     ``resource_created_at`` (ISO string or datetime, from the detector's
     ``metadata["resource_created_at"]``): see :func:`_not_yet_billed`.
 
@@ -1209,6 +1457,10 @@ def reconcile_savings(
        labelled, *not* zeroed. Its metric charges are billed account-wide
        with no per-cluster resource id, so a miss is not "not billed". An
        empty cluster skips this and takes the ordinary path below.
+    3b. A charge AWS bills per region with no resource id (a duplicate
+       CloudTrail trail, CLO-1012) → capped at its share of that region's
+       bill for the usage type; see :func:`_reconcile_region_usage`. Never
+       matched by resource id: no row carries one.
     4. The finding's name matched several CUR resources and none uniquely →
        labelled, *not* zeroed (CLO-739). We cannot tell which bill is its,
        so we cannot claim it has none.
@@ -1267,6 +1519,17 @@ def reconcile_savings(
             ),
         )
 
+    regional = CUR_REGIONAL_USAGE_WASTE_TYPES.get(_resource_type_key(waste_type) or "")
+    if regional is not None and estimated_savings > 0:
+        return _reconcile_region_usage(
+            estimated_savings=estimated_savings,
+            lookup=lookup,
+            region=region,
+            usage_suffix=regional["usage_suffix"],
+            evidence_suffix=regional["evidence_suffix"],
+            share=regional_share,
+        )
+
     match = lookup.match_for(
         resource_id,
         secretsmanager_secret=secretsmanager_secret,
@@ -1275,6 +1538,7 @@ def reconcile_savings(
         lb_type=lb_type,
         cur_resource_id=cur_resource_id,
         member_ids=member_ids,
+        billed_ids=billed_ids,
     )
 
     # CLO-739: "couldn't tell which resource" is not "not billed". Keep the
@@ -1292,6 +1556,19 @@ def reconcile_savings(
         return ReconciliationOutcome(
             monthly_savings=estimated_savings,
             reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
+            billed_cost_observed=rollup.monthly_equivalent(),
+            cost_basis=rollup.cost_basis,
+        )
+
+    # CLO-1012: some billed ids have rows and others none. The rows are part
+    # of the bill, so neither a cap nor "AWS bills $0" can be read from them:
+    # keep the estimate, labelled, even when the parts found bill $0.
+    if match.missing_parts and rollup is not None:
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=(
+                ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA
+            ),
             billed_cost_observed=rollup.monthly_equivalent(),
             cost_basis=rollup.cost_basis,
         )

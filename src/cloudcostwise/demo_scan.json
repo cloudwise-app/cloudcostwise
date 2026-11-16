@@ -1,0 +1,912 @@
+{
+  "generatedBy": "scripts/sample_scan/build_demo_scan.py",
+  "source": "frontend/src/data/sample-scan.json",
+  "scanDate": "2026-11-08",
+  "scanCoreCommit": "519255c5da",
+  "regions": [
+    "us-east-1",
+    "us-west-2"
+  ],
+  "findings": [
+    {
+      "wasteType": "idle_dynamodb",
+      "region": "us-east-1",
+      "resource": "DynamoDB table B",
+      "title": "Idle DynamoDB Table",
+      "monthlySavings": 5.69,
+      "confidence": "high",
+      "action": "Delete or switch to on-demand billing.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Zero consumed read and write capacity over 14 days (10 RCU / 10 WCU provisioned), on a table 96 days old",
+        "threshold": "0 consumed reads AND 0 consumed writes over a 14-day monitoring period, on a table at least 14 days old",
+        "pricing": "Provisioned: $5.69/month for idle capacity",
+        "why_waste": "This table has had no reads or writes in 14 days. Provisioned capacity charges continue regardless of usage.",
+        "risk": "Verify no applications depend on this table. Check DynamoDB Streams consumers. If keeping, switch to on-demand to avoid idle costs."
+      }
+    },
+    {
+      "wasteType": "dynamodb_no_autoscaling",
+      "region": "us-east-1",
+      "resource": "DynamoDB table B",
+      "title": "DynamoDB Table Without Auto-Scaling",
+      "monthlySavings": 0.85,
+      "confidence": "medium",
+      "action": "Enable auto-scaling or switch to on-demand billing.",
+      "actionCommand": "aws application-autoscaling register-scalable-target --service-namespace dynamodb --resource-id table/<DynamoDB table B> --scalable-dimension dynamodb:table:ReadCapacityUnits --min-capacity 1 --max-capacity 10",
+      "explanation": {
+        "detection": "Provisioned mode with 10 RCU / 10 WCU and no Application Auto Scaling target registered",
+        "threshold": "Provisioned table with monthly cost \u2265 $5 and no auto-scaling",
+        "pricing": "Provisioned: (10 RCU \u00d7 $0.00013 + 10 WCU \u00d7 $0.00065) \u00d7 730 = $5.69/month. ~15% savings with auto-scaling: $0.85/month",
+        "why_waste": "Without auto-scaling, provisioned capacity is fixed 24/7. Auto-scaling adjusts capacity based on traffic, reducing cost during low-activity periods.",
+        "risk": "Auto-scaling has a brief delay when scaling up. Set appropriate minimum capacities for baseline traffic. Consider on-demand mode as an alternative."
+      }
+    },
+    {
+      "wasteType": "s3_rapid_growth",
+      "region": "us-east-1",
+      "resource": "S3 bucket D",
+      "title": "S3 Rapid Growth Anomaly",
+      "monthlySavings": 0.28,
+      "confidence": "low",
+      "action": "S3 bucket 'S3 bucket D' grew from under 0.1 GB to 12.0 GB in 30 days (+12.0 GB). Investigate source of growth. Consider adding lifecycle rules to expire old objects or transition to cheaper storage classes.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Bucket grew from under 0.1 GB to 12.0 GB in 30 days (+12.0 GB)",
+        "threshold": "> 100.0% growth in 30 days with > 10.0 GB absolute increase",
+        "pricing": "Growth adds ~$0.28/month in storage costs.",
+        "why_waste": "Abnormal growth often indicates runaway logging, build artifacts, or misconfigured data pipelines. Without lifecycle rules, this growth continues unchecked.",
+        "risk": "Investigate the source of growth before adding lifecycle rules. Use S3 Storage Lens or S3 Inventory to identify which prefixes are growing."
+      }
+    },
+    {
+      "wasteType": "unattached_ebs",
+      "region": "us-east-1",
+      "resource": "EBS volume A",
+      "title": "Unattached EBS Volume (1GB gp3)",
+      "monthlySavings": 0.08,
+      "confidence": "high",
+      "action": "Delete this volume if no longer needed.",
+      "actionCommand": "aws ec2 delete-volume --volume-id <EBS volume A>",
+      "explanation": {
+        "detection": "EBS volume state is \"available\" (not attached to any EC2 instance)",
+        "threshold": "Volume not attached to any instance",
+        "pricing": "gp3: 1 GB \u00d7 $0.080/GB = $0.08/month",
+        "why_waste": "This volume is not attached to any instance. It was likely left behind after an instance was terminated or a snapshot was restored.",
+        "risk": "Verify no data on this volume is needed before deleting. Consider creating a snapshot first as a safety net."
+      }
+    },
+    {
+      "wasteType": "old_ecr_images",
+      "region": "us-east-1",
+      "resource": "ECR repository B",
+      "title": "Old/Untagged ECR Images",
+      "monthlySavings": 0.06,
+      "confidence": "medium",
+      "action": "Delete old images or set up lifecycle policy.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "1 untagged and 0 old images totaling 0.6 GB",
+        "threshold": "> 0.5 GB of old/untagged images",
+        "pricing": "0.6 GB \u00d7 $0.10/GB/month = $0.06/month",
+        "why_waste": "Untagged images are typically superseded builds. Old images beyond your rollback window serve no purpose.",
+        "risk": "Verify no running tasks reference these images. Keep the latest tagged images needed for production and rollback."
+      }
+    },
+    {
+      "wasteType": "orphaned_ebs_snapshot",
+      "region": "us-east-1",
+      "resource": "EBS snapshot A",
+      "title": "Orphaned EBS Snapshot (1GB)",
+      "monthlySavings": 0.05,
+      "confidence": "high",
+      "action": "Delete this orphaned snapshot if no longer needed for standalone restore.",
+      "actionCommand": "aws ec2 delete-snapshot --snapshot-id <EBS snapshot A>",
+      "explanation": {
+        "detection": "Source volume (masked) no longer exists. Snapshot is 3 days old.",
+        "threshold": "Source EBS volume has been deleted",
+        "pricing": "1 GB \u00d7 $0.05/GB = $0.05/month",
+        "why_waste": "This snapshot references volume (masked) which has been deleted. Incremental snapshot chains are broken: this snapshot is now a standalone copy.",
+        "risk": "This may still contain data needed for compliance or disaster recovery. Verify before deleting."
+      }
+    },
+    {
+      "wasteType": "orphaned_ebs_snapshot",
+      "region": "us-east-1",
+      "resource": "EBS snapshot B",
+      "title": "Orphaned EBS Snapshot (1GB)",
+      "monthlySavings": 0.05,
+      "confidence": "high",
+      "action": "Delete this orphaned snapshot if no longer needed for standalone restore.",
+      "actionCommand": "aws ec2 delete-snapshot --snapshot-id <EBS snapshot B>",
+      "explanation": {
+        "detection": "Source volume (masked) no longer exists. Snapshot is 0 days old.",
+        "threshold": "Source EBS volume has been deleted",
+        "pricing": "1 GB \u00d7 $0.05/GB = $0.05/month",
+        "why_waste": "This snapshot references volume (masked) which has been deleted. Incremental snapshot chains are broken: this snapshot is now a standalone copy.",
+        "risk": "This may still contain data needed for compliance or disaster recovery. Verify before deleting."
+      }
+    },
+    {
+      "wasteType": "orphaned_ebs_snapshot",
+      "region": "us-east-1",
+      "resource": "EBS snapshot C",
+      "title": "Orphaned EBS Snapshot (1GB)",
+      "monthlySavings": 0.05,
+      "confidence": "high",
+      "action": "Delete this orphaned snapshot if no longer needed for standalone restore.",
+      "actionCommand": "aws ec2 delete-snapshot --snapshot-id <EBS snapshot C>",
+      "explanation": {
+        "detection": "Source volume (masked) no longer exists. Snapshot is 6 days old.",
+        "threshold": "Source EBS volume has been deleted",
+        "pricing": "1 GB \u00d7 $0.05/GB = $0.05/month",
+        "why_waste": "This snapshot references volume (masked) which has been deleted. Incremental snapshot chains are broken: this snapshot is now a standalone copy.",
+        "risk": "This may still contain data needed for compliance or disaster recovery. Verify before deleting."
+      }
+    },
+    {
+      "wasteType": "untagged_ecr_images",
+      "region": "us-east-1",
+      "resource": "ECR repository C",
+      "title": "Untagged ECR Images",
+      "monthlySavings": 0.02,
+      "confidence": "high",
+      "action": "Delete untagged images or add a lifecycle policy to expire them automatically.",
+      "actionCommand": "aws ecr batch-delete-image --repository-name <ECR repository C> --image-ids \"$(aws ecr list-images --repository-name <ECR repository C> --filter tagStatus=UNTAGGED --query 'imageIds[*]' --output json)\"",
+      "explanation": {
+        "detection": "1 images without any tag in repository 'ECR repository C' (0.21 GB)",
+        "threshold": "> 0 untagged images with > 0.1 GB total size",
+        "pricing": "0.21 GB \u00d7 $0.10/GB/month = $0.02/month",
+        "why_waste": "Untagged images are created when a new image is pushed with the same tag, replacing the old manifest. The old image loses its tag but remains stored. These orphaned layers accumulate and increase storage costs.",
+        "risk": "Untagged images cannot be pulled by tag. They are only referenced by digest. Verify no Fargate tasks or Kubernetes pods reference images by SHA digest before deleting."
+      }
+    },
+    {
+      "wasteType": "idle_efs",
+      "region": "us-east-1",
+      "resource": "EFS file system A",
+      "title": "EFS Without Mount Targets",
+      "monthlySavings": 0.01,
+      "confidence": "high",
+      "action": "Delete this filesystem.",
+      "actionCommand": "aws efs delete-file-system --file-system-id <EFS file system A>",
+      "explanation": {
+        "detection": "EFS filesystem has no mount targets (not mounted anywhere)",
+        "threshold": "Zero mount targets with size > $0 cost",
+        "pricing": "0.0 GB \u00d7 $0.30/GB/month = $0.01/month",
+        "why_waste": "Without mount targets, no EC2 instance or container can access this filesystem. It's paying for storage that cannot be read or written.",
+        "risk": "Verify the filesystem is not in the process of being set up. Back up data with AWS Backup or DataSync before deleting."
+      }
+    },
+    {
+      "wasteType": "lambda_excessive_timeout",
+      "region": "us-east-1",
+      "resource": "Lambda function A",
+      "title": "Excessive Lambda Timeout",
+      "monthlySavings": 0.01,
+      "confidence": "medium",
+      "action": "Reduce timeout from 900s to 10s (3\u00d7 the longest observed invocation).",
+      "actionCommand": "aws lambda update-function-configuration --function-name <Lambda function A> --timeout 10",
+      "explanation": {
+        "detection": "Timeout is 900s but average execution is 3ms (293160\u00d7 ratio)",
+        "threshold": "Timeout \u2265 10\u00d7 average duration and \u2265 60s, and 3\u00d7 the longest observed invocation is below the current timeout",
+        "pricing": "Risk exposure: $0.01/month if 1% of invocations hang to full timeout",
+        "why_waste": "An excessive timeout means a stuck invocation burns Lambda compute for 900s instead of failing fast. This is a cost-risk and operational-reliability finding.",
+        "risk": "The longest invocation in the last 30 days took 20ms; the recommended 10s is at least 3\u00d7 that. Rarer, longer invocations outside this window would fail at the new timeout."
+      }
+    },
+    {
+      "wasteType": "lambda_excessive_timeout",
+      "region": "us-east-1",
+      "resource": "Lambda function E",
+      "title": "Excessive Lambda Timeout",
+      "monthlySavings": 0.01,
+      "confidence": "medium",
+      "action": "Reduce timeout from 900s to 361s (3\u00d7 the longest observed invocation).",
+      "actionCommand": "aws lambda update-function-configuration --function-name <Lambda function E> --timeout 361",
+      "explanation": {
+        "detection": "Timeout is 900s but average execution is 2101ms (428\u00d7 ratio)",
+        "threshold": "Timeout \u2265 10\u00d7 average duration and \u2265 60s, and 3\u00d7 the longest observed invocation is below the current timeout",
+        "pricing": "Risk exposure: $0.01/month if 1% of invocations hang to full timeout",
+        "why_waste": "An excessive timeout means a stuck invocation burns Lambda compute for 900s instead of failing fast. This is a cost-risk and operational-reliability finding.",
+        "risk": "The longest invocation in the last 30 days took 120234ms; the recommended 361s is at least 3\u00d7 that. Rarer, longer invocations outside this window would fail at the new timeout."
+      }
+    },
+    {
+      "wasteType": "lambda_old_runtime",
+      "region": "us-east-1",
+      "resource": "Lambda function B",
+      "title": "Deprecated Lambda Runtime",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Update the runtime. EOL 2025-12-15. Migrate to python3.13.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Function uses deprecated runtime python3.9",
+        "threshold": "Runtime is past AWS end-of-life date",
+        "pricing": "$0.01/month (hygiene finding: no direct cost savings)",
+        "why_waste": "Deprecated runtimes no longer receive security patches from AWS. EOL 2025-12-15. Migrate to python3.13.",
+        "risk": "Runtime migration may require code changes. Test thoroughly in a staging environment. Check for deprecated API usage in your function code."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group F",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group F>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group F' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group G",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group G>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group G' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group M",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group M>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group M' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group N",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group N>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group N' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group O",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group O>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group O' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "no_retention_log_group",
+      "region": "us-east-1",
+      "resource": "Log group P",
+      "title": "Log Group Without Retention Policy",
+      "monthlySavings": 0.01,
+      "confidence": "low",
+      "action": "Set a retention policy to automatically delete old logs.",
+      "actionCommand": "aws logs put-retention-policy --log-group-name '<Log group P>' --retention-in-days 30",
+      "explanation": {
+        "detection": "Log group 'Log group P' stores 0.000 GB with no retention policy set.",
+        "threshold": "All log groups without a retention policy are flagged: logs will accumulate indefinitely.",
+        "pricing": "CloudWatch Logs storage costs $0.03/GB/month: currently $0.0000/month.",
+        "why_waste": "Even small log groups grow over time. Without retention, storage costs only increase.",
+        "risk": "Low risk: setting a retention policy is a best practice. Choose a window that matches your debugging needs."
+      }
+    },
+    {
+      "wasteType": "unused_lambda",
+      "region": "us-east-1",
+      "resource": "Lambda function C",
+      "title": "Unused Lambda Function",
+      "monthlySavings": 0.01,
+      "confidence": "high",
+      "action": "Delete this function if it's no longer needed.",
+      "actionCommand": "aws lambda delete-function --function-name <Lambda function C>",
+      "explanation": {
+        "detection": "CloudWatch Invocations metric = 0 over the past 30 days",
+        "threshold": "0 invocations in 30 days",
+        "pricing": "Storage cost: 0.0000 GB \u00d7 $0.08/GB = $0.01/month",
+        "why_waste": "This function has not been invoked in 30 days. It may be leftover from a decommissioned feature or a one-time migration.",
+        "risk": "Check if this function is triggered by scheduled events, S3 notifications, or other async invocations before deleting."
+      }
+    },
+    {
+      "wasteType": "unused_lambda",
+      "region": "us-east-1",
+      "resource": "Lambda function D",
+      "title": "Unused Lambda Function",
+      "monthlySavings": 0.01,
+      "confidence": "high",
+      "action": "Delete this function if it's no longer needed.",
+      "actionCommand": "aws lambda delete-function --function-name <Lambda function D>",
+      "explanation": {
+        "detection": "CloudWatch Invocations metric = 0 over the past 30 days",
+        "threshold": "0 invocations in 30 days",
+        "pricing": "Storage cost: 0.0000 GB \u00d7 $0.08/GB = $0.01/month",
+        "why_waste": "This function has not been invoked in 30 days. It may be leftover from a decommissioned feature or a one-time migration.",
+        "risk": "Check if this function is triggered by scheduled events, S3 notifications, or other async invocations before deleting."
+      }
+    },
+    {
+      "wasteType": "dynamodb_no_deletion_protection",
+      "region": "us-east-1",
+      "resource": "DynamoDB table A",
+      "title": "DynamoDB Without Deletion Protection",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Enable deletion protection to prevent accidental table deletion.",
+      "actionCommand": "aws dynamodb update-table --table-name <DynamoDB table A> --deletion-protection-enabled",
+      "explanation": {
+        "detection": "DynamoDB table DynamoDB table A has DeletionProtectionEnabled=False.",
+        "threshold": "All production DynamoDB tables should have deletion protection.",
+        "risk": "None: enabling deletion protection is non-destructive."
+      }
+    },
+    {
+      "wasteType": "dynamodb_no_deletion_protection",
+      "region": "us-east-1",
+      "resource": "DynamoDB table B",
+      "title": "DynamoDB Without Deletion Protection",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Enable deletion protection to prevent accidental table deletion.",
+      "actionCommand": "aws dynamodb update-table --table-name <DynamoDB table B> --deletion-protection-enabled",
+      "explanation": {
+        "detection": "DynamoDB table DynamoDB table B has DeletionProtectionEnabled=False.",
+        "threshold": "All production DynamoDB tables should have deletion protection.",
+        "risk": "None: enabling deletion protection is non-destructive."
+      }
+    },
+    {
+      "wasteType": "dynamodb_no_deletion_protection",
+      "region": "us-east-1",
+      "resource": "DynamoDB table C",
+      "title": "DynamoDB Without Deletion Protection",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Enable deletion protection to prevent accidental table deletion.",
+      "actionCommand": "aws dynamodb update-table --table-name <DynamoDB table C> --deletion-protection-enabled",
+      "explanation": {
+        "detection": "DynamoDB table DynamoDB table C has DeletionProtectionEnabled=False.",
+        "threshold": "All production DynamoDB tables should have deletion protection.",
+        "risk": "None: enabling deletion protection is non-destructive."
+      }
+    },
+    {
+      "wasteType": "dynamodb_no_deletion_protection",
+      "region": "us-east-1",
+      "resource": "DynamoDB table D",
+      "title": "DynamoDB Without Deletion Protection",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Enable deletion protection to prevent accidental table deletion.",
+      "actionCommand": "aws dynamodb update-table --table-name <DynamoDB table D> --deletion-protection-enabled",
+      "explanation": {
+        "detection": "DynamoDB table DynamoDB table D has DeletionProtectionEnabled=False.",
+        "threshold": "All production DynamoDB tables should have deletion protection.",
+        "risk": "None: enabling deletion protection is non-destructive."
+      }
+    },
+    {
+      "wasteType": "ecr_no_lifecycle_policy",
+      "region": "us-east-1",
+      "resource": "ECR repository A",
+      "title": "ECR Repository Without Lifecycle Policy",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Add a lifecycle policy to automatically clean old images.",
+      "actionCommand": "aws ecr put-lifecycle-policy --repository-name <ECR repository A> --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Keep only last 10 images\",\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":10},\"action\":{\"type\":\"expire\"}}]}'",
+      "explanation": {
+        "detection": "Repository has 1 images (0.00 GB) with no lifecycle policy",
+        "threshold": "Any repository with images and no lifecycle policy",
+        "pricing": "0.00 GB of old/untagged images \u00d7 $0.10/GB-month = $0.00/month today; the policy stops new ones accumulating.",
+        "why_waste": "Without a lifecycle policy, old and unused container images accumulate indefinitely, consuming ECR storage.",
+        "risk": "Review how many image versions your deployment process needs before setting the policy. Keep at least the last N images needed for rollback."
+      }
+    },
+    {
+      "wasteType": "ecr_no_lifecycle_policy",
+      "region": "us-east-1",
+      "resource": "ECR repository B",
+      "title": "ECR Repository Without Lifecycle Policy",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Add a lifecycle policy to automatically clean old images.",
+      "actionCommand": "aws ecr put-lifecycle-policy --repository-name <ECR repository B> --lifecycle-policy-text '{\"rules\":[{\"rulePriority\":1,\"description\":\"Keep only last 10 images\",\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":10},\"action\":{\"type\":\"expire\"}}]}'",
+      "explanation": {
+        "detection": "Repository has 1 images (0.56 GB) with no lifecycle policy",
+        "threshold": "Any repository with images and no lifecycle policy",
+        "pricing": "0.56 GB of old/untagged images \u00d7 $0.10/GB-month = $0.06/month, counted once in this repository's old/untagged image finding; $0 here.",
+        "why_waste": "Without a lifecycle policy, old and unused container images accumulate indefinitely, consuming ECR storage.",
+        "risk": "Review how many image versions your deployment process needs before setting the policy. Keep at least the last N images needed for rollback."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group A",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group A>'",
+      "explanation": {
+        "detection": "Log group 'Log group A' is 0 bytes and has been empty for 553 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group B",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group B>'",
+      "explanation": {
+        "detection": "Log group 'Log group B' is 0 bytes and has been empty for 1160 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group C",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group C>'",
+      "explanation": {
+        "detection": "Log group 'Log group C' is 0 bytes and has been empty for 229 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group D",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group D>'",
+      "explanation": {
+        "detection": "Log group 'Log group D' is 0 bytes and has been empty for 706 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group E",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group E>'",
+      "explanation": {
+        "detection": "Log group 'Log group E' is 0 bytes and has been empty for 464 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group H",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group H>'",
+      "explanation": {
+        "detection": "Log group 'Log group H' is 0 bytes and has been empty for 495 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group I",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group I>'",
+      "explanation": {
+        "detection": "Log group 'Log group I' is 0 bytes and has been empty for 707 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group J",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group J>'",
+      "explanation": {
+        "detection": "Log group 'Log group J' is 0 bytes and has been empty for 706 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group K",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group K>'",
+      "explanation": {
+        "detection": "Log group 'Log group K' is 0 bytes and has been empty for 706 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group L",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group L>'",
+      "explanation": {
+        "detection": "Log group 'Log group L' is 0 bytes and has been empty for 706 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group Q",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group Q>'",
+      "explanation": {
+        "detection": "Log group 'Log group Q' is 0 bytes and has been empty for 201 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group R",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group R>'",
+      "explanation": {
+        "detection": "Log group 'Log group R' is 0 bytes and has been empty for 644 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group S",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group S>'",
+      "explanation": {
+        "detection": "Log group 'Log group S' is 0 bytes and has been empty for 553 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group T",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group T>'",
+      "explanation": {
+        "detection": "Log group 'Log group T' is 0 bytes and has been empty for 517 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group U",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group U>'",
+      "explanation": {
+        "detection": "Log group 'Log group U' is 0 bytes and has been empty for 53 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group V",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group V>'",
+      "explanation": {
+        "detection": "Log group 'Log group V' is 0 bytes and has been empty for 40 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "empty_log_group",
+      "region": "us-east-1",
+      "resource": "Log group W",
+      "title": "Empty Log Group",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "Delete this empty log group to reduce clutter and free quota.",
+      "actionCommand": "aws logs delete-log-group --log-group-name '<Log group W>'",
+      "explanation": {
+        "detection": "Log group 'Log group W' is 0 bytes and has been empty for 40 days.",
+        "threshold": "Log groups storing 0 bytes whose newest log stream has had no event for 30+ days (or that never received one and are 30+ days old) are flagged.",
+        "pricing": "An empty log group costs nothing in storage, but contributes to API and quota limits.",
+        "why_waste": "Empty log groups are typically orphaned from deleted services and add unnecessary clutter.",
+        "risk": "Safe to delete. If a service recreates the log group, CloudWatch will create a new one automatically."
+      }
+    },
+    {
+      "wasteType": "incomplete_multipart",
+      "region": "us-east-1",
+      "resource": "S3 bucket B",
+      "title": "Incomplete Multipart Uploads",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Abort the stale multipart uploads, and add a lifecycle rule (AbortIncompleteMultipartUpload after 7 days) so new ones are cleaned up.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "1 of the bucket's 1 incomplete multipart uploads were started more than 7 days ago",
+        "threshold": "Incomplete multipart uploads older than 7 days",
+        "pricing": "Uploaded parts are billed as S3 storage until the upload is aborted, but their size is not measured: reading it needs s3:ListMultipartUploadParts, which the CloudWise scan role does not have. Saving shown as $0; the S3 Storage Lens \"incomplete multipart upload bytes\" metric shows the real figure.",
+        "why_waste": "Incomplete multipart uploads consume storage but are not usable. They are typically left behind by failed or interrupted uploads.",
+        "risk": "Aborting a stale upload is safe; uploads under 7 days old are not flagged, since they may still be in progress. A lifecycle rule prevents future accumulation."
+      }
+    },
+    {
+      "wasteType": "resource_without_backup_coverage",
+      "region": "us-east-1",
+      "resource": "DynamoDB table A",
+      "title": "DynamoDB Table Without Backup Coverage",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Enable point-in-time recovery or add this table to an AWS Backup plan.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "No AWS Backup recovery point for DynamoDB table A; PITR disabled.",
+        "threshold": "All production DynamoDB tables should have PITR or AWS Backup coverage.",
+        "risk": "Low: verify no other backup strategy covers this table before acting."
+      }
+    },
+    {
+      "wasteType": "resource_without_backup_coverage",
+      "region": "us-east-1",
+      "resource": "DynamoDB table B",
+      "title": "DynamoDB Table Without Backup Coverage",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Enable point-in-time recovery or add this table to an AWS Backup plan.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "No AWS Backup recovery point for DynamoDB table B; PITR disabled.",
+        "threshold": "All production DynamoDB tables should have PITR or AWS Backup coverage.",
+        "risk": "Low: verify no other backup strategy covers this table before acting."
+      }
+    },
+    {
+      "wasteType": "resource_without_backup_coverage",
+      "region": "us-east-1",
+      "resource": "DynamoDB table D",
+      "title": "DynamoDB Table Without Backup Coverage",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Enable point-in-time recovery or add this table to an AWS Backup plan.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "No AWS Backup recovery point for DynamoDB table D; PITR disabled.",
+        "threshold": "All production DynamoDB tables should have PITR or AWS Backup coverage.",
+        "risk": "Low: verify no other backup strategy covers this table before acting."
+      }
+    },
+    {
+      "wasteType": "resource_without_backup_coverage",
+      "region": "us-east-1",
+      "resource": "Resource A",
+      "title": "DynamoDB Table Without Backup Coverage",
+      "monthlySavings": 0.0,
+      "confidence": "medium",
+      "action": "Enable point-in-time recovery or add this table to an AWS Backup plan.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "No AWS Backup recovery point for Resource A; PITR disabled.",
+        "threshold": "All production DynamoDB tables should have PITR or AWS Backup coverage.",
+        "risk": "Low: verify no other backup strategy covers this table before acting."
+      }
+    },
+    {
+      "wasteType": "s3_empty_bucket",
+      "region": "us-east-1",
+      "resource": "S3 bucket A",
+      "title": "Empty S3 Bucket",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "S3 bucket 'S3 bucket A' has been empty for 238 days. Consider deleting it to reduce console clutter and simplify IAM policies.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Bucket has 0 objects and 0 bytes. Created 238 days ago.",
+        "threshold": "Empty for > 30 days and not an infrastructure bucket",
+        "pricing": "Empty buckets incur no storage cost, but clutter your account and IAM policies.",
+        "why_waste": "This bucket has been empty for 238 days. It may have been created for testing or by a deployment tool and never used.",
+        "risk": "Verify no applications or scripts reference this bucket name before deleting. S3 bucket names are globally unique: once deleted, the name may be claimed by someone else."
+      }
+    },
+    {
+      "wasteType": "s3_empty_bucket",
+      "region": "us-east-1",
+      "resource": "S3 bucket C",
+      "title": "Empty S3 Bucket",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "S3 bucket 'S3 bucket C' has been empty for 53 days. Consider deleting it to reduce console clutter and simplify IAM policies.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Bucket has 0 objects and 0 bytes. Created 53 days ago.",
+        "threshold": "Empty for > 30 days and not an infrastructure bucket",
+        "pricing": "Empty buckets incur no storage cost, but clutter your account and IAM policies.",
+        "why_waste": "This bucket has been empty for 53 days. It may have been created for testing or by a deployment tool and never used.",
+        "risk": "Verify no applications or scripts reference this bucket name before deleting. S3 bucket names are globally unique: once deleted, the name may be claimed by someone else."
+      }
+    },
+    {
+      "wasteType": "s3_empty_bucket",
+      "region": "us-east-1",
+      "resource": "S3 bucket E",
+      "title": "Empty S3 Bucket",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "S3 bucket 'S3 bucket E' has been empty for 561 days. Consider deleting it to reduce console clutter and simplify IAM policies.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Bucket has 0 objects and 0 bytes. Created 561 days ago.",
+        "threshold": "Empty for > 30 days and not an infrastructure bucket",
+        "pricing": "Empty buckets incur no storage cost, but clutter your account and IAM policies.",
+        "why_waste": "This bucket has been empty for 561 days. It may have been created for testing or by a deployment tool and never used.",
+        "risk": "Verify no applications or scripts reference this bucket name before deleting. S3 bucket names are globally unique: once deleted, the name may be claimed by someone else."
+      }
+    },
+    {
+      "wasteType": "s3_empty_bucket",
+      "region": "us-east-1",
+      "resource": "S3 bucket F",
+      "title": "Empty S3 Bucket",
+      "monthlySavings": 0.0,
+      "confidence": "low",
+      "action": "S3 bucket 'S3 bucket F' has been empty for 495 days. Consider deleting it to reduce console clutter and simplify IAM policies.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "Bucket has 0 objects and 0 bytes. Created 495 days ago.",
+        "threshold": "Empty for > 30 days and not an infrastructure bucket",
+        "pricing": "Empty buckets incur no storage cost, but clutter your account and IAM policies.",
+        "why_waste": "This bucket has been empty for 495 days. It may have been created for testing or by a deployment tool and never used.",
+        "risk": "Verify no applications or scripts reference this bucket name before deleting. S3 bucket names are globally unique: once deleted, the name may be claimed by someone else."
+      }
+    },
+    {
+      "wasteType": "unencrypted_efs_filesystem",
+      "region": "us-east-1",
+      "resource": "EFS file system B",
+      "title": "Unencrypted EFS Filesystem",
+      "monthlySavings": 0.0,
+      "confidence": "high",
+      "action": "Create a new encrypted EFS filesystem and migrate data with DataSync.",
+      "actionCommand": null,
+      "explanation": {
+        "detection": "EFS filesystem EFS file system B has encrypted=False.",
+        "threshold": "All EFS filesystems should be encrypted at rest.",
+        "risk": "EFS encryption is set at creation time. Migration requires DataSync or rsync to a new filesystem."
+      }
+    }
+  ]
+}

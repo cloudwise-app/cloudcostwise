@@ -26,6 +26,7 @@ from mcp.types import ToolAnnotations
 from cloudcostwise import __version__, render
 from cloudcostwise import exclude as exclude_mod
 from cloudcostwise import share as share_mod
+from cloudcostwise import demo as demo_mod
 from cloudcostwise.runtime import (
     COST_EXPLORER_PRICE_PER_REQUEST,
     CredentialsError,
@@ -48,7 +49,10 @@ INSTRUCTIONS = (
     "first `scan`, tell the user two things. The RI/Savings Plans checks (and one KMS spend read, only if an S3 bucket-key finding appears) call Cost Explorer, which AWS "
     f"bills at ${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), and "
     "include_cost_explorer=false skips them. Results, including the account ID and resource IDs, come "
-    "back to you, the assistant."
+    "back to you, the assistant. `scan` with demo=true shows a recorded scan of a CloudWise test account "
+    "(sample data, every identifier a placeholder) without calling AWS; the later tools then work on it, "
+    "and you must tell the user it is sample data, not their account. This server never sends a scan "
+    "or its summary to CloudWise unless the user's own setting says so."
 )
 
 
@@ -65,12 +69,22 @@ class _Session:
     by_id: Dict[str, object] = field(default_factory=dict)
     footer_shown: bool = False
     upsell: bool = True
+    share_note_shown: bool = False
 
     def footer_once(self) -> str:
-        if not self.upsell or self.footer_shown or self.report is None:
+        # CLO-1057: a demo result neither shows the footer nor uses it up for a later real scan.
+        # CLO-1055: the MCP footer has no hosted-product line or link (render.mcp_footer).
+        if not self.upsell or self.footer_shown or self.report is None or self.report.demo:
             return ""
         self.footer_shown = True
-        return "\n\n" + render.footer(self.report)
+        return "\n\n" + render.mcp_footer(self.report)
+
+
+def _demo_wrap(report: Optional[ScanReport], text: str) -> str:
+    """CLO-1057: every tool result about the recorded sample starts and ends with the sample-data note."""
+    if report is None or not report.demo:
+        return text
+    return f"{demo_mod.MCP_NOTE}\n\n{text.rstrip()}\n\n{demo_mod.BANNER_BOTTOM}"
 
 
 def _money(x) -> str:
@@ -138,9 +152,11 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
     """The MCP server. The defaults are the free tool.
 
     ``full`` runs all 46 service checks (partner build only), ``upsell=False``
-    drops the hosted-product footer and links, ``share=True`` (the free ``serve()`` only)
+    drops the footer (the local-check count and the feedback note; MCP output carries no
+    hosted-product line, CLO-1055), ``share=True`` (the free ``serve()`` only)
     lets a scan send a summary when the human's own setting says yes (CLO-824; never a
-    tool parameter, never a prompt; the partner build leaves it off), and ``register(server,
+    tool parameter, never a prompt; the partner build leaves it off) and saves each real scan's
+    summary for ``cloudcostwise share --last`` (CLO-1055; the partner build saves nothing), and ``register(server,
     last_report)`` lets a build add its own tools over the last scan, and
     ``transform`` rewrites each scan before any tool shows it. ``gate(creds)``
     runs after the account is resolved and before any check: it returns None to
@@ -163,9 +179,28 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                              f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), plus one request for the last 30 days of spend and, only when an S3 bucket-key finding exists, one for KMS request spend (one per scan, not per region), "
                              "which scores the result; tell the user before running, and pass "
                              "include_cost_explorer=false to skip them (the score is then labelled \"without spend data\"). regions: comma-separated, or 'all'; "
-                             "default us-east-1 plus the profile's region.")
+                             "default us-east-1 plus the profile's region. demo=true: show a recorded scan of a CloudWise test "
+                             "account (sample data, no AWS call, no credentials; profile, regions and "
+                             "include_cost_explorer are ignored) and say it is sample data.")
     async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,
-                   include_cost_explorer: bool = True) -> str:
+                   include_cost_explorer: bool = True, demo: bool = False) -> str:
+        if demo:
+            # CLO-1057: no credentials, no AWS, no exclude list, no transform, no share: the recording as it is.
+            report = demo_mod.load_report()
+            session.report = report
+            session.by_id = {str(i.id): i for i in report.findings}
+            await _notify_scan_changed(ctx)
+            lines = [*render.score_card(report, markdown=True), "",
+                     f"{len(report.findings)} findings, estimated savings "
+                     f"{_money(render.counted_total(report))}/month (advisory findings excluded)."]
+            for g in render.groups(report)[:15]:
+                tag = " (advisory, not counted)" if g.advisory else ""
+                lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
+            if len(render.groups(report)) > 15:
+                lines.append("- ... call list_findings for the rest")
+            lines += [*render.scope_notes(report), demo_mod.IGNORED_IN_MCP,
+                      "Use list_findings for finding ids, then explain_finding or fix_guidance."]
+            return _demo_wrap(report, "\n".join(lines) + session.footer_once())
         try:
             creds = resolve_credentials(profile)
             region_list = resolve_regions(regions, creds)
@@ -199,8 +234,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
         session.report = report
         session.by_id = {str(i.id): i for i in report.findings}
         await _notify_scan_changed(ctx)
-        if share_enabled:
-            share_mod.share_from_settings_mcp(report)
+        share_line = await _share_after_scan(report) if share_enabled else ""
         lines = [*render.score_card(report, markdown=True), "",
                  f"Account {report.account_id}, regions {', '.join(report.regions)}: "
                  f"{len(report.findings)} findings, estimated savings "
@@ -230,7 +264,28 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             lines.append(f"{len(report.coverage_notes)} AWS input(s) not enabled in this account: "
                          "the findings they feed are MISSING, not zero.")
         lines.append("Use list_findings for finding ids, then explain_finding or fix_guidance.")
+        if share_line:
+            lines += ["", share_line]
         return "\n".join(lines) + session.footer_once()
+
+    async def _share_after_scan(report: ScanReport) -> str:
+        """CLO-1055: save the summary for `share --last`, send it only if the user's setting says yes,
+        and return the one line for the user: what was sent, or (once per session) that nothing was.
+        The send is awaited (capped at about 3 s) so the line says what really happened: "was sent" only
+        when CloudWise answered with success, a line that claims no send when it did not, and nothing
+        when no send was made ('already', 'not_marked', 'error')."""
+        saved = await asyncio.to_thread(share_mod.save_last_summary, report, "mcp")
+        outcome = await asyncio.to_thread(lambda: share_mod.share_from_settings_mcp(report, saved_at=saved))
+        if outcome == "sent":
+            return share_mod.MCP_SENT_NOTE
+        if outcome == "unsure":
+            return share_mod.MCP_SEND_UNCONFIRMED
+        if outcome == "refused":
+            return share_mod.URL_REFUSED.replace("cloudcostwise: ", "", 1)
+        if outcome == "not_on" and saved and not session.share_note_shown:
+            session.share_note_shown = True
+            return share_mod.MCP_NOT_SENT_NOTE
+        return ""
 
     @server.tool(annotations=LOCAL_READ,
                  description="List findings from the last scan, with ids, optionally filtered by waste type "
@@ -250,8 +305,8 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                 rows.append(f"| {i.id} | {name} | {i.region or '-'} | `{i.resource_id}` | {_money(i.monthly_savings)} |")
                 n += 1
         if not n:
-            return "No findings match."
-        return "\n".join(rows) + session.footer_once()
+            return _demo_wrap(session.report, "No findings match.")
+        return _demo_wrap(session.report, "\n".join(rows) + session.footer_once())
 
     @server.tool(annotations=LOCAL_READ,
                  description="Explain one finding: what was detected, the threshold, the pricing used, why "
@@ -271,7 +326,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
             value = (item.explanation or {}).get(key)
             if value:
                 out.append(f"{key.replace('_', ' ').capitalize()}: {value}")
-        return "\n".join(out).strip() + session.footer_once()
+        return _demo_wrap(session.report, "\n".join(out).strip() + session.footer_once())
 
     @server.tool(annotations=LOCAL_READ,
                  description="How to fix one finding: the recommended action and, where known, the AWS CLI "
@@ -287,9 +342,8 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
         risk = (item.explanation or {}).get("risk")
         if risk:
             out += ["", f"Risk: {risk}"]
-        if session.upsell:
-            out += ["", f"Safe, approved fixes with rollback are part of the hosted product: {render.HOSTED_URL}"]
-        return "\n".join(out) + session.footer_once()
+        # CLO-1055: no hosted-product line here; the terminal CLI keeps its footer.
+        return _demo_wrap(session.report, "\n".join(out) + session.footer_once())
 
     @server.resource(RESOURCE_LATEST, name="scan-latest", mime_type="application/json",
                      description="The last scan's findings as JSON, held in this process. Read-only: never "
@@ -305,7 +359,7 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
     def scan_latest_summary() -> str:
         if session.report is None:
             return NO_SCAN_YET
-        return _summary_text(session.report)
+        return _demo_wrap(session.report, _summary_text(session.report))
 
     @server.resource(RESOURCE_CHECKS, name="checks", mime_type="text/markdown",
                      description="The free checks and the waste types each can report, read from the shipped "

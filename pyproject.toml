@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloudcostwise"
-version = "0.1.23"
-description = "Find AWS waste from your terminal or your AI assistant. Runs locally with your own read-only credentials. Nothing is sent to CloudWise unless you choose to share a summary at the end."
+version = "0.1.24"
+description = "Find AWS waste from your terminal or your AI assistant, including kinds AWS's own tools don't flag. Runs locally with your own read-only credentials. Nothing is sent to CloudWise unless you choose to share a summary at the end."
 readme = "README.md"
 requires-python = ">=3.11"
 keywords = ["aws", "finops", "cost-optimization", "cloud-cost", "waste", "mcp", "claude-code", "cli"]
@@ -43,3 +43,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 cloudwise_scan_core = ["py.typed"]
+cloudcostwise = ["demo_scan.json"]

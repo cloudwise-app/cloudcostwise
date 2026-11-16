@@ -753,6 +753,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         # endpoint).
         self.swallowed_error_count: int = 0
         self._warned_swallowed: set = set()
+        # (resource, permission) pairs already in ``permission_errors``: a refused
+        # per-resource read on thousands of buckets is one missing permission.
+        self._recorded_permissions: set = set()
         self._workspaces_pools_unavailable_logged = False
         # CLO-493: LaunchTime per instance, recorded by get_ec2_instances so
         # get_ec2_metrics can skip the MISSING note for an instance younger
@@ -773,6 +776,21 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         # metrics could not be fetched. ``_attach_provider_permission_errors``
         # carries them to ``WasteDetectionResult.warnings``.
         self.data_warnings: List[str] = []
+
+    @property
+    def pricing_session(self) -> boto3.Session:
+        """CLO-1002: a session on this scan's credentials, built once, for the
+        Price List client (the CLI's frozen profile keys, the hosted role)."""
+        session = getattr(self, "_pricing_session", None)
+        if session is None:
+            session = boto3.Session(
+                aws_access_key_id=self._access_key_id,
+                aws_secret_access_key=self._secret_access_key,
+                aws_session_token=self._session_token,
+                region_name=self._region,
+            )
+            self._pricing_session = session
+        return session
 
     @property
     def provider_type(self) -> str:
@@ -905,6 +923,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         mechanism that lets a permission failure surface even for detectors
         that were never touched by this change.
         """
+        # One record per (resource, permission) on this provider: the same
+        # refusal repeated per bucket or per volume adds nothing downstream
+        # (permission_missing is deduplicated by action) but would grow the
+        # list by thousands. A different permission is always recorded.
+        key = (resource, permission)
+        if key in self._recorded_permissions:
+            return
+        self._recorded_permissions.add(key)
         error_code = ''
         if isinstance(error, ClientError):
             error_code = error.response.get('Error', {}).get('Code', '')
@@ -991,7 +1017,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         "one WARNING per detector per region per scan" the CLO-368 cost
         note requires, not a general-purpose log throttle.
         """
-        self.swallowed_error_count += 1
+        # An access denial is one missing permission, however many resources hit
+        # it: counted once per (context, permission). Any other failure
+        # (throttling, a timeout) is a lost read each time and is counted each time.
+        if not (self._is_access_denied(error) and (context, permission) in self._recorded_permissions):
+            self.swallowed_error_count += 1
         error_class = error.__class__.__name__
         # For a botocore ClientError, "ClientError" alone is true of nearly
         # every AWS API failure and tells an operator nothing — fold in the
@@ -3530,10 +3560,9 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         except ParamValidationError:
             return s3.list_buckets().get('Buckets', [])
 
-    @staticmethod
     def _s3_default_encryption(
-        s3, bucket_name: str,
-    ) -> Tuple[bool, Optional[str], Optional[bool]]:
+        self, s3, bucket_name: str,
+    ) -> Tuple[Optional[bool], Optional[str], Optional[bool]]:
         """A bucket's default encryption: (enabled, algorithm, bucket_key_enabled).
 
         CLO-993: ``BucketKeyEnabled`` is a member of the rule itself
@@ -3541,8 +3570,17 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
         ``ApplyServerSideEncryptionByDefault`` (botocore s3 2006-03-01), so it
         is read from the same ``Rules[0]`` as the algorithm. It is None when
         the rule does not carry it.
+
+        CLO-1049: only ``ServerSideEncryptionConfigurationNotFoundError`` means
+        "no default encryption" (False). Any other failure (AccessDenied from a
+        role without s3:GetEncryptionConfiguration, a bucket policy deny,
+        throttling) means the setting was not read: (None, None, None), so
+        neither encryption check reports the bucket. It is passed to
+        ``_warn_swallowed``, which folds an access denial into
+        permission_errors (and so permission_missing). It used to be dropped
+        and read as (True, None, None): encryption on, algorithm unknown.
         """
-        default_encryption_enabled = True  # AWS default since Jan 2023
+        default_encryption_enabled: Optional[bool] = True  # AWS default since Jan 2023
         encryption_algorithm = None
         bucket_key_enabled: Optional[bool] = None
         try:
@@ -3559,8 +3597,20 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     if isinstance(flag, bool):
                         bucket_key_enabled = flag
         except ClientError as e:
-            if e.response['Error']['Code'] == 'ServerSideEncryptionConfigurationNotFoundError':
-                default_encryption_enabled = False
+            if e.response.get('Error', {}).get('Code') == 'ServerSideEncryptionConfigurationNotFoundError':
+                return False, None, None
+            self._warn_swallowed(
+                "S3 bucket default encryption", "s3:GetEncryptionConfiguration", e,
+            )
+            return None, None, None
+        except BotoCoreError as e:
+            # A connection or endpoint failure on this one bucket: unknown for it,
+            # counted as a swallowed error (never a permission), and the other
+            # buckets' results are kept.
+            self._warn_swallowed(
+                "S3 bucket default encryption", "s3:GetEncryptionConfiguration", e,
+            )
+            return None, None, None
         return default_encryption_enabled, encryption_algorithm, bucket_key_enabled
     
     async def get_s3_cost_breakdown(self) -> Dict[str, S3CostBreakdown]:
@@ -6738,7 +6788,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     cluster_type=c.get('ClusterType', 'PROVISIONED'),
                     state=c.get('State', 'ACTIVE'),
                     tags=c.get('Tags', {}),
-                    creation_time=c.get('CreationTime'),  # CLO-457
+                    creation_time=c.get('CreationTime'), broker_volume_gb=MSKClusterData.volume_gb_from(c.get('BrokerNodeGroupInfo')),  # CLO-457, CLO-975
                 ))
         except ClientError as e:
             if self._is_access_denied(e):
@@ -10572,6 +10622,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
 
         # ── Instances by tag ──
         instances_by_env: Dict[str, List[str]] = {}
+        volumes_by_env: Dict[str, List[str]] = {}
+        # CLO-1012: when each billed part appeared (LaunchTime, AttachTime),
+        # from the same response; see BeanstalkMetricsData.billed_created_at.
+        created_by_env: Dict[str, Dict[str, Any]] = {}
         instances_read = True
         try:
             ec2 = self._get_client('ec2')
@@ -10586,6 +10640,16 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                             env = self._get_tag_value(inst.get('Tags', []), 'elasticbeanstalk:environment-name')
                             if env in metrics:
                                 instances_by_env.setdefault(env, []).append(inst.get('InstanceId', ''))
+                                if inst.get('InstanceId') and inst.get('LaunchTime'):
+                                    created_by_env.setdefault(env, {})[inst['InstanceId']] = inst['LaunchTime']
+                                # CLO-1012: the attached volumes, from the same response.
+                                for bdm in inst.get('BlockDeviceMappings') or []:
+                                    ebs = (bdm or {}).get('Ebs') or {}
+                                    vol_id = ebs.get('VolumeId')
+                                    if vol_id:
+                                        volumes_by_env.setdefault(env, []).append(vol_id)
+                                        if ebs.get('AttachTime'):
+                                            created_by_env.setdefault(env, {})[vol_id] = ebs['AttachTime']
         except Exception as e:  # noqa: BLE001 - any failure is MISSING, never zero
             self._warn_swallowed("Beanstalk environment instances", "ec2:DescribeInstances", e)
             instances_read = False
@@ -10597,6 +10661,10 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 ids = []
             instance_budget -= len(ids)
             metrics[name].instance_ids = ids
+            metrics[name].instance_volume_ids = (
+                list(dict.fromkeys(volumes_by_env.get(name, []))) if ids else []
+            )
+            metrics[name].billed_created_at = dict(created_by_env.get(name, {})) if ids else {}
 
         # ── Load balancers by DNS name ──
         lb_by_env: Dict[str, Tuple[str, str, List[str]]] = {}  # name -> (kind, dimension, target groups)
@@ -10624,6 +10692,11 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     lb = v2_by_dns.get(host)
                     if lb is not None:
                         arn = lb.get('LoadBalancerArn', '')
+                        if arn:
+                            metrics[name].billed_load_balancer = arn
+                            metrics[name].billed_load_balancer_kind = 'elbv2'
+                            if lb.get('CreatedTime'):
+                                metrics[name].billed_created_at[arn] = lb['CreatedTime']
                         if lb.get('Type') == 'application' and 'loadbalancer/' in arn:
                             # CLO-527 item 5: every page. A capped read
                             # would sum RequestCount over some groups only,
@@ -10647,9 +10720,31 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     classic = classic_by_dns.get(host)
                     if classic is not None:
                         lb_by_env[name] = ('elb', classic.get('LoadBalancerName', ''), [])
+                        if classic.get('LoadBalancerName'):
+                            metrics[name].billed_load_balancer = classic['LoadBalancerName']
+                            metrics[name].billed_load_balancer_kind = 'classic'
+                            if classic.get('CreatedTime'):
+                                metrics[name].billed_created_at[classic['LoadBalancerName']] = classic['CreatedTime']
+
             except Exception as e:  # noqa: BLE001 - any failure is MISSING, never zero
                 self._warn_swallowed("Beanstalk load balancers", "elasticloadbalancing:DescribeLoadBalancers", e)
                 lb_by_env = {}
+                for name in names:
+                    metrics[name].billed_load_balancer = ''
+                    metrics[name].billed_load_balancer_kind = ''
+
+        # CLO-1012: a load balancer more than one environment resolves to is
+        # shared. It is billed once for all of them, so it is attributed to
+        # none (each environment's saving would otherwise claim all of it).
+        lb_owners: Dict[str, List[str]] = {}
+        for name in names:
+            if metrics[name].billed_load_balancer:
+                lb_owners.setdefault(metrics[name].billed_load_balancer, []).append(name)
+        for owners in lb_owners.values():
+            if len(owners) > 1:
+                for name in owners:
+                    metrics[name].billed_load_balancer = ''
+                    metrics[name].billed_load_balancer_kind = ''
 
         # ── One batched GetMetricData pass ──
         queries: List[Dict[str, Any]] = []

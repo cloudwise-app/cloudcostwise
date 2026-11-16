@@ -1,0 +1,19 @@
+{
+  "name": "cloudcostwise",
+  "version": "0.1.24",
+  "description": "Find AWS waste, including kinds AWS's tools miss. Local, read-only. Nothing sent unless you opt in.",
+  "mcpServers": {
+    "cloudcostwise": {
+      "command": "uvx",
+      "args": ["cloudcostwise==0.1.24", "mcp"]
+    }
+  },
+  "settings": [
+    {
+      "name": "AWS profile",
+      "description": "The AWS profile to scan with (read-only access is enough). Leave empty to use the default profile. Credentials set only as environment variables (AWS_ACCESS_KEY_ID and similar) are not passed to extensions; file and SSO profiles work.",
+      "envVar": "AWS_PROFILE",
+      "sensitive": false
+    }
+  ]
+}

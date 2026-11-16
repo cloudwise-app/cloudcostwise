@@ -1660,6 +1660,57 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return [], None
         return [], False
 
+    @staticmethod
+    def _s3_encryption_read_failed(bucket: Dict[str, Any]) -> bool:
+        """True when export script 1.30.3+ marked this bucket's default-encryption
+        read as failed (``{"_cw_read": "failed"}``)."""
+        enc_config = bucket.get('ServerSideEncryptionConfiguration')
+        return isinstance(enc_config, dict) and enc_config.get('_cw_read') == 'failed'
+
+    @staticmethod
+    def _s3_encryption_from_export(
+        bucket: Dict[str, Any],
+    ) -> Tuple[Optional[bool], Optional[str], Optional[bool]]:
+        """A bucket's default encryption from the export:
+        (enabled, algorithm, bucket_key_enabled), the same answers as the
+        hosted reader (``OnlineDataProvider._s3_default_encryption``).
+
+        Export script 1.30.3 writes three states into
+        ``ServerSideEncryptionConfiguration``: the real response (a ``Rules``
+        list), ``{"_cw_read": "not_configured"}`` (AWS said there is no default
+        encryption) and ``{"_cw_read": "failed"}`` (the read failed, e.g.
+        AccessDenied). Only "not_configured" is (False, None, None); "failed"
+        is (None, None, None), which neither encryption check reports.
+
+        An older script wrote ``{}`` for all three, so an empty or unrecognised
+        value is unknown too: a false "unencrypted" is worse than silence.
+        The ``default_encryption_enabled`` flag some exports carry still counts
+        when it is explicitly False.
+        """
+        enc_config = bucket.get('ServerSideEncryptionConfiguration')
+        if not isinstance(enc_config, dict):
+            enc_config = {}
+        read_state = enc_config.get('_cw_read')
+        if read_state == 'not_configured':
+            return False, None, None
+        if read_state is not None:
+            return None, None, None
+        rules = enc_config.get('Rules')
+        if isinstance(rules, list) and rules:
+            rule = rules[0] if isinstance(rules[0], dict) else {}
+            by_default = rule.get('ApplyServerSideEncryptionByDefault')
+            algorithm = by_default.get('SSEAlgorithm') if isinstance(by_default, dict) else None
+            # CLO-993: the export keeps get-bucket-encryption whole, so the
+            # rule's own BucketKeyEnabled (a sibling of
+            # ApplyServerSideEncryptionByDefault) is there.
+            flag = rule.get('BucketKeyEnabled')
+            return True, algorithm, flag if isinstance(flag, bool) else None
+        if isinstance(rules, list):
+            return True, None, None
+        if bucket.get('default_encryption_enabled') is False:
+            return False, None, None
+        return None, None, None
+
     async def get_s3_buckets(self) -> List[S3BucketData]:
         """Get all S3 buckets from the export, enriched with CloudWatch size metrics."""
         buckets = []
@@ -1798,21 +1849,21 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 )
             
             # Parse encryption config from export
-            enc_config = bucket.get('ServerSideEncryptionConfiguration', {})
-            enc_rules = enc_config.get('Rules', []) if isinstance(enc_config, dict) else []
-            default_encryption_enabled = True  # AWS default since Jan 2023
-            encryption_algorithm = None
-            bucket_key_enabled: Optional[bool] = None
-            if enc_rules:
-                encryption_algorithm = enc_rules[0].get('ApplyServerSideEncryptionByDefault', {}).get('SSEAlgorithm')
-                # CLO-993: the export keeps get-bucket-encryption whole, so
-                # the rule's own BucketKeyEnabled (a sibling of
-                # ApplyServerSideEncryptionByDefault) is there.
-                flag = enc_rules[0].get('BucketKeyEnabled')
-                if isinstance(flag, bool):
-                    bucket_key_enabled = flag
-            elif bucket.get('default_encryption_enabled') is False:
-                default_encryption_enabled = False
+            (default_encryption_enabled, encryption_algorithm,
+             bucket_key_enabled) = self._s3_encryption_from_export(bucket)
+            # CLO-1050: the export marks a default-encryption read that failed
+            # ({"_cw_read": "failed"}, for example s3:GetEncryptionConfiguration
+            # denied). It is unknown, so neither encryption check reports the
+            # bucket; say so, as the hosted scan does for a refused read. Only
+            # the bucket's own region notes it (the provider is built per region).
+            if (self._s3_encryption_read_failed(bucket)
+                    and bucket_region == self._region):
+                self._note_idle_verdict_missing(
+                    's3 encryption', bucket_name,
+                    "default encryption not read in export "
+                    "(s3:GetEncryptionConfiguration denied or the read failed)",
+                    verdict="encryption", evidence="default encryption reads",
+                )
             
             buckets.append(S3BucketData(
                 bucket_name=bucket_name,
@@ -3395,7 +3446,7 @@ class OfflineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 state=c.get('State', 'ACTIVE'),
                 tags=c.get('Tags', {}),
                 # CLO-457: list-clusters(-v2) both return CreationTime.
-                creation_time=self._parse_datetime(c.get('CreationTime')),
+                creation_time=self._parse_datetime(c.get('CreationTime')), broker_volume_gb=MSKClusterData.volume_gb_from(broker_info),  # CLO-975
             ))
 
         return clusters

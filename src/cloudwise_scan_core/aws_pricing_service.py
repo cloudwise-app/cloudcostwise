@@ -14,10 +14,39 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 from decimal import Decimal
 import asyncio
+import contextvars
+import hashlib
+import threading
+import time
+import weakref
 from functools import lru_cache
 
 import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import (
+    BotoCoreError, ClientError, CredentialRetrievalError, NoCredentialsError,
+    NoRegionError, PartialCredentialsError, ProfileNotFound,
+)
+
+# CLO-975: the EBS, EFS, NAT Gateway, Elastic IP, load balancer and Transfer
+# Family fallbacks below read models.py, the one table each price lives in
+# (models.py imports only the standard library, so there is no cycle).
+from cloudwise_scan_core.models import (
+    ALB_HOURLY,
+    CLB_HOURLY,
+    EBS_PRICING,
+    EFS_IA_ELASTIC_PER_GB,
+    EFS_IA_PER_GB,
+    EFS_STANDARD_PER_GB,
+    EIP_IDLE_HOURLY,
+    IO1_IOPS_PRICE,
+    IO2_IOPS_TIERS,
+    NAT_GATEWAY_HOURLY,
+    NLB_HOURLY,
+    KINESIS_SHARD_HOURLY,
+    rds_hourly_price,
+    WORKSPACES_ALWAYS_ON_MONTHLY,
+    TRANSFER_PROTOCOL_HOURLY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +88,27 @@ _LIGHTSAIL_BUNDLE_PRICES: Dict[tuple, tuple] = {
     ('c', '12xlarge'): (1126.0, 2518.0, 1122.0, 2514.0),
     ('c', '18xlarge'): (1688.0, 3776.0, 1684.0, 3772.0),
 }
+
+
+# CLO-975: Lightsail managed-database bundles, monthly price, us-east-1. AWS
+# Price List, AmazonLightsail, usage type USE1-DatabaseUsage:<N>GB[_ha], read
+# 2026-11-14 (publication 2026-11-13T18:02:18Z): an hourly rate x 744 hours is
+# the advertised monthly price (1 GB 0.02016/h = $15.00, 2 GB $30.00, 4 GB
+# $60.00, 8 GB $115.00, 16 GB $245.00, 32 GB $490.00); the High Availability
+# bundle (the _ha ids) is a separate rate, twice the standard one. Matched on
+# the whole bundle id: the substring match this replaces priced xlarge_2_0 and
+# 2xlarge_2_0 as large_2_0, and any unknown bundle at $15.
+_LIGHTSAIL_DB_BUNDLE_PRICES = {
+    'micro_2_0': 15.0, 'small_2_0': 30.0, 'medium_2_0': 60.0, 'large_2_0': 115.0,
+    'xlarge_2_0': 245.0, '2xlarge_2_0': 490.0,
+    'micro_ha_2_0': 30.0, 'small_ha_2_0': 60.0, 'medium_ha_2_0': 120.0,
+    'large_ha_2_0': 230.0, 'xlarge_ha_2_0': 490.0, '2xlarge_ha_2_0': 980.0,
+}
+
+
+def lightsail_database_bundle_monthly_price(bundle_id: str) -> Optional[float]:
+    """Monthly price of a Lightsail database bundle id (exact match), or None."""
+    return _LIGHTSAIL_DB_BUNDLE_PRICES.get((bundle_id or '').strip().lower())
 
 
 def lightsail_bundle_monthly_price(bundle_id: str) -> Optional[float]:
@@ -251,21 +301,15 @@ class AWSPricingService:
         "c3.large": 0.105,
     }
     
-    FALLBACK_EBS_PRICING: Dict[str, float] = {
-        "gp2": 0.10,
-        "gp3": 0.08,
-        "io1": 0.125,
-        "io2": 0.125,
-        "st1": 0.045,
-        "sc1": 0.015,
-        "standard": 0.05,
-    }
+    # CLO-975: was a second EBS table whose sc1 (0.015) disagreed with
+    # models.EBS_PRICING (0.025, the value the detectors use).
+    FALLBACK_EBS_PRICING: Dict[str, float] = dict(EBS_PRICING)
     
-    FALLBACK_NAT_GATEWAY_HOURLY = 0.045
-    FALLBACK_EIP_IDLE_HOURLY = 0.005
-    FALLBACK_ALB_HOURLY = 0.0225
-    FALLBACK_NLB_HOURLY = 0.0225
-    FALLBACK_CLB_HOURLY = 0.025
+    FALLBACK_NAT_GATEWAY_HOURLY = NAT_GATEWAY_HOURLY
+    FALLBACK_EIP_IDLE_HOURLY = EIP_IDLE_HOURLY
+    FALLBACK_ALB_HOURLY = ALB_HOURLY
+    FALLBACK_NLB_HOURLY = NLB_HOURLY
+    FALLBACK_CLB_HOURLY = CLB_HOURLY
     
     # EMR surcharge rates (per-instance-hour, us-east-1)
     FALLBACK_EMR_SURCHARGE: Dict[str, float] = {
@@ -492,12 +536,18 @@ class AWSPricingService:
         "cache.t4g.small": 0.0256,
     }
     
+    # CLO-975 item 9: the one Redshift node-hour table; the detector reads it
+    # (no local copies, no $1.00/hr default). dc2.large, dc2.8xlarge,
+    # ra3.large, ra3.xlplus, ra3.4xlarge and ra3.16xlarge: AWS Price List,
+    # AmazonRedshift, US East (N. Virginia), On-Demand, read 2026-11-14. The two
+    # ds2 rows are no longer in the current offer and could not be re-verified.
     FALLBACK_REDSHIFT_PRICING: Dict[str, float] = {
         # Hourly pricing per node
         "dc2.large": 0.25,
         "dc2.8xlarge": 4.80,
         "ds2.xlarge": 0.85,
         "ds2.8xlarge": 6.80,
+        "ra3.large": 0.543,
         "ra3.xlplus": 1.086,
         "ra3.4xlarge": 3.26,
         "ra3.16xlarge": 13.04,
@@ -784,29 +834,31 @@ class AWSPricingService:
     }
     
     FALLBACK_KINESIS_PRICING = {
-        "shard_hour": 0.015,  # Per shard hour
+        "shard_hour": KINESIS_SHARD_HOURLY,  # Per shard hour
         "put_payload_unit": 0.014,  # Per million units
     }
     
+    # CLO-975: broker-hour prices, AWS Price List, AmazonMSK, US East (N. Virginia),
+    # usage types USE1-Kafka.<type>, publication 2026-11-11T00:23:59Z. t3.small
+    # was 0.052 (list 0.0456), m5.16xlarge 6.72 (6.73) and every m7g row ~4%
+    # low ("~7% cheaper than m5" is not what AWS lists: m7g.large is 0.204).
     FALLBACK_MSK_PRICING: Dict[str, float] = {
-        # Hourly pricing per broker (us-east-1)
-        "kafka.t3.small": 0.052,
+        "kafka.t3.small": 0.0456,
         "kafka.m5.large": 0.21,
         "kafka.m5.xlarge": 0.42,
         "kafka.m5.2xlarge": 0.84,
         "kafka.m5.4xlarge": 1.68,
         "kafka.m5.8xlarge": 3.36,
         "kafka.m5.12xlarge": 5.04,
-        "kafka.m5.16xlarge": 6.72,
+        "kafka.m5.16xlarge": 6.73,
         "kafka.m5.24xlarge": 10.08,
-        # Graviton3 (m7g) — ~7% cheaper than m5
-        "kafka.m7g.large": 0.196,
-        "kafka.m7g.xlarge": 0.392,
-        "kafka.m7g.2xlarge": 0.784,
-        "kafka.m7g.4xlarge": 1.568,
-        "kafka.m7g.8xlarge": 3.136,
-        "kafka.m7g.12xlarge": 4.704,
-        "kafka.m7g.16xlarge": 6.272,
+        "kafka.m7g.large": 0.204,
+        "kafka.m7g.xlarge": 0.408,
+        "kafka.m7g.2xlarge": 0.816,
+        "kafka.m7g.4xlarge": 1.632,
+        "kafka.m7g.8xlarge": 3.264,
+        "kafka.m7g.12xlarge": 4.896,
+        "kafka.m7g.16xlarge": 6.528,
     }
     
     # MSK instance network throughput capacity in MB/s (per broker).
@@ -845,9 +897,15 @@ class AWSPricingService:
         "realtime_per_million": 2.00,
     }
     
+    # CLO-975: infrequent_per_gb_month was 0.016 here and 0.025 in the EFS
+    # lifecycle check. Both are AWS prices, by ThroughputMode (AWS Price List
+    # API, AmazonEFS, us-east-1, read 2026-11-13): Standard-IA 0.025
+    # (bursting/provisioned), IA with Elastic Throughput 0.016. Both read
+    # models.py now.
     FALLBACK_EFS_PRICING = {
-        "standard_per_gb_month": 0.30,
-        "infrequent_per_gb_month": 0.016,
+        "standard_per_gb_month": EFS_STANDARD_PER_GB,
+        "infrequent_per_gb_month": EFS_IA_PER_GB,
+        "infrequent_elastic_per_gb_month": EFS_IA_ELASTIC_PER_GB,
     }
     
     FALLBACK_FSX_PRICING = {
@@ -857,7 +915,7 @@ class AWSPricingService:
     }
     
     FALLBACK_TRANSFER_FAMILY_PRICING = {
-        "server_hour": 0.30,  # Per server hour
+        "server_hour": TRANSFER_PROTOCOL_HOURLY,  # Per server (protocol) hour
         "data_per_gb": 0.04,
     }
     
@@ -866,14 +924,17 @@ class AWSPricingService:
         "data_per_gb": 0.015,
     }
     
+    # CLO-975 item 7: the one WorkSpaces price table is models.WORKSPACES_
+    # ALWAYS_ON_MONTHLY (list prices, with its basis); this is its display-name
+    # view. Until CLO-975 this table disagreed with the detector's inline
+    # prices (Power 76/78, PowerPro 96/127, GraphicsPro 349/85).
     FALLBACK_WORKSPACES_PRICING: Dict[str, float] = {
-        # Monthly pricing
-        "Value": 21.0,
-        "Standard": 35.0,
-        "Performance": 60.0,
-        "Power": 76.0,
-        "PowerPro": 96.0,
-        "GraphicsPro": 349.0,
+        "Value": WORKSPACES_ALWAYS_ON_MONTHLY["VALUE"],
+        "Standard": WORKSPACES_ALWAYS_ON_MONTHLY["STANDARD"],
+        "Performance": WORKSPACES_ALWAYS_ON_MONTHLY["PERFORMANCE"],
+        "Power": WORKSPACES_ALWAYS_ON_MONTHLY["POWER"],
+        "PowerPro": WORKSPACES_ALWAYS_ON_MONTHLY["POWERPRO"],
+        "GraphicsPro": WORKSPACES_ALWAYS_ON_MONTHLY["GRAPHICSPRO"],
     }
     
 
@@ -985,13 +1046,31 @@ class AWSPricingService:
         )
         return self._apply_region(base, region)
 
-    def _get_pricing_client(self) -> boto3.client:
-        """Get or create the AWS Pricing API client."""
+    def _default_pricing_client(self) -> boto3.client:
+        """The process's default-chain Price List client (as before CLO-1002)."""
         if self._pricing_client is None:
             # Pricing API only available in us-east-1 or ap-south-1
             self._pricing_client = boto3.client("pricing", region_name="us-east-1")
         return self._pricing_client
-    
+
+    def _get_pricing_client(self):
+        """Get the Price List client.
+
+        CLO-1002: inside a scan the order is (1) the scan's own credentials (CLI
+        ``--profile``), (2) the process's default credentials (the platform role
+        when hosted, whose execution role holds ``pricing:GetProducts`` while the
+        customer's read-only role does not), (3) the caller's built-in prices.
+        Which step works is remembered per credential, so a denied step is not
+        retried for every lookup. Outside a scan: the default chain, as before.
+        """
+        provider = _scan_pricing_provider.get()
+        # Resolved here, on first use, so a scan that never prices pays nothing
+        # for building a session.
+        scan_session = getattr(provider, "pricing_session", None) if provider is not None else None
+        if scan_session is None:
+            return self._default_pricing_client()
+        return _PriceListClient(self, scan_session)
+
     def _is_cache_valid(self) -> bool:
         """Check if the pricing cache is still valid."""
         if self._cache_timestamp is None:
@@ -1364,7 +1443,12 @@ class AWSPricingService:
             price_per_gb_month=self._apply_region(
                 self.FALLBACK_EBS_PRICING.get(volume_type, 0.10), region
             ),
-            iops_price=self._apply_region(0.065 if volume_type in ("io1", "io2") else 0.0, region),
+            iops_price=self._apply_region(
+                IO1_IOPS_PRICE if volume_type == "io1"
+                else IO2_IOPS_TIERS[0][1] if volume_type == "io2"  # first tier
+                else 0.0,
+                region,
+            ),
             throughput_price=self._apply_region(0.04 if volume_type == "gp3" else 0.0, region),
         )
     
@@ -1377,8 +1461,9 @@ class AWSPricingService:
         return self._apply_region(self.FALLBACK_NAT_GATEWAY_HOURLY, region)
 
     async def get_eip_idle_price(self, region: str = "us-east-1") -> float:
-        """Get Elastic IP idle hourly pricing (region-scaled)."""
-        return self._apply_region(self.FALLBACK_EIP_IDLE_HOURLY, region)
+        """Get Elastic IP idle hourly pricing. Flat in every commercial region
+        (AWS Price List, AmazonVPC PublicIPv4:IdleAddress), so ``region`` is ignored."""
+        return self.FALLBACK_EIP_IDLE_HOURLY
 
     async def get_load_balancer_price(
         self,
@@ -1555,17 +1640,16 @@ class AWSPricingService:
         self,
         bundle_type: str = "Standard",
         region: str = "us-east-1"
-    ) -> float:
-        """Get WorkSpaces monthly pricing for a bundle type (region-scaled).
+    ) -> Optional[float]:
+        """Get WorkSpaces monthly pricing for a bundle type (region-scaled), or
+        None for a bundle without a price (CLO-975: it was a $35 default).
 
-        NOTE (CLO-170 follow-up): the us-east-1 FALLBACK_WORKSPACES_PRICING constants are
-        stale for the 2026 AlwaysOn line-up (Standard/Performance web-verified ~26–30% low)
-        and need a full-bundle refresh from the live console — deferred to keep bundle
-        ordering consistent. The region multiplier below still corrects non-us-east-1.
+        Basis: models.WORKSPACES_ALWAYS_ON_MONTHLY (list prices, us-east-1,
+        Windows license included, smallest volumes). The region multiplier
+        corrects non-us-east-1.
         """
-        return self._apply_region(
-            self.FALLBACK_WORKSPACES_PRICING.get(bundle_type, 35.0), region
-        )
+        base = self.FALLBACK_WORKSPACES_PRICING.get(bundle_type)
+        return None if base is None else self._apply_region(base, region)
 
     async def get_lightsail_price(
         self,
@@ -1620,27 +1704,14 @@ class AWSPricingService:
 
         # Use fallback pricing
         self._record_pricing_fallback('rds')
-        rds_hourly_rates = {
-            "db.t3.micro": 0.017,
-            "db.t3.small": 0.034,
-            "db.t3.medium": 0.068,
-            "db.t3.large": 0.136,
-            "db.t3.xlarge": 0.272,
-            "db.t3.2xlarge": 0.544,
-            "db.m5.large": 0.171,
-            "db.m5.xlarge": 0.342,
-            "db.m5.2xlarge": 0.684,
-            "db.m5.4xlarge": 1.368,
-            "db.m6i.large": 0.171,
-            "db.m6i.xlarge": 0.342,
-            "db.r5.large": 0.24,
-            "db.r5.xlarge": 0.48,
-            "db.r5.2xlarge": 0.96,
-            "db.r6i.large": 0.24,
-            "db.r6i.xlarge": 0.48,
-        }
-        
-        hourly = self._apply_region(rds_hourly_rates.get(instance_class, 0.10), region)
+        # CLO-975 item 5: one table (models.RDS_PRICING). This method held a
+        # second copy (17 classes, no db.r6g/db.r7g) and priced every other
+        # class at $0.10/hr. An unknown class now raises: callers treat that
+        # as "price unknown, saving not estimated" and skip the saving.
+        base_hourly = rds_hourly_price(instance_class)
+        if base_hourly is None:
+            raise ValueError(f"no RDS price for instance class {instance_class!r}")
+        hourly = self._apply_region(base_hourly, region)
         if multi_az:
             hourly *= 2
 
@@ -1942,6 +2013,132 @@ class AWSPricingService:
         ec2_rate = self.FALLBACK_EC2_PRICING.get(instance_type, 0.192)
         emr_surcharge = self.FALLBACK_EMR_SURCHARGE.get(instance_type, ec2_rate * 0.25)
         return ec2_rate + emr_surcharge
+
+
+# CLO-1002: the data provider of the scan whose detector is running; its
+# ``pricing_session`` is the scan's credentials. A ContextVar so concurrent
+# scans in one process never see each other's credentials, and so the singleton
+# pricing service holds none between scans.
+_scan_pricing_provider: contextvars.ContextVar = contextvars.ContextVar(
+    "scan_pricing_provider", default=None
+)
+# One Price List client per scan session; entries go with the session.
+_scan_pricing_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+# Error codes that mean "these credentials cannot call the Price List" (as
+# opposed to throttling or a network error, which say nothing about permission).
+_PRICE_LIST_DENIED_CODES = frozenset({
+    "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
+    "UnrecognizedClientException", "InvalidClientTokenId", "ExpiredToken",
+    "ExpiredTokenException", "InvalidSignatureException", "SignatureDoesNotMatch",
+})
+
+
+_PRICE_LIST_CREDENTIAL_ERRORS = (
+    NoCredentialsError, PartialCredentialsError, ProfileNotFound,
+    CredentialRetrievalError, NoRegionError,
+)
+
+
+class PriceListUnavailable(RuntimeError):
+    """No credentials in the order may call the Price List: use built-in prices."""
+
+
+def _price_list_cannot_call(exc: BaseException) -> bool:
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "") in _PRICE_LIST_DENIED_CODES
+    # Credential-type errors only. A connection or timeout error says nothing
+    # about permission and must not mark a source unusable for an hour.
+    return isinstance(exc, _PRICE_LIST_CREDENTIAL_ERRORS)
+
+
+# Which Price List source worked, per scan credential: a hash of the access key
+# id and token (never the secret), flags only, one hour. The pricing service is
+# a process-wide singleton, so this holds no credentials, just "denied".
+_PRICE_LIST_STATE_TTL_SECONDS = 3600
+_PRICE_LIST_STATE_MAX = 512
+_price_list_state: Dict[str, Dict[str, Any]] = {}
+_price_list_state_lock = threading.Lock()
+
+
+def _price_list_state_for(session) -> Dict[str, Any]:
+    try:
+        creds = session.get_credentials()
+        raw = f"{getattr(creds, 'access_key', '')}|{getattr(creds, 'token', '')}"
+    except Exception:  # noqa: BLE001 - a session we cannot read gets a fresh state
+        raw = f"id:{id(session)}"
+    key = hashlib.sha256(raw.encode()).hexdigest()[:24]
+    now = time.monotonic()
+    with _price_list_state_lock:
+        entry = _price_list_state.get(key)
+        if entry is not None and now - entry["at"] > _PRICE_LIST_STATE_TTL_SECONDS:
+            entry = None
+        if entry is None:
+            if len(_price_list_state) >= _PRICE_LIST_STATE_MAX:
+                _price_list_state.clear()
+            entry = {"at": now, "scan": None, "default": None, "logged": set()}
+            _price_list_state[key] = entry
+        return entry
+
+
+class _PriceListClient:
+    """``get_products`` through the scan's credentials, then the default chain."""
+
+    def __init__(self, service: "AWSPricingService", scan_session):
+        self._service = service
+        self._session = scan_session
+        self._state = _price_list_state_for(scan_session)
+
+    def _scan_client(self):
+        client = _scan_pricing_clients.get(self._session)
+        if client is None:
+            client = self._session.client("pricing", region_name="us-east-1")
+            _scan_pricing_clients[self._session] = client
+        return client
+
+    def _note(self, source: str) -> None:
+        if source not in self._state["logged"]:
+            self._state["logged"].add(source)
+            logger.info("Price List source for this scan: %s", source)
+
+    def get_products(self, **kwargs):
+        state = self._state
+        if state["scan"] is not False:
+            try:
+                pricing_client = self._scan_client()
+                response = pricing_client.get_products(**kwargs)
+                state["scan"] = True
+                self._note("the scan's credentials")
+                return response
+            except (ClientError, BotoCoreError) as exc:
+                if not _price_list_cannot_call(exc):
+                    raise
+                state["scan"] = False
+        if state["default"] is not False:
+            try:
+                pricing_client = self._service._default_pricing_client()
+                response = pricing_client.get_products(**kwargs)
+                state["default"] = True
+                self._note("the default AWS credentials")
+                return response
+            except (ClientError, BotoCoreError) as exc:
+                if not _price_list_cannot_call(exc):
+                    raise
+                state["default"] = False
+        self._note("built-in prices (the Price List is not available to these credentials)")
+        raise PriceListUnavailable("pricing:GetProducts is not available; using built-in prices")
+
+
+async def run_with_scan_pricing_session(coro, data_provider):
+    """Await ``coro`` with the Price List client bound to the scan's session.
+
+    A provider without ``pricing_session`` (offline) keeps the default chain.
+    """
+    token = _scan_pricing_provider.set(data_provider)
+    try:
+        return await coro
+    finally:
+        _scan_pricing_provider.reset(token)
 
 
 # Singleton instance

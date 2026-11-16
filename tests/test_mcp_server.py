@@ -65,7 +65,7 @@ def test_four_read_only_tools_and_the_scan_tool_states_its_cost():
         assert tool.annotations.destructive_hint is False, tool.name
     scan = next(t for t in listed if t.name == "scan")
     assert "$0.01 per request" in scan.description and "include_cost_explorer=false" in scan.description
-    assert set(scan.input_schema["properties"]) == {"profile", "regions", "include_cost_explorer"}
+    assert set(scan.input_schema["properties"]) == {"profile", "regions", "include_cost_explorer", "demo"}
 
 
 def _scan_text(regions, args=None):

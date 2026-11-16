@@ -52,7 +52,7 @@ def _scan(monkeypatch, capsys, *extra):
                         lambda profile: runtime.Credentials("AKIATEST", "s", None, ACCT, "eu-west-1"))
     monkeypatch.setattr(runtime, "resolve_regions", lambda regions, creds: ["eu-west-1"])
     monkeypatch.setattr(scan, "run_scan", lambda *a, **k: _report())
-    monkeypatch.setattr("cloudcostwise.share.offer", lambda report: "skipped")
+    monkeypatch.setattr("cloudcostwise.share.offer", lambda report, **k: "skipped")
     capsys.readouterr()
     assert cli.main(["scan", *extra]) == 0
     return capsys.readouterr().out
@@ -219,7 +219,7 @@ def test_a_corrupt_file_warns_on_stderr_during_a_scan(monkeypatch, capsys, home)
     monkeypatch.setattr(runtime, "resolve_credentials", lambda p: runtime.Credentials("A", "s", None, ACCT, "eu-west-1"))
     monkeypatch.setattr(runtime, "resolve_regions", lambda r, c: ["eu-west-1"])
     monkeypatch.setattr(scan, "run_scan", lambda *a, **k: _report())
-    monkeypatch.setattr("cloudcostwise.share.offer", lambda report: "skipped")
+    monkeypatch.setattr("cloudcostwise.share.offer", lambda report, **k: "skipped")
     assert cli.main(["scan", "--format", "json"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["excluded_by_list_count"] == 0   # stdout stays clean JSON
@@ -252,6 +252,7 @@ def test_exclude_makes_no_network_call(monkeypatch, capsys):
         raise AssertionError("network")
 
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr("cloudcostwise.share._open", boom)  # the share send uses its own no-redirect opener
     assert _run(["exclude", "add", FS], capsys)[0] == 0
     assert _run(["exclude", "list"], capsys)[0] == 0
     assert "network" not in "".join(_run(["exclude", "remove", FS], capsys)[1:])
@@ -359,7 +360,7 @@ def test_anonymize_scrubs_an_excluded_name_from_warnings(monkeypatch, capsys, fm
     monkeypatch.setattr(runtime, "resolve_credentials", lambda p: runtime.Credentials("A", "s", None, ACCT, "eu-west-1"))
     monkeypatch.setattr(runtime, "resolve_regions", lambda r, c: ["eu-west-1"])
     monkeypatch.setattr(scan, "run_scan", lambda *a, **k: _leaky_report())
-    monkeypatch.setattr("cloudcostwise.share.offer", lambda report: "skipped")
+    monkeypatch.setattr("cloudcostwise.share.offer", lambda report, **k: "skipped")
     capsys.readouterr()
     assert cli.main(["scan", "--format", fmt, "--anonymize", *extra]) == 0
     text = capsys.readouterr().out

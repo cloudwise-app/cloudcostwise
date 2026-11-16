@@ -43,7 +43,7 @@ def test_card_without_spend_is_labelled_and_has_no_url():
 def test_card_with_spend_uses_the_spend_formula():
     r = _report(_item(TRUSTED, "a", 150.0), spend=1000.0)
     assert render.score_for(r).value == 75 and render.score_for(r).basis == "spend"
-    assert "75/100 (of your last 30 days of spend)" in "\n".join(render.score_card(r))
+    assert "75/100 (of this account's last 30 days of spend)" in "\n".join(render.score_card(r))
 
 
 def test_advisory_is_not_counted_in_the_score_and_fires_no_cell():
@@ -109,7 +109,10 @@ def _ce_client(response=None, error=None):
     client = boto3.client("ce", region_name="us-east-1", aws_access_key_id="a", aws_secret_access_key="b")
     stub = Stubber(client)
     expected = {"TimePeriod": {"Start": scan_mod.spend_window()[0], "End": scan_mod.spend_window()[1]},
-                "Granularity": "DAILY", "Metrics": ["UnblendedCost"]}
+                "Granularity": "DAILY", "Metrics": ["UnblendedCost"],
+                "Filter": {"And": [  # CLO-962: this account only, credits and refunds out
+                    {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": ["123456789012"]}},
+                    {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit", "Refund"]}}}]}}
     if error:
         stub.add_client_error("get_cost_and_usage", service_error_code=error, expected_params=expected)
     else:
@@ -133,6 +136,26 @@ def test_spend_is_one_request_and_counted():
         real_fetch(CREDS, r)
     assert mk.call_count == 1 and mk.call_args[0][0] == "ce"
     assert r.spend_monthly == 1234.5 and r.api_calls == {"ce": 1}
+
+
+def test_spend_request_is_scoped_to_the_scanned_account_without_credits_and_refunds():
+    """CLO-962: the stubbed client only accepts the exact filter (see _ce_client); a mismatch is a
+    StubResponseError, which fetch_monthly_spend turns into no spend."""
+    assert scan_mod.spend_filter("123456789012") == {"And": [
+        {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": ["123456789012"]}},
+        {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit", "Refund"]}}}]}
+    other = ScanReport(account_id="other-account", regions=["us-east-1"], findings=[], entrypoints=20)
+    resp = {"ResultsByTime": []}
+    with patch.object(scan_mod.boto3, "client", return_value=_ce_client(resp)):
+        real_fetch(CREDS, other)  # another account's filter does not match the stub: error, so None
+    assert other.spend_monthly is None
+
+
+def test_an_unknown_account_makes_no_spend_request():
+    r = ScanReport(account_id="", regions=["us-east-1"], findings=[], entrypoints=20)
+    with patch.object(scan_mod.boto3, "client") as mk:
+        real_fetch(CREDS, r)
+    assert mk.call_count == 0 and r.spend_monthly is None and r.api_calls == {}
 
 
 def test_a_cost_explorer_error_falls_back_and_never_raises():
@@ -232,7 +255,7 @@ def _run_cli(monkeypatch, capsys, fmt, tty):
     monkeypatch.setattr(scan_mod, "scan_region", lambda *a, **k: res)
     monkeypatch.setattr(runtime, "configure_local_runtime", lambda: None)
     monkeypatch.setattr(board, "wants_board", lambda s: tty)
-    monkeypatch.setattr("cloudcostwise.share.offer", lambda r: None)
+    monkeypatch.setattr("cloudcostwise.share.offer", lambda r, **k: None)
     assert cli.main(["scan", "--parallel", "1", "--format", fmt, "--no-cost-explorer"]) == 0
     return capsys.readouterr()
 

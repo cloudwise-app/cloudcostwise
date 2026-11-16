@@ -11,7 +11,7 @@ import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
-from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_rds_monthly_cost
+from cloudwise_scan_core.models import WasteItem, WasteDetectionSettings, WasteType, ResourceType, ConfidenceLevel, get_rds_monthly_cost, note_price_unknown
 from cloudwise_scan_core.cpu_sizing import has_min_coverage, is_as_old_as_window
 from cloudwise_scan_core.billed_cost import rds_cluster_cur_member_ids
 from cloudwise_scan_core.detectors.extended_support import resolve_version_policy, classify_support_state, estimate_surcharge, describe_estimate, surcharge_metadata, needs_base_price, get_billed_surcharge_monthly
@@ -834,6 +834,11 @@ class OpenDatabaseDetectorsMixin:
                     
                     metrics = metrics_map.get(db.db_instance_id)
                     if metrics and metrics.is_idle:
+                        if monthly_cost is None:
+                            # CLO-975: no RDS_PRICING row for this class; the
+                            # saving is not guessed (it was $0.10/hr).
+                            note_price_unknown(data_provider, 'rds', db.db_instance_id)
+                            continue
                         multi_az_note = ' (Multi-AZ doubles the cost)' if db.multi_az else ''
                         waste_items.append(WasteItem(
                             id=str(uuid.uuid4()),
