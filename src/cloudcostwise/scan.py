@@ -26,6 +26,13 @@ KMS_WASTE_TYPE = "s3_kms_bucket_key_disabled"
 # A Cost Explorer IAM action ("ce:GetCostAndUsage"), not a longer prefix that
 # merely ends in "ce" ("aws-marketplace:...").
 _COST_EXPLORER_ACTION = re.compile(r"(?<![\w-])ce:")
+# CLO-1065: the IAM action both scan-level Cost Explorer reads need, and the error codes that mean the
+# credentials lack it. Only these are reported as a missing permission; a throttle or network error is not.
+CE_SPEND_ACTION = "ce:GetCostAndUsage"
+_ACCESS_DENIED_CODES = frozenset({"AccessDenied", "AccessDeniedException"})
+# What each read is, in the "<label>: <what> needs <permission> (<code>)" shape the engine's denials use.
+SPEND_READ_LABEL = "COST_EXPLORER: 30-day account spend for the score"
+KMS_SPEND_READ_LABEL = "COST_EXPLORER: account KMS request spend for the S3 Bucket Key finding"
 # A local scan starts with an empty in-memory cache, so the commitment check has
 # nothing to read until the savings check's refresh has filled it. Hosted scans
 # wait too, for the weekly refresh (``hosted_service.py``); this keeps the local
@@ -62,6 +69,18 @@ class ScanReport:
     # CLO-1057: True only on the recorded sample (demo.py). Every output marks it as sample data and
     # share.py refuses it on every path. A real scan never sets it.
     demo: bool = False
+    # CLO-1116: True only on a live scan of the fake account in AWS Emulator (emulator_demo.py). Every output
+    # says so and share.py refuses it on every path, like a demo.
+    emulator: bool = False
+
+
+def _note_denied(report: "ScanReport", label: str, error: Exception) -> None:
+    """CLO-1065: record a Cost Explorer AccessDenied as a missing permission, named like the engine's own
+    (``permission_errors``, so it reaches the JSON, the MCP summary and the partner report). Any other
+    error stays silent: the read is optional and its absence is already said where it is used."""
+    code = error.response.get("Error", {}).get("Code", "") if isinstance(error, ClientError) else ""
+    if code in _ACCESS_DENIED_CODES:
+        report.permission_errors.append(f"{label} needs {CE_SPEND_ACTION} ({code})")
 
 
 def spend_window(today: Optional[_dt.date] = None):
@@ -100,7 +119,9 @@ def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
     Runs under the read-only guard (GetCostAndUsage is a read; any other
     operation raises ReadOnlyViolation, which is deliberately not caught). Any
     Cost Explorer or network error leaves ``spend_monthly`` None: the score
-    falls back to dollars alone and the scan never fails for it.
+    falls back to dollars alone and the scan never fails for it. An AccessDenied
+    also names the missing ``ce:GetCostAndUsage`` in ``report.permission_errors``
+    (CLO-1065).
     """
     start, end = spend_window()
     total: Optional[float] = None
@@ -116,8 +137,9 @@ def fetch_monthly_spend(creds: Credentials, report: "ScanReport") -> None:
             resp = client.get_cost_and_usage(TimePeriod={"Start": start, "End": end}, Granularity="DAILY",
                                              Metrics=["UnblendedCost"], Filter=spend_filter(account_id))
             total = sum(float(r["Total"]["UnblendedCost"]["Amount"]) for r in resp.get("ResultsByTime", []))
-        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError):
+        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError) as e:
             total = None
+            _note_denied(report, SPEND_READ_LABEL, e)
     n = guard.calls.get(COST_EXPLORER_SERVICE, 0)
     if n:
         report.api_calls[COST_EXPLORER_SERVICE] = report.api_calls.get(COST_EXPLORER_SERVICE, 0) + n
@@ -139,8 +161,9 @@ def fetch_kms_spend(creds: Credentials, report: "ScanReport") -> None:
     UnblendedCost, grouped by USAGE_TYPE, usage types naming requests summed) and put it on
     every such finding as context (CLO-993). No finding, no request, however many regions
     were scanned. It is an optional read: any Cost Explorer or network error keeps the
-    findings, which then say the spend is not available, and adds no warning or permission
-    error to the report. Runs under the read-only guard; the request is counted in
+    findings, which then say the spend is not available, and adds no warning. An AccessDenied
+    names the missing ``ce:GetCostAndUsage`` in ``report.permission_errors`` (CLO-1065); any
+    other error adds nothing. Runs under the read-only guard; the request is counted in
     ``report.api_calls``. Never attributes a share of the spend to a bucket.
     """
     items = [f for f in report.findings
@@ -164,8 +187,9 @@ def fetch_kms_spend(creds: Credentials, report: "ScanReport") -> None:
                     if "Requests" in (group.get("Keys") or [""])[0]:
                         total += float(group["Metrics"]["UnblendedCost"]["Amount"])
             result = round(total, 2)
-        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError):
+        except (ClientError, BotoCoreError, KeyError, TypeError, ValueError) as e:
             result = None
+            _note_denied(report, KMS_SPEND_READ_LABEL, e)
     n = guard.calls.get(COST_EXPLORER_SERVICE, 0)
     if n:
         report.api_calls[COST_EXPLORER_SERVICE] = report.api_calls.get(COST_EXPLORER_SERVICE, 0) + n

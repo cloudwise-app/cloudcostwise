@@ -9,7 +9,7 @@ Ask Claude: *"Scan my AWS account for waste."*
 
 ## What happens when the skill runs
 
-- Claude runs one command in your terminal: `uvx cloudcostwise==0.1.27 scan --format json`. `uvx`
+- Claude runs one command in your terminal: `uvx cloudcostwise==0.1.29 scan --format json`. `uvx`
   downloads that exact release of cloudcostwise from PyPI the first time. You need
   [uv](https://docs.astral.sh/uv/) installed and a place where Claude can run commands, such as Claude Code.
 - The scan calls AWS from your machine with your own credentials, through the standard AWS credential
@@ -32,7 +32,7 @@ Ask Claude: *"Scan my AWS account for waste."*
 
 ## Try it without AWS credentials
 
-Ask Claude for a demo scan. It runs `uvx cloudcostwise==0.1.27 scan --demo --format json`, which
+Ask Claude for a demo scan. It runs `uvx cloudcostwise==0.1.29 scan --demo --format json`, which
 prints a recorded scan of a CloudWise test account: sample data, no AWS call and no network call beyond
 the download of the tool.
 

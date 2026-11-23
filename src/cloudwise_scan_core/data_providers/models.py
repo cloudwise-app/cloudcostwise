@@ -337,6 +337,15 @@ class S3BucketData:
     # not read, or the rule carries no BucketKeyEnabled (botocore marks the
     # member optional); only a True means the bucket key is on.
     bucket_key_enabled: Optional[bool] = None
+    # CLO-1083: the bucket's own GetRequests / PutRequests, read only for an
+    # SSE-KMS bucket whose bucket key is off. None = not read (offline, another
+    # region's bucket, or the check does not apply). Otherwise a dict with a
+    # ``status``: ``counts`` (``filter_id``, ``get_requests``, ``put_requests``,
+    # ``window_days``), ``no_filter`` (no request metrics filter covers the
+    # whole bucket), ``no_datapoints`` (a filter exists but CloudWatch holds no
+    # request datapoint in the window: new filter or no requests, never a zero),
+    # ``permission_denied`` (``permission`` names the action) or ``not_read``.
+    kms_request_counts: Optional[Dict[str, Any]] = None
     # CLO-385: Maximum NumberOfObjects over a lookback window, checked only
     # for a bucket that is currently empty AND has a lifecycle expiration
     # rule — evidence it was recently used and self-cleared by design,

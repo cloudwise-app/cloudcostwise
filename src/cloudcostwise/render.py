@@ -120,7 +120,7 @@ def left_out_lines(report: ScanReport, verbose: bool = False) -> List[str]:
 
 def scope_notes(report: ScanReport) -> List[str]:
     # A demo recording was made with Cost Explorer off; the user passed no flag, so say nothing (CLO-1057).
-    return [CE_SKIPPED_NOTE] if report.cost_explorer_skipped and not report.demo else []
+    return [CE_SKIPPED_NOTE] if report.cost_explorer_skipped and not (report.demo or report.emulator) else []
 
 
 def _money(x: float) -> str:
@@ -219,11 +219,14 @@ def score_card(report: ScanReport, markdown: bool = False, emoji: bool = False) 
     facts = (f"{_money(counted_total(report))}/month found | {ran.count('fired')} of {len(ran)} checks fired | "
              f"{len(report.regions)} region(s)" + ("" if report.demo else f" | {report.seconds:.1f}s"))  # a recording has no run time
     names = fired_types(report)
+    mark = None
     if report.demo:
-        from cloudcostwise.demo import CARD_MARK
-
-        head = f"{CARD_MARK} {head}"
-    body = [*([CARD_MARK] if report.demo else []), f"cloudcostwise {score.value}/100 ({BASIS_LABEL[score.basis]})", *share_grid(report, emoji), legend]
+        from cloudcostwise.demo import CARD_MARK as mark
+    elif report.emulator:
+        from cloudcostwise.emulator_demo import CARD_MARK as mark  # CLO-1116
+    if mark:
+        head = f"{mark} {head}"
+    body = [*([mark] if mark else []), f"cloudcostwise {score.value}/100 ({BASIS_LABEL[score.basis]})", *share_grid(report, emoji), legend]
     if names:
         body.append("Found: " + ", ".join(names))
     body.append("Advisory findings are listed, not counted in the score.")
@@ -234,6 +237,13 @@ def score_card(report: ScanReport, markdown: bool = False, emoji: bool = False) 
 
 def _demo_wrap(report: ScanReport, text: str, markdown: bool = False) -> str:
     """CLO-1057: the first and last line of a demo (sample data) report say so."""
+    if report.emulator and not report.demo:
+        # CLO-1116: one sentence says what it is and is not, first and last line.
+        from cloudcostwise.emulator_demo import NOTE
+
+        if markdown:
+            return f"> **{NOTE}**\n\n{text.rstrip()}\n\n> **{NOTE}**"
+        return f"{NOTE}\n\n{text.rstrip()}\n\n{NOTE}"
     if not report.demo:
         return text
     from cloudcostwise.demo import BANNER_BOTTOM, BANNER_TOP
@@ -272,6 +282,13 @@ def _table(report: ScanReport, verbose: bool = False, emoji: bool = False) -> st
             lines += [f"  - {w}" for w in warnings]
         else:
             lines.append(f"{len(warnings)} data warning(s); rerun with --verbose to see them.")
+    # CLO-1065: reads these credentials were denied, each naming the IAM action it needs.
+    if report.permission_errors:
+        if verbose:
+            lines += ["", "Missing permissions (findings and figures these affect are MISSING, not zero):"]
+            lines += [f"  - {p}" for p in report.permission_errors]
+        else:
+            lines.append(f"{len(report.permission_errors)} missing permission(s); rerun with --verbose to see them.")
     for e in report.errors:
         lines.append(f"error: {e}")
     lines += ["", *score_card(report, emoji=emoji)]
@@ -307,9 +324,11 @@ def _markdown(report: ScanReport, emoji: bool = False, verbose: bool = False) ->
 def as_json(report: ScanReport) -> str:
     score = score_for(report)
     from cloudcostwise.demo import JSON_NOTE
+    from cloudcostwise.emulator_demo import NOTE as EMULATOR_NOTE
 
     return json.dumps({
         **({"demo": True, "demo_note": JSON_NOTE} if report.demo else {}),
+        **({"emulator": True, "emulator_note": EMULATOR_NOTE} if report.emulator else {}),
         "account_id": report.account_id,
         "regions": report.regions,
         "estimated_monthly_savings": counted_total(report),

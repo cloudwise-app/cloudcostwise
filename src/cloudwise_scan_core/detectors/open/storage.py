@@ -391,6 +391,36 @@ def kms_spend_line(amount: float, period: str) -> str:
     )
 
 
+def kms_request_line(status: str, counts: Optional[Dict[str, Any]] = None) -> str:
+    """CLO-1083: the sentence on an s3_kms_bucket_key_disabled finding about the
+    bucket's own request volume. Counts are shown as measured (never estimated,
+    never priced); every other status says why they are not available."""
+    base = "Per-bucket request volume not available"
+    if status == 'counts' and counts:
+        def fmt(v):
+            return f"{v:,}" if isinstance(v, int) else "no datapoints"
+        return (
+            f"This bucket's requests in the last {counts.get('window_days')} days, from its request "
+            f"metrics filter '{counts.get('filter_id')}': GetRequests {fmt(counts.get('get_requests'))}, "
+            f"PutRequests {fmt(counts.get('put_requests'))}. They are not priced: only some of these "
+            f"requests call KMS, and the share of the account's KMS spend caused by this bucket is not known."
+        )
+    if status == 'air_gapped':
+        return base + " in Air-Gapped Mode: the export does not carry request metrics."
+    if status == 'no_filter':
+        return base + ": no request metrics filter covers the whole bucket."
+    if status == 'no_datapoints':
+        return (base + f": its request metrics filter '{(counts or {}).get('filter_id')}' has no request "
+                "datapoints in the window (a new filter, or no requests); this is not a count of zero.")
+    if status == 'permission_denied':
+        perm = (counts or {}).get('permission', 's3:GetMetricsConfiguration')
+        # Surface-neutral: the hosted role, the CLI and the MCP server all run this detector,
+        # and only the hosted one has a CloudFormation template to update.
+        return (base + f": the credentials used for the scan lack {perm} "
+                "(listed under missing permissions).")
+    return base + "."
+
+
 class OpenStorageDetectorsMixin:
     """Open detectors from ``StorageDetectorsMixin``."""
 
@@ -929,8 +959,10 @@ class OpenStorageDetectorsMixin:
         configuration, and a bucket whose encryption was not read (None).
 
         No per-bucket saving is sized: it depends on the bucket's request
-        volume, which the scan does not read, so the finding reports $0 (it is
-        in GOVERNANCE_WASTE_TYPES so the $0 finding is still shown).
+        volume, which the scan reads only as unpriced GET/PUT counts when a
+        whole-bucket request metrics filter exists (CLO-1083), so the finding
+        reports $0 (it is in GOVERNANCE_WASTE_TYPES so the $0 finding is still
+        shown).
         """
         if bucket.default_encryption_enabled is False:
             return []  # no encryption configuration: s3_no_default_encryption's finding
@@ -954,6 +986,14 @@ class OpenStorageDetectorsMixin:
 
         name = bucket.bucket_name
         state = 'is set to false' if key_flag is False else 'is not set'
+        counts = getattr(bucket, 'kms_request_counts', None)
+        counts = counts if isinstance(counts, dict) else None
+        request_status = (
+            'air_gapped' if data_provider.provider_type == 'offline'
+            else (counts or {}).get('status', 'not_read')
+        )
+        counts_ok = request_status == 'counts'
+        request_line = kms_request_line(request_status, counts)
         return [WasteItem(
             id=str(uuid.uuid4()),
             resource_id=name,
@@ -994,9 +1034,9 @@ class OpenStorageDetectorsMixin:
                 'pricing': (
                     'KMS bills $0.03 per 10,000 requests, and without a bucket key S3 makes a KMS '
                     'request for each object upload and download. AWS states a bucket key reduces '
-                    'KMS request cost by up to 99%. The saving depends on request volume, which '
-                    'CloudWise does not read per bucket, so none is claimed ($0). Per-bucket request '
-                    'volume not available. ' + KMS_SPEND_UNAVAILABLE_LINE
+                    'KMS request cost by up to 99%. The saving depends on request volume, so no '
+                    'dollar saving is claimed for the bucket ($0). '
+                    + request_line + ' ' + KMS_SPEND_UNAVAILABLE_LINE
                 ),
                 'why_waste': (
                     'Every object request on this bucket triggers a billed KMS request that a bucket '
@@ -1018,7 +1058,12 @@ class OpenStorageDetectorsMixin:
                 'sse_algorithm': bucket.encryption_algorithm,
                 'bucket_key_enabled': key_flag,
                 'savings_basis': 'depends on request volume',
-                'per_bucket_request_volume': 'not available',
+                'per_bucket_request_volume': 'available' if counts_ok else 'not available',
+                'per_bucket_request_volume_status': request_status,
+                'request_metrics_filter_id': (counts or {}).get('filter_id') if counts_ok else None,
+                'per_bucket_get_requests': counts.get('get_requests') if counts_ok else None,
+                'per_bucket_put_requests': counts.get('put_requests') if counts_ok else None,
+                'per_bucket_request_window_days': counts.get('window_days') if counts_ok else None,
                 'account_kms_request_spend_usd': None,
                 'account_kms_request_spend_period': None,
                 'estimated_savings_usd': 0.0,

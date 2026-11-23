@@ -79,12 +79,26 @@ def test_nothing_firing_makes_no_request():
     assert r.api_calls == {}
 
 
-def test_a_cost_explorer_error_keeps_the_findings_and_adds_no_warning():
-    r = _report(_finding("a"))
-    with patch.object(scan_mod.boto3, "client", return_value=_client(error="AccessDeniedException")):
+@pytest.mark.parametrize("code", ["AccessDeniedException", "AccessDenied"])
+def test_a_denied_read_keeps_the_findings_and_names_the_missing_permission(code):
+    # CLO-1065: the CLI policy lacked ce:GetCostAndUsage and the denial was silent. It is now one
+    # permission gap in the engine's own shape; the findings still say the spend is not available.
+    r = _report(_finding("a"), _finding("b", region="eu-west-1"))
+    with patch.object(scan_mod.boto3, "client", return_value=_client(error=code)):
         REAL_KMS(CREDS, r)
     assert KMS_SPEND_UNAVAILABLE_LINE in r.findings[0].explanation["pricing"]
     assert r.findings[0].metadata["account_kms_request_spend_usd"] is None
+    assert r.permission_errors == [
+        f"COST_EXPLORER: account KMS request spend for the S3 Bucket Key finding needs ce:GetCostAndUsage ({code})"]
+    assert r.warnings == [] and r.errors == []
+
+
+@pytest.mark.parametrize("code", ["ThrottlingException", "LimitExceededException", "DataUnavailableException"])
+def test_any_other_cost_explorer_error_keeps_the_findings_and_adds_nothing(code):
+    r = _report(_finding("a"))
+    with patch.object(scan_mod.boto3, "client", return_value=_client(error=code)):
+        REAL_KMS(CREDS, r)
+    assert KMS_SPEND_UNAVAILABLE_LINE in r.findings[0].explanation["pricing"]
     assert r.warnings == [] and r.errors == [] and r.permission_errors == []
 
 

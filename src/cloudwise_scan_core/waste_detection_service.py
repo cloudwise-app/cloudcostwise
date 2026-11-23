@@ -1539,6 +1539,7 @@ class WasteDetectionServiceBase:
         account_id: str = None,
         is_global_scan_region: bool = True,
         user_id: str = None,
+        billed_cost_lookup=None,
     ) -> WasteDetectionResult:
         """
         Run waste detection using a DataProvider.
@@ -1563,6 +1564,11 @@ class WasteDetectionServiceBase:
                 (e.g. air-gapped uploads) every finding is labelled
                 ``unreconciled_no_cur`` and keeps its list-price estimate,
                 rather than silently presenting it as reconciled.
+            billed_cost_lookup: a ``BilledCostLookup`` the caller already
+                built, used instead of the configured billed-cost port
+                (CLO-812: an Air-Gapped upload reconciles against the CUR it
+                uploaded, built in memory, never read from AWS). ``None``
+                keeps the port path above.
 
         Returns:
             WasteDetectionResult with all findings
@@ -1719,6 +1725,7 @@ class WasteDetectionServiceBase:
                 settings,
                 user_id=user_id,
                 account_id=account_id,
+                billed_cost_lookup=billed_cost_lookup,
             )
 
             # CLO-485: the provider's "MISSING, not zero" notes (idle verdicts
@@ -1926,6 +1933,7 @@ class WasteDetectionServiceBase:
         *,
         user_id: Optional[str],
         account_id: str,
+        billed_cost_lookup=None,
     ) -> None:
         """Reconcile staged findings against billed cost, then apply the floor.
 
@@ -1970,8 +1978,10 @@ class WasteDetectionServiceBase:
         )
         from cloudwise_scan_core.config import get_billed_cost_provider
 
-        lookup = None
-        if staged and user_id:
+        # CLO-812: a caller-built lookup (the Air-Gapped upload's own CUR)
+        # replaces the port read; the reconciliation below is the same.
+        lookup = billed_cost_lookup
+        if lookup is None and staged and user_id:
             # Best-effort: a broken or unconfigured lookup must never take a
             # scan down, and must never silently zero a finding either — a
             # None lookup yields UNRECONCILED_NO_CUR for every item.
@@ -2115,6 +2125,9 @@ class WasteDetectionServiceBase:
                     regional_share=regional_counts.get(
                         (_waste_type_value(item.waste_type), item.region or "")
                     ),
+                    # CLO-1096: an unprovable (Air-Gapped) lookup keeps the
+                    # estimate rather than reconcile below the floor.
+                    savings_floor=settings.min_waste_threshold_usd,
                 )
 
             item.estimated_savings_list_price = estimate

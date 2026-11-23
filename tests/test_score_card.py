@@ -166,6 +166,31 @@ def test_a_cost_explorer_error_falls_back_and_never_raises():
     assert render.score_for(r).basis == "no_spend"
 
 
+@pytest.mark.parametrize("code", ["AccessDeniedException", "AccessDenied"])
+def test_a_denied_spend_read_names_the_missing_permission(code):
+    # CLO-1065: the CLI policy lacked ce:GetCostAndUsage and the score fell back silently. The denial
+    # is now one permission gap in the engine's own shape, and the table names it with --verbose.
+    r = _report(_item(TRUSTED, "a", 10.0))
+    with patch.object(scan_mod.boto3, "client", return_value=_ce_client(error=code)):
+        real_fetch(CREDS, r)
+    assert r.spend_monthly is None and render.score_for(r).basis == "no_spend"
+    gap = f"COST_EXPLORER: 30-day account spend for the score needs ce:GetCostAndUsage ({code})"
+    assert r.permission_errors == [gap]
+    assert r.warnings == [] and r.errors == []
+    assert f"  - {gap}" in render.as_table(r, verbose=True)
+    assert "1 missing permission(s); rerun with --verbose to see them." in render.as_table(r)
+    assert json.loads(render.as_json(r))["permission_errors"] == [gap]
+
+
+@pytest.mark.parametrize("code", ["ThrottlingException", "DataUnavailableException", "BillExpirationException"])
+def test_any_other_spend_error_adds_no_permission_gap(code):
+    r = _report()
+    with patch.object(scan_mod.boto3, "client", return_value=_ce_client(error=code)):
+        real_fetch(CREDS, r)
+    assert r.spend_monthly is None and r.permission_errors == [] and r.warnings == []
+    assert "missing permission" not in render.as_table(r)
+
+
 def test_the_read_only_guard_still_covers_the_spend_lookup():
     client = MagicMock()
     client.meta.service_model.service_name = "ce"

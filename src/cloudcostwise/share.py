@@ -260,7 +260,7 @@ def build_payload(report, source: str, *, email: Optional[str] = None, email_rep
 
     # CLO-1057: the one place every payload is built (the prompt, a setting, MCP, the saved summary), so
     # the demo recording can never become one, whatever CLOUDCOSTWISE_SHARE says.
-    if getattr(report, "demo", False):
+    if _is_fake(report):
         raise ValueError("a demo (sample data) report is never shared")
     base: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -346,11 +346,16 @@ def _write_private(path: Path, data: Dict[str, Any]) -> None:
         raise
 
 
+def _is_fake(report) -> bool:
+    """A recorded demo (CLO-1057) or a scan of the AWS Emulator's fake account (CLO-1116): never saved, never shared."""
+    return bool(getattr(report, "demo", False) or getattr(report, "emulator", False))
+
+
 def save_last_summary(report, source: str) -> Optional[str]:
     """Keep this scan's summary for `share --last`. Never a demo; never raises. Returns the record's
     ``saved_at`` (pass it to the automatic send, so it marks this scan's record and no other), or None
     if nothing was written."""
-    if getattr(report, "demo", False):
+    if _is_fake(report):
         return None  # CLO-1057: sample data is never saved, so it can never be shared
     try:
         saved_at = _now()
@@ -542,7 +547,7 @@ def share_from_settings_mcp(report, *, env: Optional[Dict[str, str]] = None,
     already attempted from a terminal: nothing sent), 'not_marked' (the attempt could not be recorded in
     last-summary.json: nothing sent), 'refused' (CLOUDCOSTWISE_SHARE_URL not allowed: nothing
     sent), 'demo' or 'error' (nothing sent)."""
-    if getattr(report, "demo", False):
+    if _is_fake(report):
         return "demo"  # CLO-1057
     try:
         settings = read_settings(env)
@@ -592,7 +597,7 @@ def offer(report, *, source: str = "cli", stdin=None, stdout=None, stderr=None,
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
-    if getattr(report, "demo", False):
+    if _is_fake(report):
         return "skipped"  # CLO-1057: sample data: nothing asked, nothing sent
     try:
         settings = read_settings(env)
@@ -644,7 +649,7 @@ def _email_flow(base: Dict[str, Any], stdin, out) -> Optional[Dict[str, Any]]:
 
 
 def _prompt(report, source: str, stdin, stderr, sender, saved_at: Any = _FIND) -> str:
-    if getattr(report, "demo", False):
+    if _is_fake(report):
         return "skipped"  # CLO-1057: before it can record that the human was asked
     # Whatever the answer, do not ask again on this machine.
     cfg = load_config()

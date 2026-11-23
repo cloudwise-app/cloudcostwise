@@ -29,7 +29,7 @@ standard AWS credential chain. Without `--regions` it scans us-east-1 plus the p
 ## Run the scan
 
 ```bash
-uvx cloudcostwise==0.1.27 scan --format json
+uvx cloudcostwise==0.1.29 scan --format json
 ```
 
 Options, added only as the user asked:
@@ -44,7 +44,7 @@ A scan takes about 30 to 60 seconds per region. If `uvx` is not found, tell the 
 (`brew install uv` or `pipx install uv`). Do not install it for them unless they ask.
 
 To show what a result looks like without AWS credentials, run
-`uvx cloudcostwise==0.1.27 scan --demo --format json`. It prints a recorded scan of a CloudWise test
+`uvx cloudcostwise==0.1.29 scan --demo --format json`. It prints a recorded scan of a CloudWise test
 account and makes no AWS call. Say clearly that it is sample data and not the user's account.
 
 ## Read the result
@@ -81,7 +81,7 @@ The savings are estimates. They are not figures from the user's bill. Say so whe
 - Do not send the scan result anywhere, and do not write it to a file unless the user asks.
 - Report what the scan found and what it could not check. Do not add product or plan suggestions.
 - If the user wants a resource left out of future scans, the command is
-  `uvx cloudcostwise==0.1.27 exclude add RESOURCE_ID_OR_ARN`. The list stays on their machine.
+  `uvx cloudcostwise==0.1.29 exclude add RESOURCE_ID_OR_ARN`. The list stays on their machine.
 
 ## When the scan fails
 

@@ -739,6 +739,16 @@ class BilledCostLookup:
     #: no rows there would be absence of the read, not a $0 bill.
     region_usage_read: bool = False
 
+    #: CLO-812: False when the rows cannot be shown to be the whole bill, so
+    #: neither an absent row nor rows summing to $0 prove "AWS bills $0". An
+    #: Air-Gapped upload's CUR is whatever files the user picked: a missing
+    #: part file or a service-filtered report leaves a billed resource with no
+    #: rows (or only its $0 rows). Every branch that would answer
+    #: ``CONFIRMED_ZERO_BILLED`` answers ``UNRECONCILED_INSUFFICIENT_DATA``
+    #: instead and keeps the estimate; a positive bill still caps. The hosted
+    #: CUR, delivered whole by AWS, keeps the default True.
+    zero_billed_provable: bool = True
+
     @classmethod
     def build(
         cls,
@@ -748,12 +758,14 @@ class BilledCostLookup:
         account_days_covered: int = 0,
         latest_usage_date: Optional[date] = None,
         region_usage=None,
+        zero_billed_provable: bool = True,
     ) -> "BilledCostLookup":
         """Index rollups by resource id AND by unambiguous alias.
 
         ``region_usage`` (CLO-1012): the account's no-resource-id CUR rows as
         rollups keyed ``(region, usage type)``, or ``None`` when the adapter
         did not read them. See :attr:`by_region_usage`.
+        ``zero_billed_provable`` (CLO-812): see :attr:`zero_billed_provable`.
         """
         by_region_usage = {
             (str(k[0] or ""), str(k[1] or "")): v
@@ -836,6 +848,7 @@ class BilledCostLookup:
             by_typed_rollup=by_typed_rollup,
             by_region_usage=by_region_usage,
             region_usage_read=region_usage is not None,
+            zero_billed_provable=zero_billed_provable,
         )
 
     def _typed_name_match(
@@ -1337,6 +1350,7 @@ def _reconcile_region_usage(
     usage_suffix: str,
     evidence_suffix: str,
     share: Optional[int],
+    savings_floor: float = 0.0,
 ) -> ReconciliationOutcome:
     """Cap a saving AWS bills per region without a resource id (CLO-1012).
 
@@ -1356,7 +1370,9 @@ def _reconcile_region_usage(
       absent read is not a $0 bill.
     - A discount line among the rows → ``UNRECONCILED_DISCOUNTED``.
     - Rows for the service but none (or $0) for the usage type →
-      ``CONFIRMED_ZERO_BILLED``: AWS bills no further copy.
+      ``CONFIRMED_ZERO_BILLED``: AWS bills no further copy. On a lookup whose
+      rows may not be the whole bill (``zero_billed_provable`` False,
+      CLO-812) → ``UNRECONCILED_INSUFFICIENT_DATA``, estimate kept.
     - Otherwise ``RECONCILED``, capped at ``min(estimate, share of the
       monthly bill)``.
 
@@ -1388,6 +1404,12 @@ def _reconcile_region_usage(
             reconciliation_status=ReconciliationStatus.UNRECONCILED_DISCOUNTED,
         )
     total = sum(v.billed_total for v in billed)
+    if total <= 0 and not lookup.zero_billed_provable:
+        # CLO-812: the paid rows may sit in a part file that was not uploaded.
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA,
+        )
     if total <= 0:
         return ReconciliationOutcome(
             monthly_savings=0.0,
@@ -1401,6 +1423,19 @@ def _reconcile_region_usage(
     )
     parts = share if isinstance(share, int) and not isinstance(share, bool) and share > 1 else 1
     monthly_share = total * _DAYS_PER_MONTH / days / parts
+    if (
+        not lookup.zero_billed_provable
+        and estimated_savings >= savings_floor
+        and monthly_share < savings_floor
+    ):
+        # CLO-1096: rows that may not be the whole bill and a reconciled
+        # figure the savings floor would drop: keep the estimate.
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA,
+            billed_cost_observed=monthly_share,
+            cost_basis=CostBasis.UNKNOWN,
+        )
     bases = {v.cost_basis for v in billed}
     return ReconciliationOutcome(
         monthly_savings=min(estimated_savings, monthly_share),
@@ -1432,6 +1467,7 @@ def reconcile_savings(
     running_tasks=None,
     billed_ids: Optional[Sequence[str]] = None,
     regional_share: Optional[int] = None,
+    savings_floor: float = 0.0,
 ) -> ReconciliationOutcome:
     """Reconcile one finding's list-price estimate against actual billed cost.
 
@@ -1441,6 +1477,12 @@ def reconcile_savings(
     ``running_tasks`` with ``waste_type``: see ``CUR_ACCOUNT_WIDE_WASTE_TYPES``.
     ``regional_share`` with ``waste_type``: see
     ``CUR_REGIONAL_USAGE_WASTE_TYPES`` and :func:`_reconcile_region_usage`.
+    ``savings_floor`` (CLO-1096): the caller's minimum reportable saving
+    (``min_waste_threshold_usd``). Only a lookup whose ``zero_billed_provable``
+    is False uses it: a reconciled figure below it keeps the estimate,
+    ``UNRECONCILED_INSUFFICIENT_DATA``, because the rows may be a fragment of
+    the bill (an expensive usage type missing from the upload) and the floor
+    would drop the finding on that fragment. 0 (the default) disables it.
     ``resource_created_at`` (ISO string or datetime, from the detector's
     ``metadata["resource_created_at"]``): see :func:`_not_yet_billed`.
 
@@ -1472,6 +1514,9 @@ def reconcile_savings(
     6. No rows at all, for a resource younger than the CUR's latest covered
        day (or of a type billed while it exists) → labelled, *not* zeroed:
        the CUR has not billed it yet. See :func:`_not_yet_billed`.
+    6a. No rows, or rows summing to $0, on a lookup whose rows may not be the
+       whole bill (``zero_billed_provable`` False: an Air-Gapped upload,
+       CLO-812) → labelled insufficient data, *not* zeroed.
     7. No rows, or rows summing to $0, on an account that demonstrably *has*
        resource-level CUR → genuinely not billed. This is the free-tier fix.
     8. Too few days on this specific resource → labelled, not zeroed.
@@ -1531,6 +1576,7 @@ def reconcile_savings(
             usage_suffix=regional["usage_suffix"],
             evidence_suffix=regional["evidence_suffix"],
             share=regional_share,
+            savings_floor=savings_floor,
         )
 
     match = lookup.match_for(
@@ -1594,6 +1640,19 @@ def reconcile_savings(
             reconciliation_status=ReconciliationStatus.UNRECONCILED_NOT_YET_BILLED,
         )
 
+    # CLO-812: the rows may not be the whole bill (an Air-Gapped upload's
+    # CUR with a part file or a service left out), so a miss or a $0 sum is
+    # absence of evidence, not a $0 bill. Keep the estimate, labelled.
+    if (rollup is None or rollup.billed_total <= 0) and not lookup.zero_billed_provable:
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=(
+                ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA
+            ),
+            billed_cost_observed=rollup.monthly_equivalent() if rollup else None,
+            cost_basis=rollup.cost_basis if rollup else None,
+        )
+
     # No rows for this resource, or rows that sum to nothing. The account has
     # resource-level CUR over a populated window, so AWS is not charging for
     # this resource: deleting it saves the customer $0.
@@ -1617,6 +1676,25 @@ def reconcile_savings(
 
     billed_monthly = rollup.monthly_equivalent()
     assert billed_monthly is not None  # days_covered >= min_days_covered > 0
+
+    # CLO-1096: an unprovable lookup (Air-Gapped upload) may hold only a
+    # fragment of the resource's bill, e.g. its cheap rows while the
+    # expensive usage types are missing. A reconciled figure the savings
+    # floor would drop is not evidence the resource is cheap: keep the
+    # estimate. A hosted lookup (zero_billed_provable) is unchanged.
+    if (
+        not lookup.zero_billed_provable
+        and estimated_savings >= savings_floor
+        and billed_monthly < savings_floor
+    ):
+        return ReconciliationOutcome(
+            monthly_savings=estimated_savings,
+            reconciliation_status=(
+                ReconciliationStatus.UNRECONCILED_INSUFFICIENT_DATA
+            ),
+            billed_cost_observed=billed_monthly,
+            cost_basis=rollup.cost_basis,
+        )
 
     return ReconciliationOutcome(
         # Cap, don't replace: a right-sizing finding claims the delta between

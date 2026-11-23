@@ -27,6 +27,7 @@ from cloudcostwise import __version__, render
 from cloudcostwise import exclude as exclude_mod
 from cloudcostwise import share as share_mod
 from cloudcostwise import demo as demo_mod
+from cloudcostwise import emulator_demo
 from cloudcostwise.runtime import (
     COST_EXPLORER_PRICE_PER_REQUEST,
     CredentialsError,
@@ -51,7 +52,9 @@ INSTRUCTIONS = (
     "include_cost_explorer=false skips them. Results, including the account ID and resource IDs, come "
     "back to you, the assistant. `scan` with demo=true shows a recorded scan of a CloudWise test account "
     "(sample data, every identifier a placeholder) without calling AWS; the later tools then work on it, "
-    "and you must tell the user it is sample data, not their account. This server never sends a scan "
+    "and you must tell the user it is sample data, not their account. `scan` with emulator=true runs a live scan of a "
+    "fake account in AWS Emulator on the user's machine (needs Docker; never their AWS credentials); tell the "
+    "user it is a fake account, not theirs. This server never sends a scan "
     "or its summary to CloudWise unless the user's own setting says so."
 )
 
@@ -74,7 +77,7 @@ class _Session:
     def footer_once(self) -> str:
         # CLO-1057: a demo result neither shows the footer nor uses it up for a later real scan.
         # CLO-1055: the MCP footer has no hosted-product line or link (render.mcp_footer).
-        if not self.upsell or self.footer_shown or self.report is None or self.report.demo:
+        if not self.upsell or self.footer_shown or self.report is None or self.report.demo or self.report.emulator:
             return ""
         self.footer_shown = True
         return "\n\n" + render.mcp_footer(self.report)
@@ -82,6 +85,9 @@ class _Session:
 
 def _demo_wrap(report: Optional[ScanReport], text: str) -> str:
     """CLO-1057: every tool result about the recorded sample starts and ends with the sample-data note."""
+    if report is not None and report.emulator and not report.demo:
+        # CLO-1116: the same wrap for a live scan of the fake account in AWS Emulator.
+        return f"{emulator_demo.MCP_NOTE}\n\n{text.rstrip()}\n\n{emulator_demo.NOTE}"
     if report is None or not report.demo:
         return text
     return f"{demo_mod.MCP_NOTE}\n\n{text.rstrip()}\n\n{demo_mod.BANNER_BOTTOM}"
@@ -179,11 +185,43 @@ def build_server(full: bool = False, upsell: bool = True, share: bool = False, n
                              f"${COST_EXPLORER_PRICE_PER_REQUEST:.2f} per request (a few cents a scan), plus one request for the last 30 days of spend and, only when an S3 bucket-key finding exists, one for KMS request spend (one per scan, not per region), "
                              "which scores the result; tell the user before running, and pass "
                              "include_cost_explorer=false to skip them (the score is then labelled \"without spend data\"). regions: comma-separated, or 'all'; "
-                             "default us-east-1 plus the profile's region. demo=true: show a recorded scan of a CloudWise test "
+                             "default us-east-1 plus the profile's region. emulator=true: scan a FAKE account in AWS Emulator, which "
+                             "this tool starts in Docker on this machine (127.0.0.1 only; needs Docker running; the first "
+                             "run builds a ~1.4 GB image): a live scan of fake resources, never the user's AWS "
+                             "account and never their credentials (profile, regions and include_cost_explorer are ignored); "
+                             "say it is a fake account, not sample data from a real one. demo=true: show a recorded scan of a CloudWise test "
                              "account (sample data, no AWS call, no credentials; profile, regions and "
                              "include_cost_explorer are ignored) and say it is sample data.")
     async def scan(ctx: Context, profile: Optional[str] = None, regions: Optional[str] = None,
-                   include_cost_explorer: bool = True, demo: bool = False) -> str:
+                   include_cost_explorer: bool = True, demo: bool = False,
+                   emulator: bool = False) -> str:
+        if emulator and demo:
+            return "Could not scan: pass emulator=true or demo=true, not both."
+        if emulator:
+            # CLO-1116: a live scan of a fake account in AWS Emulator. Never the user's credentials, no
+            # exclude list, no transform, no share. Docker, seeding and the scan block, so run them off the loop.
+            port = emulator_demo.default_port()
+            try:
+                report = await asyncio.to_thread(emulator_demo.run, port)
+            except emulator_demo.DockerMissing as e:
+                return emulator_demo.MCP_DOCKER_NEEDED.format(why=e)
+            except emulator_demo.EmulatorError as e:
+                return f"Could not run the emulator scan: {e}"
+            session.report = report
+            session.by_id = {str(i.id): i for i in report.findings}
+            await _notify_scan_changed(ctx)
+            lines = [*render.score_card(report, markdown=True), "",
+                     f"Account {report.account_id}, regions {', '.join(report.regions)}: "
+                     f"{len(report.findings)} findings, estimated savings "
+                     f"{_money(render.counted_total(report))}/month (advisory findings excluded)."]
+            for g in render.groups(report)[:15]:
+                tag = " (advisory, not counted)" if g.advisory else ""
+                lines.append(f"- {g.waste_type}: {len(g.items)} resource(s), {_money(g.monthly)}/month{tag}")
+            if len(render.groups(report)) > 15:
+                lines.append("- ... call list_findings for the rest")
+            lines += [*render.scope_notes(report), emulator_demo.IGNORED_IN_MCP,
+                      "Use list_findings for finding ids, then explain_finding or fix_guidance."]
+            return _demo_wrap(report, "\n".join(lines) + session.footer_once())
         if demo:
             # CLO-1057: no credentials, no AWS, no exclude list, no transform, no share: the recording as it is.
             report = demo_mod.load_report()

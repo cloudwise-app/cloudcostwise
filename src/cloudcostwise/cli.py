@@ -10,6 +10,16 @@ from typing import List, Optional
 from cloudcostwise import __version__
 
 
+def _port(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if not 1024 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a port from 1024 to 65535")
+    return n
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cloudcostwise",
@@ -23,6 +33,17 @@ def _parser() -> argparse.ArgumentParser:
                         "placeholder) instead of scanning: no AWS call, no credentials, no network, never shared. "
                         "Works with every --format and --anonymize; --profile and --regions are refused with it; "
                         "--no-cost-explorer, --no-exclude and --parallel have nothing to change and are ignored")
+    s.add_argument("--emulator", action="store_true",
+                   help="run a live scan of a fake AWS account in AWS Emulator on your machine (needs Docker): "
+                        "starts the emulator (127.0.0.1 only, telemetry off) or reuses it, creates fake wasteful "
+                        "resources, and runs the normal scan against them. Never uses your AWS credentials; "
+                        "--profile, --regions and --demo are refused with it; Cost Explorer is always off and "
+                        "--no-exclude and --parallel are ignored. Works with every --format and --anonymize; "
+                        "never shared")
+    s.add_argument("--emulator-port", type=_port, default=None, metavar="PORT",
+                   help="port for --emulator on 127.0.0.1 (default 9397, or $CW_DEMO_EMULATOR_PORT)")
+    s.add_argument("--emulator-down", action="store_true",
+                   help="stop the emulator that --emulator started (its fake resources are gone) and exit")
     s.add_argument("--profile", help="AWS profile (default: the standard credential chain)")
     s.add_argument("--regions", help="comma-separated regions, or 'all' (default: us-east-1 plus your profile's region)")
     s.add_argument("--format", choices=["table", "markdown", "json"], default="table")
@@ -80,6 +101,47 @@ def _demo(args, render) -> int:
     return 0  # never share.offer: a demo result is never offered for sharing
 
 
+def _emulator(args, render) -> int:
+    """CLO-1116: a live scan of a fake account in AWS Emulator. Never the person's credentials, no exclude
+    list, no share offer, nothing saved for `share --last`."""
+    from cloudcostwise import emulator_demo as em
+
+    port = args.emulator_port or em.default_port()
+
+    def say(line: str) -> None:
+        print(line, file=sys.stderr)
+
+    try:
+        if args.emulator_down:
+            em.stop(port)
+            print(f"AWS Emulator on port {port} stopped; its fake resources are gone.")
+            return 0
+        report = em.run(port, say)
+    except em.DockerMissing as e:
+        print(em.DOCKER_NEEDED.format(why=e), file=sys.stderr)
+        return 1
+    except em.Unsafe as e:
+        print(f"cloudcostwise: stopped, {e}. Nothing was changed outside the local emulator.", file=sys.stderr)
+        return 1
+    except em.EmulatorError as e:
+        print(f"cloudcostwise: {e}", file=sys.stderr)
+        return 1
+    shown = report
+    if args.anonymize:
+        from cloudcostwise.anonymize import anonymize_report
+
+        shown = anonymize_report(report)
+    if args.format == "json":
+        print(render.as_json(shown))
+    elif args.format == "markdown":
+        print(render.as_markdown(shown, emoji=sys.stdout.isatty(), verbose=args.verbose))
+    else:
+        print(render.as_table(shown, verbose=args.verbose, emoji=sys.stdout.isatty()))
+        again = f" --emulator-port {port}" if port != em.DEFAULT_PORT else ""
+        print(f"Stop the emulator with: cloudcostwise scan --emulator-down{again}", file=sys.stderr)
+    return 0  # never share.offer or save_last_summary: a fake account is never shared
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     # stderr always: on `mcp`, stdout carries the protocol and must stay clean.
@@ -103,6 +165,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     from cloudcostwise import render
+
+    if args.emulator or args.emulator_down:
+        if args.demo or args.profile or args.regions:
+            print("cloudcostwise: --emulator scans a fake account on your machine and never uses your AWS "
+                  "credentials, so --demo, --profile and --regions do not apply. Drop them, or drop --emulator "
+                  "to scan your account.", file=sys.stderr)
+            return 2
+        return _emulator(args, render)
 
     if args.demo:
         if args.profile or args.regions:

@@ -313,6 +313,8 @@ WORKSPACES_MIN_COVERAGE = 0.75
 # not a point), so a single missed day does not lose the comparison.
 S3_GROWTH_BASELINE_MAX_DAYS_AGO = 32
 S3_GROWTH_BASELINE_MIN_DAYS_AGO = 28
+# CLO-1083: days of GetRequests / PutRequests summed for an SSE-KMS bucket's finding.
+KMS_REQUEST_WINDOW_DAYS = 30
 
 # CLO-516: over_provisioned_iops reads each candidate volume's one-minute
 # VolumeReadOps + VolumeWriteOps through one metric-math expression
@@ -3493,6 +3495,14 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                 (default_encryption_enabled, encryption_algorithm,
                  bucket_key_enabled) = self._s3_default_encryption(s3, bucket_name)
 
+                # CLO-1083: per-bucket request counts, only for the buckets the
+                # s3_kms_bucket_key_disabled check will flag.
+                kms_request_counts = None
+                if encryption_algorithm == 'aws:kms' and bucket_key_enabled is not True:
+                    kms_request_counts = self._s3_kms_request_counts(
+                        s3, bucket_name, bucket_region or self._region, now,
+                    )
+
                 buckets.append(S3BucketData(
                     bucket_name=bucket_name,
                     region=bucket_region,
@@ -3511,6 +3521,7 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
                     default_encryption_enabled=default_encryption_enabled,
                     encryption_algorithm=encryption_algorithm,
                     bucket_key_enabled=bucket_key_enabled,
+                    kms_request_counts=kms_request_counts,
                     recent_max_object_count=recent_max_objects,
                     contents_observed=contents_observed,
                 ))
@@ -3613,6 +3624,106 @@ class OnlineDataProvider(MissingDataNotesMixin, WasteDataProvider):
             return None, None, None
         return default_encryption_enabled, encryption_algorithm, bucket_key_enabled
     
+    def _s3_kms_request_counts(
+        self, s3, bucket_name: str, bucket_region: str, now: datetime,
+    ) -> Dict[str, Any]:
+        """CLO-1083: a bucket's own GetRequests and PutRequests, for the
+        s3_kms_bucket_key_disabled finding.
+
+        S3 publishes request metrics (``AWS/S3`` ``GetRequests`` /
+        ``PutRequests``, dimensions ``BucketName`` and ``FilterId``) only for a
+        request metrics configuration the owner created. Only a configuration
+        with NO ``Filter`` covers the whole bucket (a prefix, tag or access
+        point filter covers a part of it, so its counts would undercount and
+        are not used). The metrics are not back-filled, so the Sum over
+        ``KMS_REQUEST_WINDOW_DAYS`` days may cover less than the whole window.
+
+        Returns a dict with a ``status`` (see ``S3BucketData.kms_request_counts``).
+        Never a zero for a missing read: a denied ``s3:GetMetricsConfiguration``
+        (``_warn_swallowed`` records it in ``permission_missing``, once per
+        scan), a failed read and an empty series each have their own status,
+        and the finding is kept either way.
+        """
+        permission = 's3:GetMetricsConfiguration'
+        if getattr(self, '_kms_metrics_config_denied', False):
+            return {'status': 'permission_denied', 'permission': permission}
+        configs: List[Any] = []
+        token = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {'Bucket': bucket_name}
+                if token:
+                    kwargs['ContinuationToken'] = token
+                resp = s3.list_bucket_metrics_configurations(**kwargs)
+                if not isinstance(resp, dict):
+                    return {'status': 'not_read'}
+                page = resp.get('MetricsConfigurationList') or []
+                if not isinstance(page, list):
+                    return {'status': 'not_read'}
+                configs.extend(page)
+                token = resp.get('NextContinuationToken') if resp.get('IsTruncated') is True else None
+                if not isinstance(token, str) or not token:
+                    break
+        except (ClientError, BotoCoreError) as e:
+            self._warn_swallowed("S3 bucket request metrics configuration", permission, e)
+            if self._is_access_denied(e):
+                self._kms_metrics_config_denied = True
+                return {'status': 'permission_denied', 'permission': permission}
+            return {'status': 'not_read'}
+
+        whole_bucket = sorted(
+            c['Id'] for c in configs
+            if isinstance(c, dict) and isinstance(c.get('Id'), str) and c.get('Id') and not c.get('Filter')
+        )
+        if not whole_bucket:
+            return {'status': 'no_filter'}
+        filter_id = whole_bucket[0]
+
+        start = now - timedelta(days=KMS_REQUEST_WINDOW_DAYS)
+        totals: Dict[str, float] = {}
+        try:
+            cloudwatch = self._get_client('cloudwatch', region=bucket_region)
+            for metric in ('GetRequests', 'PutRequests'):
+                resp = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/S3',
+                    MetricName=metric,
+                    Dimensions=[
+                        {'Name': 'BucketName', 'Value': bucket_name},
+                        {'Name': 'FilterId', 'Value': filter_id},
+                    ],
+                    StartTime=start,
+                    EndTime=now,
+                    Period=86400,
+                    Statistics=['Sum'],
+                )
+                points = resp.get('Datapoints') if isinstance(resp, dict) else None
+                if not isinstance(points, list):
+                    return {'status': 'not_read', 'filter_id': filter_id}
+                sums = [p['Sum'] for p in points
+                        if isinstance(p, dict) and isinstance(p.get('Sum'), (int, float))]
+                if sums:
+                    totals[metric] = sum(sums)
+        except (ClientError, BotoCoreError) as e:
+            self._warn_swallowed(
+                "S3 bucket request metrics", "cloudwatch:GetMetricStatistics", e,
+            )
+            if self._is_access_denied(e):
+                return {'status': 'permission_denied', 'permission': 'cloudwatch:GetMetricStatistics',
+                        'filter_id': filter_id}
+            return {'status': 'not_read', 'filter_id': filter_id}
+        if not totals:
+            # No datapoint at all: a new filter (metrics are not back-filled) or a
+            # bucket with no requests. Neither is a count of zero.
+            return {'status': 'no_datapoints', 'filter_id': filter_id,
+                    'window_days': KMS_REQUEST_WINDOW_DAYS}
+        return {
+            'status': 'counts',
+            'filter_id': filter_id,
+            'get_requests': int(totals['GetRequests']) if 'GetRequests' in totals else None,
+            'put_requests': int(totals['PutRequests']) if 'PutRequests' in totals else None,
+            'window_days': KMS_REQUEST_WINDOW_DAYS,
+        }
+
     async def get_s3_cost_breakdown(self) -> Dict[str, S3CostBreakdown]:
         """Query Cost Explorer for per-bucket S3 cost breakdown by usage type.
 

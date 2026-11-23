@@ -8,12 +8,12 @@
 [![MCP server](https://img.shields.io/badge/MCP-Claude%20Code%20%7C%20Codex%20%7C%20Cursor%20%7C%20Kiro%20%7C%20Gemini%20CLI-8A2BE2)](#use-it-from-claude-code-codex-cursor-kiro-or-gemini-cli)
 ![AWS access: read-only](https://img.shields.io/badge/AWS%20access-read--only-success)
 ![Sharing: opt-in only](https://img.shields.io/badge/sharing-opt--in%20only-success)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/LICENSE.md)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0%20%28open%20source%29-blue)](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/LICENSE.md)
 
 Find AWS waste from your terminal or your AI assistant, including the kinds AWS's own tools don't flag.
 `cloudcostwise` scans your account on your own machine, with your own read-only AWS credentials.
-<!-- fact:awsGap.openNone -->19<!-- /fact --> of its <!-- fact:awsGap.openProven -->56<!-- /fact --> proven checks flag waste that Trusted Advisor, Cost Optimization Hub and Compute Optimizer
-don't, and <!-- fact:awsGap.openPartial -->13<!-- /fact --> more go further than the closest AWS check.
+<!-- fact:awsGap.openNone -->19<!-- /fact --> of its <!-- fact:awsGap.openProven -->57<!-- /fact --> proven checks flag waste that Trusted Advisor, Cost Optimization Hub and Compute Optimizer
+don't, and <!-- fact:awsGap.openPartial -->14<!-- /fact --> more go further than the closest AWS check.
 
 ```bash
 pipx install cloudcostwise
@@ -43,7 +43,7 @@ Then ask it: *"Where am I wasting money on AWS?"* Setup for Codex, Cursor and Ki
 
 For idle EC2, RDS and NAT gateways, rightsizing and Savings Plans, AWS's tools cover the same ground: use them too.
 
-![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.27/docs/demo.svg)
+![cloudcostwise scanning our test account: findings ranked by monthly cost](https://raw.githubusercontent.com/cloudwise-app/cloudcostwise/v0.1.29/docs/demo.svg)
 
 **Before you run it with AWS credentials:**
 
@@ -61,8 +61,8 @@ For idle EC2, RDS and NAT gateways, rightsizing and Savings Plans, AWS's tools c
 - **It stores up to three small files:** your share answer in `~/.config/cloudcostwise/share.json`, the summary numbers of your last scan in `~/.config/cloudcostwise/last-summary.json` (never sent by itself; see [Sharing a summary](#sharing-a-summary-optional)) and, only if you use `cloudcostwise exclude`, your exclude list in `~/.config/cloudcostwise/exclude.json` (it never leaves your machine). No report, cache or credentials are written.
 - **Open source (Apache-2.0).** Read the code: [github.com/cloudwise-app/cloudcostwise](https://github.com/cloudwise-app/cloudcostwise).
 
-Least-privilege IAM policy (<!-- fact:iam.cliPolicyActionCount -->71<!-- /fact --> read-only actions):
-[`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/docs/iam-policy.json). See a real scan first, no credentials needed:
+Least-privilege IAM policy (<!-- fact:iam.cliPolicyActionCount -->73<!-- /fact --> read-only actions):
+[`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/docs/iam-policy.json). See a real scan first, no credentials needed:
 [cloudcostwise.io/sample-scan](https://cloudcostwise.io/sample-scan?utm_source=github&utm_medium=referral&utm_campaign=readme).
 
 - **<!-- fact:detectors.free -->20<!-- /fact --> of CloudWise's <!-- fact:detectors.total -->46<!-- /fact --> service checks**: EC2, Lambda, SageMaker, WorkSpaces,
@@ -90,10 +90,13 @@ Options:
 | `--format table\|markdown\|json` | Output format |
 | `--anonymize` | Replace the account ID and the resource IDs, names, ARNs and tag values it recognizes with stable placeholders (`account-1`, `resource-1`, ...; the same value always gets the same one). Waste type, region, savings, confidence, action wording, warnings and counts stay. Works with every `--format`; it runs locally and sends nothing. **Anonymizing is not complete:** it replaces the identifiers it recognizes, so review the file before you send it |
 | `--demo` | Print a recorded scan of a CloudWise test account instead of scanning: sample data with every identifier replaced by a placeholder, no AWS call, no credentials, no network. The first and last line say it is sample data, and JSON output carries `"demo": true`. Works with every `--format` and with `--anonymize`; `--profile` and `--regions` are refused with it; `--no-cost-explorer`, `--no-exclude` and `--parallel` have nothing to change and are ignored. It never asks to share a summary and is never sent, whatever your share setting says |
+| `--emulator` | Run a live scan of a fake AWS account in AWS Emulator on your machine (needs Docker): it starts the emulator or reuses it, creates fake wasteful resources next to healthy twins, and runs the normal scan against them. It never uses your AWS credentials; `--profile`, `--regions` and `--demo` are refused with it; Cost Explorer is always off and `--no-exclude` and `--parallel` are ignored. Works with every `--format` and with `--anonymize`; every output says it is a fake account, and JSON output carries `"emulator": true`. It never asks to share a summary and is never sent |
+| `--emulator-port PORT` | Port for `--emulator`, on 127.0.0.1 only (default 9397, or `$CW_DEMO_EMULATOR_PORT`) |
+| `--emulator-down` | Stop the emulator that `--emulator` started; its fake resources are gone |
 | `--no-exclude` | Ignore your exclude list (see below) for this run and show every finding |
 | `--no-cost-explorer` | Make no Cost Explorer call. AWS bills those at $<!-- fact:costExplorer.pricePerRequestUsd -->0.01<!-- /fact --> per request and a scan makes up to about <!-- fact:costExplorer.requestsPerScan -->10<!-- /fact -->. Skips the RI/Savings Plans checks, the one KMS spend read and the one request that reads this account's last 30 days of spend (all regions; credits and refunds left out), so the score falls back to "without spend data" |
 | `--parallel N` | Regions scanned at once, each in its own process (default <!-- fact:cli.defaultParallel -->4<!-- /fact -->; `--regions all` takes ~2–3 min instead of ~10) |
-| `--verbose` | Show data warnings (checks that could not read a metric report it as missing, never as zero) |
+| `--verbose` | Show data warnings (checks that could not read a metric report it as missing, never as zero) and the missing permissions, each naming the IAM action |
 
 ## Try it without AWS credentials
 
@@ -102,6 +105,14 @@ uvx cloudcostwise scan --demo          # a recorded sample scan; any --format
 ```
 
 In an AI assistant, call the `scan` tool with `demo` set to `true`: `list_findings`, `explain_finding` and `fix_guidance` then work on the sample. It is a recording of a CloudWise test account, not your account, and every result says so. Nothing is scanned, nothing leaves your machine, and a demo result is never shared.
+
+### Scan a fake account on your machine
+
+```bash
+uvx cloudcostwise scan --emulator       # needs Docker; --emulator-down stops it
+```
+
+This starts [AWS Emulator](https://github.com/aws/aws-emulator), AWS's own free local emulator, in Docker (published on 127.0.0.1 only, telemetry off), creates a small fake account with wasteful resources next to healthy twins, and runs the normal scan against it. The first run builds a local image from AWS's own package (about 1.4 GB, once). Without Docker running it stops with one line and suggests `--demo`. It never uses your AWS credentials or `AWS_PROFILE`: it reads only the emulator's own credentials file and stops unless the endpoint is 127.0.0.1 and the account is the emulator's `000000000000`. The resources are fake, savings use AWS list prices, and checks that need billing or usage history can't fire there; every output says so, and a result is never shared. In an AI assistant, call the `scan` tool with `emulator` set to `true`; `list_findings`, `explain_finding` and `fix_guidance` then work on it.
 
 ## Leave resources out of every scan
 
@@ -132,7 +143,7 @@ cloudcostwise scan --no-exclude                                                 
 ## What AWS's free tools don't flag
 
 <!-- aws-gap:start (generated by scripts/aws_gap.py) -->
-This tool has 56 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 13 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
+This tool has 57 proven checks (L2 or above in [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/VALIDATION.md): each fired on a real AWS resource built to trigger it and stayed silent on a healthy twin). **19 of them flag waste that none of AWS's own tools flag**, and 14 more go further than the closest AWS check, going by AWS's lists of what its tools cover ([Trusted Advisor](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html), [Compute Optimizer](https://docs.aws.amazon.com/compute-optimizer/latest/ug/supported-resources.html); checked 2026-10-11).
 
 | Check | What it finds | Closest AWS check |
 |---|---|---|
@@ -164,6 +175,7 @@ This tool has 56 proven checks (L2 or above in [VALIDATION.md](https://github.co
 | `lambda_excessive_timeout` | Lambda timeouts set far above what the function needs | AWS Lambda functions with excessive timeouts: Trusted Advisor flags functions where more than 10% of invocations time out; it does not flag a configured timeout set far above the function's real duration. |
 | `no_retention_log_group` | Log groups set to never expire, so they grow every month | Amazon CloudWatch Log Group Retention Period: Trusted Advisor checks log group retention but flags retention below a minimum, so a log group set to never expire passes it. |
 | `old_ecr_images` | Old ECR images still billed for storage | Amazon ECR Repository without lifecycle policy configured: Trusted Advisor checks that an ECR repository has a lifecycle policy; it does not flag the old images already stored. |
+| `over_provisioned_dynamodb` | Provisioned DynamoDB tables whose read and write utilisation are both under 20 percent | Idle recommendation for DynamoDB provisioned tables: Compute Optimizer (and Cost Optimization Hub) flag a provisioned table only when it consumed no read or write capacity at all over the lookback window (14 days by default), table and every global secondary index. A table with light steady traffic is not flagged. Trusted Advisor's DynamoDB cost check covers reserved capacity purchases, not capacity sizing (checked 2026-11-20). |
 | `oversized_sagemaker_endpoint` | SageMaker endpoints serving traffic on bigger instances than they need | Idle recommendation for SageMaker endpoints: Compute Optimizer flags SageMaker endpoints with zero invocations over 14 days but gives no rightsizing for endpoints that serve traffic on oversized instances. |
 | `s3_kms_bucket_key_disabled` | S3 buckets on SSE-KMS default encryption with the S3 Bucket Key off, so every object request is a billed KMS call | S3.17 S3 general purpose buckets should be encrypted at rest with AWS KMS keys: Shown in Trusted Advisor as a Security Hub CSPM control (Business Support+ or higher, Security Hub CSPM with the Foundational Security Best Practices standard, AWS Config recording). It checks only that a bucket is encrypted with a KMS key (SSE-KMS or DSSE-KMS) and fails SSE-S3, so it passes an SSE-KMS bucket with the bucket key off; no S3 control mentions S3 Bucket Keys or KMS request cost. Trusted Advisor's S3 cost checks look at lifecycle and multipart settings, and neither Compute Optimizer nor Cost Optimization Hub lists S3 or KMS among its resource types (checked 2026-11-16). |
 | `s3_rapid_growth` | S3 buckets whose Standard storage at least doubled in 30 days and grew by 10 GB or more | Amazon S3 Bucket Lifecycle Policy Configured: Trusted Advisor's S3 cost checks (lifecycle policy configured, incomplete multipart upload abort, version-enabled buckets without a lifecycle policy) look at bucket configuration, not at how fast a bucket is growing. Neither Compute Optimizer nor Cost Optimization Hub lists S3 among its resource types, so none of the three tools documents a check for a bucket that grows quickly (checked 2026-11-03). |
@@ -209,7 +221,7 @@ Claude Code, as a plugin (asks for your AWS profile):
 /plugin install cloudcostwise@cloudcostwise
 ```
 
-Claude, as a skill with no MCP server: the folder [`plugins/cloudcostwise`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/plugins/cloudcostwise) holds
+Claude, as a skill with no MCP server: the folder [`plugins/cloudcostwise`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/plugins/cloudcostwise) holds
 one Markdown skill that tells Claude how to run a pinned release of this CLI in your terminal and read the
 result. It contains no code. To use it in Claude Code, copy `plugins/cloudcostwise/skills/aws-waste-scan`
 into `~/.claude/skills/`.
@@ -299,9 +311,10 @@ Claude Code, `/mcp__cloudcostwise__fix-guidance` with a finding id from
 ## Permissions
 
 The minimal policy the checks use is
-in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/docs/iam-policy.json). AWS-managed `ReadOnlyAccess` also works, but it is much broader than the scan needs. It was derived from a scan of
+in [`docs/iam-policy.json`](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/docs/iam-policy.json). AWS-managed `ReadOnlyAccess` also works, but it is much broader than the scan needs. It was derived from a scan of
 an account with most supported resource types; if a check lacks a permission,
-the scan says so in its data warnings instead of failing.
+the scan lists it as a missing permission (named with `--verbose` and in `--format json`) instead of failing.
+That includes the two Cost Explorer spend reads, which need `ce:GetCostAndUsage`.
 EC2 instance prices come from the AWS Price List when the AWS credentials the scan uses, or failing that your default AWS credentials, allow `pricing:GetProducts`, and from built-in prices (adjusted by region) otherwise.
 
 One of those reads, `lambda:ListFunctions`, returns each function's environment variables as plain text. The scan reads only
@@ -382,9 +395,9 @@ next release.
 
 ## License
 
-Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/LICENSE.md)). 0.1.18 and later are Apache-2.0.
+Open source under the Apache License 2.0 (see [LICENSE.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/LICENSE.md)). 0.1.18 and later are Apache-2.0.
 0.1.17 and earlier are FSL-1.1-ALv2 (each becomes Apache-2.0 two years after it ships).
 
 ## How we know it's right
 
-See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.27/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.
+See [VALIDATION.md](https://github.com/cloudwise-app/cloudcostwise/blob/v0.1.29/VALIDATION.md): the validation level of every waste type this tool reports, from L0 (unit-tested) to L2 (fired on a real AWS resource and stayed silent on a healthy twin) and beyond.
